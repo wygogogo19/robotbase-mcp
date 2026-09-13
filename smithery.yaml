@@ -1,0 +1,65 @@
+# Smithery configuration for RobotBase MCP Server
+# Hosted (recommended): connect directly to the public endpoint — no local process needed.
+# This file also documents how to run the bundled reference implementation against your own nodes.
+
+name: robotbase-mcp
+displayName: RobotBase MCP Server
+description: >-
+  Read-only multi-chain data for AI agents: the first MCP server covering all five classic
+  non-EVM chains (Bitcoin, Monero, Zcash, Dogecoin, Litecoin). Mempool & fee estimates,
+  transaction and address lookup, Zcash shielded-pool supply, node status. No auth, no tracking.
+version: 0.3.0
+license: MIT
+homepage: https://robotbase.cc/mcp
+repository: https://github.com/<your-org>/robotbase-mcp
+
+transport:
+  type: streamable-http
+  url: https://robotbase.cc/mcp
+
+# Hosted endpoint needs no configuration; the optional apiKey only raises rate limits.
+configSchema:
+  type: object
+  properties:
+    apiKey:
+      type: string
+      description: Optional X-API-Key header value (raises the limit from 120 to 600 req/min per IP)
+  additionalProperties: false
+
+# Running the reference implementation locally (bring your own nodes):
+startCommand:
+  type: stdio
+  command: python3
+  args:
+    - server.py
+  env:
+    RB_BIND: "127.0.0.1"
+    RB_PORT: "8090"
+    RB_BTC_RPC_URL: "http://127.0.0.1:8332"
+    RB_BTC_RPC_USER: "${config.btcRpcUser}"
+    RB_BTC_RPC_PASS: "${config.btcRpcPass}"
+    RB_ELECTRS_HOST: "127.0.0.1"
+    RB_XMR_RPC: "http://127.0.0.1:18089/json_rpc"
+    RB_XMR_HELPER: "http://127.0.0.1:18085/rpc"
+    RB_ZEC_BASE: "http://127.0.0.1:8080"
+    RB_DOGE_BASE: "http://127.0.0.1:8080"
+    RB_LTC_BASE: "http://127.0.0.1:8080"
+
+categories:
+  - blockchain
+  - data
+  - developer-tools
+
+tags:
+  - bitcoin
+  - monero
+  - zcash
+  - dogecoin
+  - litecoin
+  - blockchain-data
+  - mempool
+  - fees
+  - onchain
+  - privacy-coins
+  - read-only
+  - mcp-server
