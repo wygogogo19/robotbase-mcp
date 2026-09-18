@@ -5,10 +5,11 @@
 name: robotbase-mcp
 displayName: RobotBase MCP Server
 description: >-
-  Read-only multi-chain data for AI agents: the first MCP server covering all five classic
-  non-EVM chains (Bitcoin, Monero, Zcash, Dogecoin, Litecoin). Mempool & fee estimates,
-  transaction and address lookup, Zcash shielded-pool supply, node status. No auth, no tracking.
-version: 0.3.0
+  Read-only multi-chain data for AI agents: the first MCP server covering the six classic
+  proof-of-work chains (Bitcoin, Kaspa, Zcash, Ravencoin, Dogecoin, Litecoin). Mempool & fee
+  estimates, transaction and address lookup, Zcash shielded-pool supply, Kaspa DAG + hashport
+  state, node status. No auth, no tracking. Free beta keys: see the README.
+version: 0.4.0
 license: MIT
 homepage: https://robotbase.cc/mcp
 repository: https://github.com/<your-org>/robotbase-mcp
@@ -39,11 +40,10 @@ startCommand:
     RB_BTC_RPC_USER: "${config.btcRpcUser}"
     RB_BTC_RPC_PASS: "${config.btcRpcPass}"
     RB_ELECTRS_HOST: "127.0.0.1"
-    RB_XMR_RPC: "http://127.0.0.1:18089/json_rpc"
-    RB_XMR_HELPER: "http://127.0.0.1:18085/rpc"
     RB_ZEC_BASE: "http://127.0.0.1:8080"
     RB_DOGE_BASE: "http://127.0.0.1:8080"
     RB_LTC_BASE: "http://127.0.0.1:8080"
+    RB_HOME_BASE: "http://127.0.0.1:8081"
 
 categories:
   - blockchain
@@ -52,8 +52,9 @@ categories:
 
 tags:
   - bitcoin
-  - monero
+  - kaspa
   - zcash
+  - ravencoin
   - dogecoin
   - litecoin
   - blockchain-data
