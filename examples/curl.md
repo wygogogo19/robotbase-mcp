@@ -33,10 +33,15 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":4,"method":"tools/call",
        "params":{"name":"zec_chain_info","arguments":{}}}'
 
-# Monero transaction lookup (is my swap on-chain?)
+# Kaspa: did our solo hashport find a real mainnet block?
 curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":5,"method":"tools/call",
-       "params":{"name":"xmr_tx_lookup","arguments":{"txid":"<64-hex-txid>"}}}'
+       "params":{"name":"kas_pool_status","arguments":{}}}'
+
+# Ravencoin: is the node synced and where is the GPU hashport?
+curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":6,"method":"tools/call",
+       "params":{"name":"rvn_pool_status","arguments":{}}}'
 ```
 
 ## 4. Higher rate limit (optional)

@@ -1,1 +1,102 @@
-{"name": "robotbase-mcp", "title": "RobotBase MCP Server", "version": "0.3.0", "description": "Read-only multi-chain data for AI agents: BTC / XMR / ZEC / DOGE / LTC. First MCP server covering all five classic non-EVM chains: mempool & fee estimates, transaction lookup, address summary, shielded-pool supply, node status. No auth required, no tracking.", "homepage": "https://robotbase.cc/mcp", "transport": {"type": "streamable-http", "url": "https://robotbase.cc/mcp"}, "protocolVersion": "2025-06-18", "capabilities": {"tools": {"listChanged": false}}, "auth": {"type": "none", "optional": "X-API-Key header or ?key= raises rate limit to 600/min per IP"}, "rateLimits": {"anonymous": "120/min per IP", "withApiKey": "600/min per IP"}, "tags": ["bitcoin", "monero", "zcash", "dogecoin", "litecoin", "blockchain-data", "onchain", "mempool", "fees", "privacy-coins", "read-only", "mcp-server"], "tools": [{"name": "list_chains", "description": "列出本服务支持的全部公链（BTC/XMR/ZEC/DOGE/LTC）及其实时可用性与区块高度。"}, {"name": "chain_status", "description": "查询"}, {"name": "zec_chain_info", "description": "查询 Zcash 主网信息，含 6 个价值池供应量（transparent/sprout/sapling/orchard/lockbox/ironwood），即"}, {"name": "zec_recent_blocks", "description": "查询 Zcash 最近 N 个区块的高度、哈希、出块时间与难度（N 最大 20）。"}, {"name": "btc_fee_estimates", "description": "查询比特币"}, {"name": "btc_mempool_summary", "description": "查询比特币内存池概况：待确认笔数、占用字节、最低费率、总手续费、容量上限。"}, {"name": "btc_tx_lookup", "description": "按 txid 查询"}, {"name": "btc_block_summary", "description": "查询"}, {"name": "btc_address_summary", "description": "查询"}, {"name": "xmr_node_info", "description": "查询门罗币"}, {"name": "xmr_fee_estimate", "description": "查询门罗币"}, {"name": "xmr_last_block", "description": "查询门罗币"}, {"name": "xmr_tx_lookup", "description": "按 txid 查询"}, {"name": "xmr_mempool_stats", "description": "查询门罗币"}, {"name": "utxo_chain_status", "description": "查询 DOGE 或 LTC 的节点状态（高度、同步进度、连接数、内存池笔数）。"}, {"name": "robotbase_services", "description": "查询 RobotBase 网关下"}]}
+{
+ "name": "robotbase-mcp",
+ "title": "RobotBase MCP Server",
+ "version": "0.4.0",
+ "description": "Read-only multi-chain data for AI agents: BTC / KAS / ZEC / RVN / DOGE / LTC. First MCP server covering six classic proof-of-work chains: mempool & fee estimates, transaction lookup, address summary, shielded-pool supply, node status. No auth required, no tracking.",
+ "homepage": "https://robotbase.cc/mcp",
+ "transport": {
+  "type": "streamable-http",
+  "url": "https://robotbase.cc/mcp"
+ },
+ "protocolVersion": "2025-06-18",
+ "capabilities": {
+  "tools": {
+   "listChanged": false
+  }
+ },
+ "auth": {
+  "type": "none",
+  "optional": "X-API-Key header or ?key= raises rate limit to 600/min per IP"
+ },
+ "rateLimits": {
+  "anonymous": "120/min per IP",
+  "withApiKey": "600/min per IP"
+ },
+ "tags": [
+  "bitcoin",
+  "kaspa",
+  "zcash",
+  "ravencoin",
+  "dogecoin",
+  "litecoin",
+  "blockchain-data",
+  "onchain",
+  "mempool",
+  "fees",
+  "privacy-coins",
+  "read-only",
+  "mcp-server"
+ ],
+ "tools": [
+  {
+   "name": "list_chains",
+   "description": "Every chain this service supports (BTC/KAS/ZEC/RVN/DOGE/LTC) with live availability and block height. When to use: the user asks which chains you support, which nodes are online, or how high each chain is. Do not use: for detail on one chain, use chain_status."
+  },
+  {
+   "name": "chain_status",
+   "description": "Run-time status of one chain's node: block height, sync progress, connected peers, mempool tx count, client version. When to use: whether a given chain's node is synced, healthy or lagging. Do not use: fees → btc_fee_estimates; address balance → btc_address_summary; pool detail → kas_pool_status / rvn_pool_status."
+  },
+  {
+   "name": "zec_chain_info",
+   "description": "Zcash mainnet info including the supply of all six value pools (transparent/sprout/sapling/orchard/lockbox/ironwood) — i.e. shielded-pool state. When to use: how much ZEC sits in the shielded/sapling/orchard pools, or privacy-pool size. Do not use: whether the ZEC node is synced → chain_status(zec)."
+  },
+  {
+   "name": "zec_recent_blocks",
+   "description": "Height, hash, block time and difficulty of the most recent N Zcash blocks (N ≤ 20). When to use: check whether ZEC is producing blocks normally, and at what interval."
+  },
+  {
+   "name": "btc_fee_estimates",
+   "description": "Recommended Bitcoin fees: rates (BTC/kvB) for 1/2/3/6/12/24-block confirmation targets, plus the mempool minimum fee. When to use: how much fee to pay, or what gets a fast confirmation. Do not use: overall congestion level → btc_mempool_summary."
+  },
+  {
+   "name": "btc_mempool_summary",
+   "description": "Bitcoin mempool overview: pending tx count, bytes used, minimum fee, total fees, capacity limit. When to use: is the network congested right now, or how big the backlog is."
+  },
+  {
+   "name": "btc_tx_lookup",
+   "description": "Look up a Bitcoin transaction by txid: confirmed or not, block height, confirmations, size, input/output summary. When to use: the user gives a 64-hex BTC txid and asks whether it confirmed or which block it is in. Do not use: other chains → chain_status."
+  },
+  {
+   "name": "btc_block_summary",
+   "description": "Bitcoin block summary: tx count, size, weight, block time, confirmations; omit parameters for the current chain tip. When to use: how many transactions the latest block holds, or an overview of a given height or block hash."
+  },
+  {
+   "name": "btc_address_summary",
+   "description": "Balance and activity of a Bitcoin address: confirmed/unconfirmed balance, UTXO count and total, tx count, last 10 transactions. Supports P2PKH (1…), P2SH (3…), bech32 (bc1q…), bech32m (bc1p…). When to use: how much BTC this address holds, whether it received funds, how active it is. Note: ultra-active addresses such as exchange cold wallets may return a degraded response under index load."
+  },
+  {
+   "name": "kas_node_status",
+   "description": "Kaspa node status: network height, DAA score, difficulty, network hashrate, DAG tips, block reward, 10 BPS cadence, next halving and the hashport ports this node serves. When to use: how high and how healthy the Kaspa node is, or the halving schedule. Do not use: our own pool's miners/blocks → kas_pool_status."
+  },
+  {
+   "name": "kas_pool_status",
+   "description": "RobotBase Kaspa solo hashport: tier state, pool hashrate, connected miners, accepted shares, blocks found, uptime, share difficulty, the last block found (hash, blue score, age) and stale/invalid counts. When to use: is the KAS hashport live, who is mining on it, did it ever find a real mainnet block. Do not use: chain-level hashrate → kas_node_status."
+  },
+  {
+   "name": "rvn_node_status",
+   "description": "Ravencoin node status: height, sync state, network hashrate, difficulty and client version. When to use: whether the RVN node is synced and how big the network is right now."
+  },
+  {
+   "name": "rvn_pool_status",
+   "description": "RobotBase Ravencoin solo hashport: engine state, pool hashrate, connected miners, shares, share difficulty, the Stratum endpoint, fee and the per-miner independent coinbase payout mode. When to use: is the RVN hashport open, is anyone mining, what endpoint do I point a GPU rig at. Do not use: node-level data → rvn_node_status."
+  },
+  {
+   "name": "utxo_chain_status",
+   "description": "Node status for DOGE or LTC (height, sync progress, peers, mempool tx count). When to use: Dogecoin or Litecoin node progress. For BTC/KAS/ZEC/RVN use chain_status (any chain in one call)."
+  },
+  {
+   "name": "robotbase_services",
+   "description": "Live availability of every service behind the RobotBase gateway: the chain nodes, hashport engines, Web3 Agent Hub, AITOKENS and MCP itself. When to use: an overall health check, or which services are down."
+  }
+ ]
+}

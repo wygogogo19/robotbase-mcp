@@ -1,34 +1,27 @@
 #!/usr/bin/env python3
-"""RobotBase MCP Server — read-only multi-chain data tools (BTC / XMR / ZEC / DOGE / LTC).
-
-Open-source reference implementation. It talks to YOUR OWN nodes; configure every endpoint
-with the RB_* environment variables below (see examples/env.example). The hosted service is
-available at https://robotbase.cc/mcp with no setup required.
-
-Read-only by design: no trading, no signing, no custody.
-"""
+"""RobotBase MCP Server — read-only multi-chain data tools (BTC / KAS / ZEC / RVN / DOGE / LTC)."""
 import base64, hashlib, html, json, os, re, socket, sqlite3, threading, time, urllib.error, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("RB_PORT", "8090"))
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "robotbase-mcp", "version": "0.3.0", "title": "RobotBase 链上数据 MCP"}
-# ---------------- configuration (all via environment variables) ----------------
-# Optional env file holding BTC_RPC_URL / BTC_RPC_USER / BTC_RPC_PASS (same as RB_BTC_RPC_* vars)
+SERVER_INFO = {"name": "robotbase-mcp", "version": "0.4.0", "title": "RobotBase on-chain data MCP (six PoW chains)"}
+# Optional env file holding BTC_RPC_URL / BTC_RPC_USER / BTC_RPC_PASS
 BTC_ENV = os.environ.get("RB_BTC_ENV", "")
-BTC_RPC_URL = os.environ.get("RB_BTC_RPC_URL", "http://127.0.0.1:8332")
-BTC_RPC_USER = os.environ.get("RB_BTC_RPC_USER", "")
-BTC_RPC_PASS = os.environ.get("RB_BTC_RPC_PASS", "")
-BTC_DASHBOARD = os.environ.get("RB_BTC_DASHBOARD", "http://127.0.0.1:8600/api/node")
-ELECTRS_HOST = os.environ.get("RB_ELECTRS_HOST", "127.0.0.1")
-ELECTRS_PORT = int(os.environ.get("RB_ELECTRS_PORT", "50001"))
-XMR_RPC = os.environ.get("RB_XMR_RPC", "http://127.0.0.1:18089/json_rpc")
-XMR_HELPER = os.environ.get("RB_XMR_HELPER", "http://127.0.0.1:18085/rpc")
 ZEC_BASE = os.environ.get("RB_ZEC_BASE", "http://127.0.0.1:8080")
 DOGE_BASE = os.environ.get("RB_DOGE_BASE", "http://127.0.0.1:8080")
 LTC_BASE = os.environ.get("RB_LTC_BASE", "http://127.0.0.1:8080")
+# Gateway aggregating the six nodes: /api/nodes, /api/pools, /api/services, /api/node/kas
 HOME_BASE = os.environ.get("RB_HOME_BASE", "http://127.0.0.1:8081")
+
 _cache, _cache_lock = {}, threading.Lock()
+# ---- BTC 地址摘要加固参数（2026-09-16）----
+BTC_ADDR_BUDGET = 4.0          # 硬预算秒数（SOP：慢工具 <4000ms）
+BTC_ADDR_CACHE_TTL = 60        # 正常结果缓存
+BTC_ADDR_CACHE_TTL_BAD = 20    # 降级/超时结果短暂缓存，避免热门地址反复打 electrs
+_addr_cache = {}
+_btc_gate = threading.Semaphore(1)   # 同一时刻只允许 1 个地址查询打 electrs（防低效路径洪水压垮索引层）
+
 _rl, _rl_lock = {}, threading.Lock()
 RATE_LIMIT_PER_MIN = 120
 
@@ -78,19 +71,11 @@ def cached(key, ttl, fn):
 
 
 def btc_rpc(method, params=None):
-    url = os.environ.get("RB_BTC_RPC_URL") or (BTC_ENV and _cfg(BTC_ENV, "BTC_RPC_URL")) or BTC_RPC_URL
-    user = os.environ.get("RB_BTC_RPC_USER") or (BTC_ENV and _cfg(BTC_ENV, "BTC_RPC_USER")) or BTC_RPC_USER
-    pw = os.environ.get("RB_BTC_RPC_PASS") or (BTC_ENV and _cfg(BTC_ENV, "BTC_RPC_PASS")) or BTC_RPC_PASS
+    url = _cfg(BTC_ENV, "BTC_RPC_URL") or os.environ.get("RB_BTC_RPC_URL", "http://127.0.0.1:8332")
+    user, pw = _cfg(BTC_ENV, "BTC_RPC_USER"), _cfg(BTC_ENV, "BTC_RPC_PASS")
     creds = base64.b64encode(f"{user}:{pw}".encode()).decode()
     d = _http_json(url, {"jsonrpc": "1.0", "id": "mcp", "method": method, "params": params or []},
                    headers={"Authorization": "Basic " + creds})
-    if d.get("error"):
-        raise RuntimeError(str(d["error"]))
-    return d.get("result")
-
-
-def xmr_rpc(method, params=None):
-    d = _http_json(XMR_RPC, {"jsonrpc": "2.0", "id": "mcp", "method": method, "params": params or {}})
     if d.get("error"):
         raise RuntimeError(str(d["error"]))
     return d.get("result")
@@ -110,30 +95,43 @@ def truncate(obj, limit=3800):
     return s if len(s) <= limit else s[:limit] + '…(truncated)'
 
 
+SIX_CHAINS = ("btc", "kas", "zec", "rvn", "doge", "ltc")
+
+
 def t_list_chains():
-    d = cached("home", 15, lambda: _http_json(HOME_BASE + "/api/services"))
-    out = []
-    for s in d.get("status", []):
-        if s.get("id") in ("btc", "xmr", "zec", "doge", "ltc"):
-            out.append({"chain": s["id"], "ok": bool(s.get("ok")), "metric": s.get("metric") or s.get("error")})
+    """The six chains this gateway serves, with live node state and height."""
+    d = cached("nodes", 15, lambda: _http_json(HOME_BASE + "/api/nodes"))
+    nodes = d.get("nodes") or {}
+    out = [{"chain": c, "ok": bool((nodes.get(c) or {}).get("ok")),
+            "synced": bool((nodes.get(c) or {}).get("synced")),
+            "height": (nodes.get(c) or {}).get("height"),
+            "state": (nodes.get(c) or {}).get("state")}
+           for c in SIX_CHAINS]
     return {"chains": out, "updated_utc": d.get("updated_utc")}
 
 
 def t_chain_status(chain):
     chain = (chain or "").lower()
     if chain == "btc":
-        d = cached("btc_node", 10, lambda: _http_json(BTC_DASHBOARD))
+        d = cached("btc_node", 10, lambda: _http_json("http://127.0.0.1:8600/api/node"))
         return {k: d.get(k) for k in ("chain", "blocks", "headers", "verification_progress_pct", "initial_block_download",
                                       "connections", "connections_out", "mempool_txs", "mempool_usage_mb",
                                       "size_on_disk_gb", "version", "rpc_ok")}
-    if chain == "xmr":
-        r = xmr_rpc("get_info")
-        return {k: r.get(k) for k in ("height", "target_height", "synchronized", "status", "difficulty",
-                                      "outgoing_connections_count", "incoming_connections_count", "version",
-                                      "database_size", "tx_pool_size", "mainnet")}
+    if chain == "kas":
+        d = cached("kas_node", 10, lambda: _http_json(HOME_BASE + "/api/node/kas"))
+        n = d.get("node") or {}
+        return {k: n.get(k) for k in ("chain", "client", "status", "network_height", "daa_score", "difficulty",
+                                      "network_hashrate_hs", "dag_tips", "block_reward_kas", "block_time_s",
+                                      "bps", "next_halving_utc", "next_halving_reward_kas")}
+    if chain == "rvn":
+        d = cached("nodes", 10, lambda: _http_json(HOME_BASE + "/api/nodes"))
+        n = (d.get("nodes") or {}).get("rvn") or {}
+        return {k: n.get(k) for k in ("height", "network", "difficulty", "client", "synced", "state", "ok")}
     if chain in ("zec", "doge", "ltc"):
         return svc_status(chain)
-    raise ValueError("chain must be one of: btc, xmr, zec, doge, ltc")
+    if chain == "utxo":
+        raise ValueError("use utxo_chain_status with doge or ltc")
+    raise ValueError("chain must be one of: btc, kas, zec, rvn, doge, ltc")
 
 
 def t_zec_chain_info():
@@ -156,9 +154,9 @@ def t_btc_fee_estimates():
     for target in (1, 2, 3, 6, 12, 24):
         try:
             r = btc_rpc("estimatesmartfee", [target])
-            out[f"{target}块"] = {"btc_per_kvb": r.get("feerate"), "blocks": r.get("blocks")}
+            out[f"{target}_blocks"] = {"btc_per_kvb": r.get("feerate"), "blocks": r.get("blocks")}
         except Exception as e:  # noqa: BLE001
-            out[f"{target}块"] = {"error": str(e)[:80]}
+            out[f"{target}_blocks"] = {"error": str(e)[:80]}
     mp = btc_rpc("getmempoolinfo")
     return {"estimates": out, "mempool_min_fee_btc_kvb": mp.get("mempoolminfee"),
             "mempool_txs": mp.get("size"), "mempool_mb": round((mp.get("bytes") or 0) / 1e6, 1)}
@@ -208,27 +206,6 @@ def t_btc_block_summary(height=None, blockhash=None):
             "previousblockhash": hdr.get("previousblockhash")}
 
 
-def t_xmr_node_info():
-    r = xmr_rpc("get_info")
-    return {k: r.get(k) for k in ("height", "target_height", "synchronized", "status", "difficulty", "version",
-                                  "outgoing_connections_count", "incoming_connections_count", "database_size",
-                                  "tx_pool_size", "free_space", "nettype")}
-
-
-def t_xmr_fee_estimate():
-    r = xmr_rpc("get_fee_estimate")
-    return {"fee_per_byte": r.get("fee"), "fees": r.get("fees"), "quantization_mask": r.get("quantization_mask"),
-            "status": r.get("status")}
-
-
-def t_xmr_last_block():
-    r = xmr_rpc("get_last_block_header")
-    h = (r or {}).get("block_header") or {}
-    return {"height": h.get("height"), "hash": h.get("hash"), "timestamp": h.get("timestamp"),
-            "difficulty": h.get("difficulty"), "reward": h.get("reward"), "block_size": h.get("block_size"),
-            "num_txes": h.get("num_txes")}
-
-
 def t_utxo_chain_status(chain):
     chain = (chain or "").lower()
     if chain not in ("doge", "ltc"):
@@ -241,6 +218,55 @@ def t_robotbase_services():
     return {"updated_utc": d.get("updated_utc"),
             "services": [{"id": s["id"], "ok": bool(s.get("ok")), "metric": s.get("metric") or s.get("error")}
                          for s in d.get("status", [])]}
+
+
+# ---------------- KAS / RVN: node + hashport telemetry from the gateway ----------------
+def t_kas_node_status():
+    """Kaspa node state straight off the gateway's read-only KAS node API."""
+    d = cached("kas_node_info", 10, lambda: _http_json(HOME_BASE + "/api/node/kas"))
+    n = d.get("node") or {}
+    pool = d.get("serves_pool") or {}
+    return {"updated_utc": d.get("updated_utc"), "chain": n.get("chain"), "client": n.get("client"),
+            "status": n.get("status"), "network_height": n.get("network_height"), "daa_score": n.get("daa_score"),
+            "difficulty": n.get("difficulty"), "network_hashrate_hs": n.get("network_hashrate_hs"),
+            "dag_tips": n.get("dag_tips"), "block_reward_kas": n.get("block_reward_kas"),
+            "block_time_s": n.get("block_time_s"), "bps": n.get("bps"),
+            "next_halving_utc": n.get("next_halving_utc"), "next_halving_reward_kas": n.get("next_halving_reward_kas"),
+            "hashport": {"ports": pool.get("ports"), "tiers_online": pool.get("tiers_online"),
+                         "dashboard": pool.get("dashboard")}}
+
+
+def t_kas_pool_status():
+    """Our own Kaspa solo hashport: fleet state plus the on-chain block it found."""
+    d = cached("pools", 10, lambda: _http_json(HOME_BASE + "/api/pools"))
+    p = (d.get("pools") or {}).get("kaspool") or {}
+    return {"updated_utc": d.get("updated_utc"), "pool": "kaspool", "state": p.get("state"),
+            "height": p.get("height"), "network": p.get("network"), "pool_hashrate": p.get("hashrate"),
+            "miners": p.get("workers"), "shares": p.get("shares"), "blocks_found": p.get("blocks"),
+            "uptime": p.get("uptime"), "share_difficulty": p.get("difficulty"),
+            "last_block": {"hash": p.get("block_hash"), "short": p.get("block_short"),
+                           "blue_score": p.get("block_bluescore"), "age": p.get("block_age")},
+            "stale": p.get("stale"), "invalid": p.get("invalid")}
+
+
+def t_rvn_node_status():
+    """Ravencoin node state (height, network hashrate, difficulty, sync)."""
+    d = cached("nodes", 10, lambda: _http_json(HOME_BASE + "/api/nodes"))
+    n = (d.get("nodes") or {}).get("rvn") or {}
+    return {"updated_utc": d.get("updated_utc"), "chain": "ravencoin", "client": n.get("client"),
+            "synced": bool(n.get("synced")), "state": n.get("state"), "height": n.get("height"),
+            "network_hashrate": n.get("network"), "difficulty": n.get("difficulty")}
+
+
+def t_rvn_pool_status():
+    """Our own Ravencoin solo hashport: engine state, per-miner coinbase, endpoint."""
+    d = cached("pools", 10, lambda: _http_json(HOME_BASE + "/api/pools"))
+    p = (d.get("pools") or {}).get("rvnpool") or {}
+    return {"updated_utc": d.get("updated_utc"), "pool": "rvnpool", "state": p.get("state"),
+            "height": p.get("height"), "network": p.get("network"), "pool_hashrate": p.get("hashrate"),
+            "miners": p.get("workers"), "shares": p.get("shares"), "share_difficulty": p.get("difficulty"),
+            "sync": p.get("sync"), "stratum": p.get("endpoint"), "fee": p.get("fee"),
+            "payout": "per-miner independent coinbase"}
 
 
 # ---------------- BTC: electrs (Electrum protocol) + address decoding ----------------
@@ -322,8 +348,8 @@ def address_to_scripthash(addr):
 
 
 def electrum_call(method, params, host=None, port=None, timeout=10):
-    host = host or ELECTRS_HOST
-    port = port or ELECTRS_PORT
+    host = host or os.environ.get("RB_ELECTRS_HOST", "127.0.0.1")
+    port = port or int(os.environ.get("RB_ELECTRS_PORT", "50001"))
     with socket.create_connection((host, port), timeout=timeout) as s:
         s.settimeout(timeout)
         s.sendall((json.dumps({"id": 1, "method": method, "params": params}) + "\n").encode())
@@ -337,92 +363,87 @@ def electrum_call(method, params, host=None, port=None, timeout=10):
 
 
 def t_btc_address_summary(address):
+    """BTC 地址摘要（2026-09-16 加固：4s 硬预算 + 分步降级 + 独立缓存）
+
+    背景：SOP 要求慢工具 <4000ms；原实现三步各给 8/8/6s 超时（最坏 22s），
+    且失败不缓存 → 热门地址会反复打 electrs 并触发 LLM 超时。
+    """
     sh = address_to_scripthash(address)
+    key = "btcaddr_" + sh
+    now = time.time()
+    with _cache_lock:
+        hit = _addr_cache.get(key)
+        if hit and now - hit[0] < hit[2]:
+            out = dict(hit[1]); out["cached"] = True; out["cache_age_sec"] = int(now - hit[0])
+            return out
+
+    t0 = time.monotonic()
+
+    def left(reserve=0.15):
+        return BTC_ADDR_BUDGET - (time.monotonic() - t0) - reserve
 
     def build():
+        notes, degraded = [], False
+        # ① 余额（必需，占预算大头）
+        bal = None
         try:
-            bal = electrum_call("blockchain.scripthash.get_balance", [sh], timeout=8).get("result") or {}
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError("该 BTC 地址活动量过大（或 electrs 繁忙）导致查询超时，请改用普通地址或稍后重试") from exc
-        note = None
-        try:
-            utxos = electrum_call("blockchain.scripthash.listunspent", [sh], timeout=8).get("result") or []
+            bal = electrum_call("blockchain.scripthash.get_balance", [sh],
+                                timeout=max(0.8, min(2.5, left()))).get("result") or {}
         except Exception:  # noqa: BLE001
-            utxos, note = [], "utxo 列表超时（地址过于活跃）"
+            bal = None
+        if bal is None:
+            return {"address": address, "degraded": True, "error": "electrs_timeout",
+                    "note": "4s 硬预算内未取到余额：地址过于活跃或 electrs 忙，请稍后重试",
+                    "elapsed_ms": int((time.monotonic() - t0) * 1000)}
+        # ② UTXO 列表（可选）
+        utxos = []
+        if left() < 0.5:
+            degraded = True; notes.append("预算不足，跳过 UTXO 列表")
+        else:
+            try:
+                utxos = electrum_call("blockchain.scripthash.listunspent", [sh],
+                                      timeout=max(0.6, min(1.2, left()))).get("result") or []
+            except Exception:  # noqa: BLE001
+                degraded = True; notes.append("UTXO 列表未取（活跃地址）")
+        # ③ 交易历史（可选，最慢的一步：大户动辄几十万条）
         hist = None
-        try:
-            hist = electrum_call("blockchain.scripthash.get_history", [sh], timeout=6).get("result") or []
-        except Exception:  # noqa: BLE001
-            note = (note + "；" if note else "") + "历史记录过大，已跳过"
+        if left() < 0.6:
+            degraded = True; notes.append("预算不足，跳过交易历史")
+        else:
+            try:
+                hist = electrum_call("blockchain.scripthash.get_history", [sh],
+                                     timeout=max(0.6, min(1.6, left()))).get("result") or []
+            except Exception:  # noqa: BLE001
+                degraded = True; notes.append("交易历史未取（地址过于活跃）")
         out = {"address": address,
                "balance_btc": round((bal.get("confirmed") or 0) / 1e8, 8),
                "unconfirmed_btc": round((bal.get("unconfirmed") or 0) / 1e8, 8),
                "utxo_count": len(utxos),
-               "utxo_value_btc": round(sum(u.get("value", 0) for u in utxos) / 1e8, 8)}
+               "utxo_value_btc": round(sum(u.get("value", 0) for u in utxos) / 1e8, 8),
+               "degraded": degraded,
+               "elapsed_ms": int((time.monotonic() - t0) * 1000)}
         if hist is not None:
             out["tx_count"] = len(hist)
-            out["confirmed_tx_count"] = sum(h.get("height", 0) > 0 for h in hist)
+            out["confirmed_tx_count"] = sum(1 for h in hist if h.get("height", 0) > 0)
             out["recent_txs"] = [{"txid": h.get("tx_hash"), "height": h.get("height")} for h in hist[-10:]]
         else:
             out["tx_count"] = None
-        if note:
-            out["note"] = note
+        if notes:
+            out["note"] = "; ".join(notes)
         return out
 
-    return cached("addr_" + sh, 60, build)
+    with _btc_gate:          # 串行化，避免并发低效查询把 electrs 线程池占满
+        val = build()
+    ttl = BTC_ADDR_CACHE_TTL_BAD if val.get("degraded") else BTC_ADDR_CACHE_TTL
+    with _cache_lock:
+        _addr_cache[key] = (now, val, ttl)
+    return val
 
 
 
 
-def xmr_full(method, params=None):
-    d = _http_json(XMR_HELPER, {"method": method, "params": params or {}}, timeout=28)
-    if not d.get("ok"):
-        raise RuntimeError(str(d.get("error"))[:160])
-    return d.get("result")
-
-
-def t_xmr_mempool_stats():
-    ps = (xmr_full("get_transaction_pool_stats") or {}).get("pool_stats") or {}
-    histo = ps.get("histo") or []
-    return {"bytes_total": ps.get("bytes_total"), "fee_total_atomic": ps.get("fee_total"),
-            "bytes_min": ps.get("bytes_min"), "bytes_med": ps.get("bytes_med"), "bytes_max": ps.get("bytes_max"),
-            "tx_count": sum(h.get("txs", 0) for h in histo), "histogram_top": histo[:6]}
-
-
-def t_xmr_tx_lookup(txid):
-    txid = (txid or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", txid):
-        raise ValueError("txid must be 64 hex chars")
-    r = xmr_full("get_transactions", {"txs_hashes": [txid], "decode_as_json": True}) or {}
-    txs = r.get("txs") or []
-    if not txs:
-        return {"txid": txid, "found": False, "status": r.get("status")}
-    tx = txs[0]
-    j = tx.get("as_json")
-    if isinstance(j, str):
-        try:
-            j = json.loads(j)
-        except Exception:
-            j = {}
-    j = j or {}
-    height = tx.get("block_height") or j.get("block_height")
-    out = {"txid": txid, "found": True, "in_pool": tx.get("in_pool"),
-           "block_height": height if isinstance(height, int) and height > 0 else None,
-           "unlock_time": j.get("unlock_time"),
-           "vin_count": len(j.get("vin") or []), "vout_count": len(j.get("vout") or []),
-           "output_indices": (tx.get("output_indices") or [])[:8]}
-    if out["block_height"]:
-        try:
-            info = xmr_rpc("get_info")
-            out["confirmations"] = max(0, (info.get("height") or 0) - out["block_height"] + 1)
-        except Exception:
-            pass
-    return out
-
-
-_HERE = os.path.dirname(os.path.abspath(__file__))
-USAGE_DB = os.environ.get("RB_USAGE_DB", os.path.join(_HERE, "usage.db"))
-BILLING_DB = os.environ.get("RB_BILLING_DB", "")
+USAGE_DB = os.environ.get("RB_USAGE_DB", "/opt/mcp/usage.db")
+BILLING_DB = os.environ.get("RB_BILLING_DB", "/opt/billing/billing.db")
 
 
 def _db(path, timeout=10):
@@ -432,14 +453,11 @@ def _db(path, timeout=10):
 
 
 def init_usage():
-    try:
-        con = _db(USAGE_DB)
-        con.execute("""CREATE TABLE IF NOT EXISTS calls(
-            ts INTEGER, tool TEXT, ok INTEGER, ms INTEGER, ip_hash TEXT, plan TEXT)""")
-        con.commit()
-        con.close()
-    except Exception:  # read-only filesystem or missing dir: auditing is optional
-        pass
+    con = _db(USAGE_DB)
+    con.execute("""CREATE TABLE IF NOT EXISTS calls(
+        ts INTEGER, tool TEXT, ok INTEGER, ms INTEGER, ip_hash TEXT, plan TEXT)""")
+    con.commit()
+    con.close()
 
 
 def log_call(tool, ok, ms, ip, plan):
@@ -455,8 +473,6 @@ def log_call(tool, ok, ms, ip, plan):
 
 
 def _has_billing():
-    if not BILLING_DB:
-        return False
     try:
         open(BILLING_DB).close()
         return True
@@ -523,89 +539,86 @@ def verify_key(key):
 
 TOOLS = [
     ("list_chains",
-     "列出本服务支持的全部公链（BTC/XMR/ZEC/DOGE/LTC）及其实时可用性与区块高度。"
-     "【何时用】用户问“你支持哪些链 / 哪些节点在线 / 各链现在多高”。"
-     "【不要用】查单条链的细节状态请用 chain_status。",
+     "Every chain this service supports (BTC/KAS/ZEC/RVN/DOGE/LTC) with live availability and block height. "
+     "When to use: the user asks which chains you support, which nodes are online, or how high each chain is. "
+     "Do not use: for detail on one chain, use chain_status.",
      {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_list_chains()),
     ("chain_status",
-     "查询【某一条链】节点的运行状态：区块高度、同步进度、已连接节点数、内存池笔数、客户端版本。"
-     "【何时用】“某条链的节点是否同步/健康/落后”。"
-     "【不要用】问手续费→btc_fee_estimates 或 xmr_fee_estimate；问地址余额→btc_address_summary。",
-     {"type": "object", "properties": {"chain": {"type": "string", "enum": ["btc", "xmr", "zec", "doge", "ltc"],
-                                                 "description": "链标识：btc / xmr / zec / doge / ltc"}},
+     "Run-time status of one chain's node: block height, sync progress, connected peers, mempool tx count, client version. "
+     "When to use: whether a given chain's node is synced, healthy or lagging. "
+     "Do not use: fees → btc_fee_estimates; address balance → btc_address_summary; pool detail → kas_pool_status / rvn_pool_status.",
+     {"type": "object", "properties": {"chain": {"type": "string",
+                                                 "enum": ["btc", "kas", "zec", "rvn", "doge", "ltc"],
+                                                 "description": "Chain id: btc / kas / zec / rvn / doge / ltc"}},
       "required": ["chain"], "additionalProperties": False}, lambda a: t_chain_status(a.get("chain"))),
     ("zec_chain_info",
-     "查询 Zcash 主网信息，含 6 个价值池供应量（transparent/sprout/sapling/orchard/lockbox/ironwood），即【屏蔽池状态】。"
-     "【何时用】“Zcash 的 shielded/sapling/orchard 池子里有多少 ZEC / 隐私池规模”。"
-     "【不要用】查 ZEC 节点是否同步→chain_status(zec)。",
+     "Zcash mainnet info including the supply of all six value pools (transparent/sprout/sapling/orchard/lockbox/ironwood) — i.e. shielded-pool state. "
+     "When to use: how much ZEC sits in the shielded/sapling/orchard pools, or privacy-pool size. "
+     "Do not use: whether the ZEC node is synced → chain_status(zec).",
      {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_zec_chain_info()),
     ("zec_recent_blocks",
-     "查询 Zcash 最近 N 个区块的高度、哈希、出块时间与难度（N 最大 20）。"
-     "【何时用】看 ZEC 最近出块是否正常、出块间隔。",
+     "Height, hash, block time and difficulty of the most recent N Zcash blocks (N ≤ 20). "
+     "When to use: check whether ZEC is producing blocks normally, and at what interval.",
      {"type": "object", "properties": {"n": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5,
-                                             "description": "返回最近多少个区块，默认 5"}},
+                                             "description": "How many recent blocks to return; default 5"}},
       "additionalProperties": False}, lambda a: t_zec_recent_blocks(a.get("n", 5))),
     ("btc_fee_estimates",
-     "查询比特币【推荐手续费】：按 1/2/3/6/12/24 个区块确认目标给出费率（BTC/kvB），并给出内存池最低费率。"
-     "【何时用】“转账该付多少手续费 / 多少能快速确认”。"
-     "【不要用】问网络拥堵程度→btc_mempool_summary。",
+     "Recommended Bitcoin fees: rates (BTC/kvB) for 1/2/3/6/12/24-block confirmation targets, plus the mempool minimum fee. "
+     "When to use: how much fee to pay, or what gets a fast confirmation. "
+     "Do not use: overall congestion level → btc_mempool_summary.",
      {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_btc_fee_estimates()),
     ("btc_mempool_summary",
-     "查询比特币内存池概况：待确认笔数、占用字节、最低费率、总手续费、容量上限。"
-     "【何时用】“现在网络堵不堵 / 内存池积压多少”。",
+     "Bitcoin mempool overview: pending tx count, bytes used, minimum fee, total fees, capacity limit. "
+     "When to use: is the network congested right now, or how big the backlog is.",
      {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_btc_mempool_summary()),
     ("btc_tx_lookup",
-     "按 txid 查询【比特币交易】：是否已确认、所在区块高度、确认数、大小、输入/输出摘要。"
-     "【何时用】用户给出 64 位十六进制 BTC 交易哈希，问“这笔交易确认了吗/在哪个块”。"
-     "【不要用】门罗币交易请用 xmr_tx_lookup。",
+     "Look up a Bitcoin transaction by txid: confirmed or not, block height, confirmations, size, input/output summary. "
+     "When to use: the user gives a 64-hex BTC txid and asks whether it confirmed or which block it is in. "
+     "Do not use: other chains → chain_status.",
      {"type": "object", "properties": {"txid": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$",
-                                                "description": "比特币交易哈希（64 位十六进制）"}},
+                                                "description": "Bitcoin transaction hash (64 hex chars)"}},
       "required": ["txid"], "additionalProperties": False}, lambda a: t_btc_tx_lookup(a.get("txid"))),
     ("btc_block_summary",
-     "查询【比特币区块】摘要：交易数、大小、权重、出块时间、确认数；不传参数则取当前链尖区块。"
-     "【何时用】“最新区块有多少笔交易 / 某个高度或区块哈希的概况”。",
-     {"type": "object", "properties": {"height": {"type": "integer", "description": "区块高度（可选）"},
-                                       "blockhash": {"type": "string", "description": "区块哈希（可选，与 height 二选一）"}},
+     "Bitcoin block summary: tx count, size, weight, block time, confirmations; omit parameters for the current chain tip. "
+     "When to use: how many transactions the latest block holds, or an overview of a given height or block hash.",
+     {"type": "object", "properties": {"height": {"type": "integer", "description": "Block height (optional)"},
+                                       "blockhash": {"type": "string", "description": "Block hash (optional; use instead of height)"}},
       "additionalProperties": False}, lambda a: t_btc_block_summary(a.get("height"), a.get("blockhash"))),
     ("btc_address_summary",
-     "查询【比特币地址】的余额与活动：已确认/未确认余额、UTXO 数量与总额、交易笔数、最近 10 笔交易。"
-     "支持 P2PKH（1…）、P2SH（3…）、bech32（bc1q…）、bech32m（bc1p…）。"
-     "【何时用】“这个地址有多少 BTC / 有没有收到款 / 活跃度”。"
-     "【注意】交易所冷钱包等超活跃地址可能因索引负载返回降级提示。",
-     {"type": "object", "properties": {"address": {"type": "string", "description": "比特币主网地址"}},
+     "Balance and activity of a Bitcoin address: confirmed/unconfirmed balance, UTXO count and total, tx count, last 10 transactions. "
+     "Supports P2PKH (1…), P2SH (3…), bech32 (bc1q…), bech32m (bc1p…). "
+     "When to use: how much BTC this address holds, whether it received funds, how active it is. "
+     "Note: ultra-active addresses such as exchange cold wallets may return a degraded response under index load.",
+     {"type": "object", "properties": {"address": {"type": "string", "description": "Bitcoin mainnet address"}},
       "required": ["address"], "additionalProperties": False}, lambda a: t_btc_address_summary(a.get("address"))),
-    ("xmr_node_info",
-     "查询门罗币【全节点信息】：高度、是否同步、难度、出/入连接数、数据库大小、内存池笔数、版本。"
-     "【何时用】“XMR 节点多高了 / 同步好了吗 / 有没有连上网络”。",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_xmr_node_info()),
-    ("xmr_fee_estimate",
-     "查询门罗币【手续费估算】：按字节费率与分档费率（低/中/高档）、量化掩码。"
-     "【何时用】“XMR 转账要多少手续费 / 现在费率多少”。",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_xmr_fee_estimate()),
-    ("xmr_last_block",
-     "查询门罗币【最新区块头】：高度、哈希、时间戳、难度、区块奖励、交易数。"
-     "【何时用】“XMR 最新出块时间 / 最新高度 / 是否卡块”。",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_xmr_last_block()),
-    ("xmr_tx_lookup",
-     "按 txid 查询【门罗币交易】：是否仍在内存池、是否已上链、所在区块高度与确认数、输入/输出数量、output indices。"
-     "【何时用】判断“某笔 XMR 交易/原子交换是否已上链、是否超时未确认”。"
-     "【不要用】比特币交易请用 btc_tx_lookup。",
-     {"type": "object", "properties": {"txid": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$",
-                                                "description": "门罗币交易哈希（64 位十六进制）"}},
-      "required": ["txid"], "additionalProperties": False}, lambda a: t_xmr_tx_lookup(a.get("txid"))),
-    ("xmr_mempool_stats",
-     "查询门罗币【内存池统计】：总字节数、手续费合计、按体积分组的交易直方图（拥堵程度）。"
-     "【何时用】“XMR 现在拥堵吗 / 内存池里多少笔”。",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_xmr_mempool_stats()),
+    ("kas_node_status",
+     "Kaspa node status: network height, DAA score, difficulty, network hashrate, DAG tips, block reward, 10 BPS cadence, next halving and the hashport ports this node serves. "
+     "When to use: how high and how healthy the Kaspa node is, or the halving schedule. "
+     "Do not use: our own pool's miners/blocks → kas_pool_status.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_kas_node_status()),
+    ("kas_pool_status",
+     "RobotBase Kaspa solo hashport: tier state, pool hashrate, connected miners, accepted shares, blocks found, uptime, share difficulty, the last block found (hash, blue score, age) and stale/invalid counts. "
+     "When to use: is the KAS hashport live, who is mining on it, did it ever find a real mainnet block. "
+     "Do not use: chain-level hashrate → kas_node_status.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_kas_pool_status()),
+    ("rvn_node_status",
+     "Ravencoin node status: height, sync state, network hashrate, difficulty and client version. "
+     "When to use: whether the RVN node is synced and how big the network is right now.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_rvn_node_status()),
+    ("rvn_pool_status",
+     "RobotBase Ravencoin solo hashport: engine state, pool hashrate, connected miners, shares, share difficulty, the Stratum endpoint, fee and the per-miner independent coinbase payout mode. "
+     "When to use: is the RVN hashport open, is anyone mining, what endpoint do I point a GPU rig at. "
+     "Do not use: node-level data → rvn_node_status.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_rvn_pool_status()),
     ("utxo_chain_status",
-     "查询 DOGE 或 LTC 的节点状态（高度、同步进度、连接数、内存池笔数）。"
-     "【何时用】问狗狗币/莱特币节点进度。ZEC/BTC/XMR 请用 chain_status（一次可传任意链）。",
+     "Node status for DOGE or LTC (height, sync progress, peers, mempool tx count). "
+     "When to use: Dogecoin or Litecoin node progress. For BTC/KAS/ZEC/RVN use chain_status (any chain in one call).",
      {"type": "object", "properties": {"chain": {"type": "string", "enum": ["doge", "ltc"],
-                                                 "description": "doge 或 ltc"}},
+                                                 "description": "doge or ltc"}},
       "required": ["chain"], "additionalProperties": False}, lambda a: t_utxo_chain_status(a.get("chain"))),
     ("robotbase_services",
-     "查询 RobotBase 网关下【全部服务】的实时可用状态：5 条链节点 + Web3 Agent Hub + AITOKENS + MCP 自身。"
-     "【何时用】“整体巡检 / 有哪些服务挂了”。",
+     "Live availability of every service behind the RobotBase gateway: the chain nodes, hashport engines, Web3 Agent Hub, AITOKENS and MCP itself. "
+     "When to use: an overall health check, or which services are down.",
      {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_robotbase_services()),
 ]
 
@@ -629,8 +642,8 @@ def handle(msg):
         return {"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": PROTOCOL_VERSION, "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": SERVER_INFO,
-            "instructions": ("RobotBase 只读链上数据服务：BTC/XMR/ZEC/DOGE/LTC。"
-                             "所有工具均为只读查询，不执行任何交易或资金操作。")}}
+            "instructions": ("RobotBase read-only on-chain data service: BTC/KAS/ZEC/RVN/DOGE/LTC. "
+                             "Every tool is a read-only query; none of them execute trades or touch funds.")}}
     if method == "notifications/initialized" or mid is None:
         return None
     if method == "ping":
@@ -653,10 +666,10 @@ def handle(msg):
     return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"Method not found: {method}"}}
 
 
-DOC_TEMPLATE = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+DOC_TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>RobotBase MCP · 五大经典公链的 AI Agent 数据接口</title>
-<meta name="description" content="全网首个覆盖 BTC/XMR/ZEC/DOGE/LTC 5 大非 EVM 经典公链的只读高可用 MCP Server，免鉴权，无追踪。">
+<title>RobotBase MCP · read-only data API for AI agents on six PoW chains</title>
+<meta name="description" content="Read-only MCP server covering the classic non-EVM PoW chains (BTC/KAS/ZEC/RVN/DOGE/LTC). No API key, no tracking.">
 <style>
 :root{--bg:#070a0f;--panel:#0f141c;--line:#1f2733;--text:#e8eef6;--muted:#8b98a9;--brand:#ff7a2f;--brand2:#ffc46b}
 *{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif;
@@ -682,21 +695,21 @@ a{color:var(--brand2)}.muted{color:var(--muted);font-size:12.5px}.ok{color:#2ee6
 border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;pointer-events:none}.toast.on{opacity:1}
 </style></head><body><div class="wrap">
 <h1>RobotBase MCP Server</h1>
-<div class="tag">全网首个覆盖 BTC / XMR / ZEC / DOGE / LTC 五大非 EVM 经典公链的只读高可用 MCP Server · 免鉴权 · 无追踪</div>
-<div class="sub">让 Claude、Cursor、VS Code、ChatGPT 等 AI Agent 直接查询比特币内存池费率、门罗币交易与内存池、Zcash 屏蔽池供应量等链上数据。全部工具只读，不涉及交易与资金。</div>
+<div class="tag">Read-only MCP server for the six classic PoW chains — BTC / KAS / ZEC / RVN / DOGE / LTC · no API key · no tracking</div>
+<div class="sub">Let Claude, Cursor, Codex, VS Code or any MCP-capable agent query Bitcoin mempool fees, Zcash shielded-pool supply, Kaspa and Ravencoin node + hashport state and more — straight from our own bare-metal nodes. Every tool is read-only; none touch trading or funds.</div>
 
 <div class="card">
   <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
-    <a class="btn" href="#connect">接入方式</a>
-    <a class="btn ghost" href="/mcp/stats?hours=24">实时调用统计</a>
-    <a class="btn ghost" href="/mcp/tools">工具清单 JSON</a>
+    <a class="btn" href="#connect">Get connected</a>
+    <a class="btn ghost" href="/mcp/stats?hours=24">Live usage stats</a>
+    <a class="btn ghost" href="/mcp/tools">Tool list (JSON)</a>
     <a class="btn ghost" href="/mcp/server.json">Server Card</a>
   </div>
 </div>
 
-<h2 id="connect">一键接入</h2>
+<h2 id="connect">One-line setup</h2>
 <div class="card">
-  <p class="muted">Claude Desktop / Cursor / VS Code（远程 MCP）配置，复制即用：</p>
+  <p class="muted">Claude Desktop / Cursor / Codex / VS Code (remote MCP) — copy and go:</p>
 <pre id="cfg">{
   "mcpServers": {
     "robotbase": {
@@ -704,66 +717,66 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
     }
   }
 }</pre>
-  <p style="margin-top:12px"><button class="btn" onclick="copyCfg()">复制配置 JSON</button>
-  <button class="btn ghost" onclick="copyText('https://robotbase.cc/mcp')">复制端点 URL</button></p>
-  <p class="muted">命令行验证：</p>
+  <p style="margin-top:12px"><button class="btn" onclick="copyCfg()">Copy config JSON</button>
+  <button class="btn ghost" onclick="copyText('https://robotbase.cc/mcp')">Copy endpoint URL</button></p>
+  <p class="muted">Verify from the command line:</p>
 <pre>curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
        "params":{"name":"zec_chain_info","arguments":{}}}'</pre>
 </div>
 
-<h2>16 个只读工具</h2>
+<h2>All 16 read-only tools</h2>
 <div class="card" style="padding:0;overflow:hidden">
-<table><tr><th style="width:230px">工具</th><th>说明</th></tr>__TOOLS_ROWS__</table>
+<table><tr><th style="width:230px">Tool</th><th>What it returns</th></tr>__TOOLS_ROWS__</table>
 </div>
 
-<h2>架构</h2>
-<div class="card"><pre>外部 AI Agent ──HTTPS(Streamable HTTP)──► https://robotbase.cc/mcp
+<h2>Architecture</h2>
+<div class="card"><pre>External AI agent ──HTTPS (Streamable HTTP)──► https://robotbase.cc/mcp
                                             │ Cloudflare Tunnel
                                             ▼
-                      9108 网关 (/mcp 反代) ──► MCP 服务 (:8090)
-                        ├── BTC  9382   全节点 RPC + electrs（地址/交易索引）
-                        ├── XMR  9281   全节点（restricted RPC + 白名单 helper）
-                        ├── ZEC  9308   Zebra 全节点（含价值池/屏蔽池供应量）
-                        ├── DOGE 9309   全节点
-                        ├── LTC  9310   全节点
-                        └── 网关服务聚合（状态页 / 面板）</pre></div>
+                      9108 gateway (/mcp reverse proxy) ──► MCP service (:8090)
+                        ├── BTC  9382   full node RPC + electrs (address/tx index)
+                        ├── ZEC  9308   Zebra full node (incl. value-pool / shielded supply)
+                        ├── DOGE 9309   full node
+                        ├── LTC  9310   full node
+                        └── gateway service aggregation (status pages / dashboards)</pre></div>
 
-<h2>限流与隐私</h2>
+<h2>Rate limits and privacy</h2>
 <div class="card"><div class="grid">
-<div><div class="muted">匿名额度</div><div><b>120 次/分钟/IP</b></div></div>
-<div><div class="muted">API Key 额度</div><div><b>600 次/分钟/IP</b>（<code>X-API-Key</code>）</div></div>
-<div><div class="muted">隐私</div><div>审计仅存 IP 的 SHA256 前 16 位，<b>不记录查询参数</b></div></div>
-<div><div class="muted">数据性质</div><div>只读链上数据，不含交易/签名/托管</div></div>
+<div><div class="muted">Anonymous</div><div><b>120 req/min/IP</b></div></div>
+<div><div class="muted">With API key</div><div><b>600 req/min/IP</b> (<code>X-API-Key</code>)</div></div>
+<div><div class="muted">Privacy</div><div>Audit keeps only the first 16 chars of the IP SHA256 — <b>query arguments are never logged</b></div></div>
+<div><div class="muted">Data</div><div>Read-only on-chain data; no trading, signing or custody</div></div>
 </div></div>
 
-<h2>示例提问</h2>
+<h2>Example prompts</h2>
 <div class="card"><ul style="margin:0;padding-left:20px">
-<li>“现在 BTC 最划算的转账手续费是多少？” → <code>btc_fee_estimates</code></li>
-<li>“Zcash 的 shielded 池子现在有多少 ZEC？” → <code>zec_chain_info</code></li>
-<li>“帮我查这笔 XMR 交易上链了没、几确认了？” → <code>xmr_tx_lookup</code></li>
-<li>“这个比特币地址还有多少余额？” → <code>btc_address_summary</code></li>
-<li>“狗狗币节点追到哪了？” → <code>utxo_chain_status</code></li>
+<li>"What is the cheapest BTC fee right now?" → <code>btc_fee_estimates</code></li>
+<li>"How much ZEC is in the Zcash shielded pools?" → <code>zec_chain_info</code></li>
+<li>"Did our Kaspa hashport ever find a real mainnet block?" → <code>kas_pool_status</code></li>
+<li>"What is the balance of this Bitcoin address?" → <code>btc_address_summary</code></li>
+<li>"How far along is the Dogecoin node?" → <code>utxo_chain_status</code></li>
 </ul></div>
 
-<p class="muted" style="margin-top:26px">RobotBase · 只读链上数据基础设施 · <a href="https://robotbase.cc/">robotbase.cc</a> ·
-端点 <code>/mcp</code> · 清单 <code>/mcp/tools</code> · 审计 <code>/mcp/stats</code></p>
+<p class="muted" style="margin-top:26px">RobotBase · read-only on-chain data infrastructure · <a href="https://robotbase.cc/">robotbase.cc</a> ·
+endpoint <code>/mcp</code> · tool list <code>/mcp/tools</code> · audit <code>/mcp/stats</code></p>
 </div>
 <script>
 function copyText(s){navigator.clipboard&&navigator.clipboard.writeText(s).then(toast).catch(fallback);function fallback(){var t=document.createElement("textarea");t.value=s;document.body.appendChild(t);t.select();document.execCommand("copy");t.remove();toast()}}
 function copyCfg(){copyText(document.getElementById("cfg").innerText)}
-function toast(){var el=document.getElementById("t")||Object.assign(document.body.appendChild(document.createElement("div")),{id:"t",className:"toast"});el.textContent="已复制到剪贴板";el.classList.add("on");setTimeout(function(){el.classList.remove("on")},1600)}
+function toast(){var el=document.getElementById("t")||Object.assign(document.body.appendChild(document.createElement("div")),{id:"t",className:"toast"});el.textContent="Copied to clipboard";el.classList.add("on");setTimeout(function(){el.classList.remove("on")},1600)}
 </script>
 </body></html>"""
 
 
 def docs_html():
     groups = [
-        ("① 链状态总览", ["list_chains", "chain_status", "robotbase_services"]),
-        ("② 比特币 BTC", ["btc_fee_estimates", "btc_mempool_summary", "btc_tx_lookup", "btc_block_summary", "btc_address_summary"]),
-        ("③ 门罗币 XMR", ["xmr_node_info", "xmr_fee_estimate", "xmr_last_block", "xmr_tx_lookup", "xmr_mempool_stats"]),
-        ("④ Zcash ZEC", ["zec_chain_info", "zec_recent_blocks"]),
-        ("⑤ 狗狗币 / 莱特币", ["utxo_chain_status"]),
+        ("① Chain overview", ["list_chains", "chain_status", "robotbase_services"]),
+        ("② Bitcoin (BTC)", ["btc_fee_estimates", "btc_mempool_summary", "btc_tx_lookup", "btc_block_summary", "btc_address_summary"]),
+        ("③ Zcash (ZEC)", ["zec_chain_info", "zec_recent_blocks"]),
+        ("④ Kaspa (KAS)", ["kas_node_status", "kas_pool_status"]),
+        ("⑤ Ravencoin (RVN)", ["rvn_node_status", "rvn_pool_status"]),
+        ("⑥ Dogecoin / Litecoin", ["utxo_chain_status"]),
     ]
     desc = {n: d for n, d, _s, _f in TOOLS}
     rows = ""
@@ -771,12 +784,12 @@ def docs_html():
         rows += '<tr class="grp"><td colspan="2">' + gname + '</td></tr>'
         for n in names:
             d = desc.get(n, "")
-            short = d.split("【")[0].strip()
+            short = d.split("When to use")[0].split("Do not use")[0].split("Note:")[0].strip().rstrip(".") + "."
             when = ""
-            if "【何时用】" in d:
-                when = d.split("【何时用】")[1].split("【")[0].strip()
+            if "When to use:" in d:
+                when = d.split("When to use:")[1].split("Do not use")[0].split("Note:")[0].strip().rstrip(".")
             rows += ('<tr><td><code>' + n + '</code></td><td>' + short +
-                     ('<div class="when">何时用：' + when + '</div>' if when else '') + '</td></tr>')
+                     ('<div class="when">When to use: ' + when + '</div>' if when else '') + '</td></tr>')
     return DOC_TEMPLATE.replace("__TOOLS_ROWS__", rows)
 
 
@@ -785,9 +798,9 @@ def server_card():
     return {
         "name": "robotbase-mcp",
         "title": "RobotBase MCP Server",
-        "version": "0.3.0",
-        "description": "Read-only multi-chain data for AI agents: BTC / XMR / ZEC / DOGE / LTC. "
-                       "First MCP server covering all five classic non-EVM chains: mempool & fee estimates, "
+        "version": "0.4.0",
+        "description": "Read-only multi-chain data for AI agents: BTC / KAS / ZEC / RVN / DOGE / LTC. "
+                       "First MCP server covering six classic proof-of-work chains: mempool & fee estimates, "
                        "transaction lookup, address summary, shielded-pool supply, node status. No auth required, no tracking.",
         "homepage": "https://robotbase.cc/mcp",
         "transport": {"type": "streamable-http", "url": "https://robotbase.cc/mcp"},
@@ -795,7 +808,7 @@ def server_card():
         "capabilities": {"tools": {"listChanged": False}},
         "auth": {"type": "none", "optional": "X-API-Key header or ?key= raises rate limit to 600/min per IP"},
         "rateLimits": {"anonymous": "120/min per IP", "withApiKey": "600/min per IP"},
-        "tags": ["bitcoin", "monero", "zcash", "dogecoin", "litecoin", "blockchain-data", "onchain",
+        "tags": ["bitcoin", "kaspa", "zcash", "ravencoin", "dogecoin", "litecoin", "blockchain-data", "onchain",
                  "mempool", "fees", "privacy-coins", "read-only", "mcp-server"],
         "tools": [{"name": n, "description": desc[n]} for n, _d, _s, _f in TOOLS],
     }
@@ -835,7 +848,7 @@ class H(BaseHTTPRequestHandler):
         return self._plan_name
 
     def _rate_ok(self, limit):
-        ip = self.client_address[0]
+        ip = (self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For") or self.client_address[0])
         now = time.time()
         with _rl_lock:
             win = _rl.setdefault(ip, [])
@@ -871,9 +884,9 @@ class H(BaseHTTPRequestHandler):
             rows = "".join(
                 f'<tr><td>{html.escape(t2["tool"])}</td><td>{t2["calls"]}</td>'
                 f'<td>{round(t2["calls"]/max(d["total_calls"],1)*100,1)}%</td><td>{t2["avg_ms"]} ms</td></tr>'
-                for t2 in d["top_tools"]) or '<tr><td colspan="4" class="muted">暂无调用</td></tr>'
-            page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>RobotBase MCP · 用量审计</title><style>
+                for t2 in d["top_tools"]) or '<tr><td colspan="4" class="muted">No calls yet</td></tr>'
+            page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>RobotBase MCP · usage audit</title><style>
 body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif;background:#070a0f;color:#e8eef6;margin:0;padding:36px 20px}}
 .wrap{{max-width:960px;margin:0 auto}}h1{{margin:0 0 4px;font-size:24px}}.sub{{color:#8b98a9;margin-bottom:24px;font-size:13px}}
 .cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:26px}}
@@ -884,20 +897,20 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang S
 table{{width:100%;border-collapse:collapse;font-size:14px}}td,th{{border:1px solid #1f2733;padding:8px 10px;text-align:left}}
 th{{background:#0f141c;color:#ffc46b}}.muted{{color:#8b949e}}a{{color:#ffc46b}}code{{background:#0d1219;padding:2px 6px;border-radius:6px}}
 h2{{font-size:15px;margin:26px 0 10px;color:#ffc46b}}</style></head><body><div class="wrap">
-<h1>RobotBase MCP · 用量审计</h1>
-<div class="sub">统计窗口：最近 <b>{hours}</b> 小时 · 数据来源 <code>/opt/mcp/usage.db</code> · IP 仅保存 SHA256 前 16 位（不可逆）</div>
+<h1>RobotBase MCP · usage audit</h1>
+<div class="sub">Window: last <b>{hours}</b> hours · source <code>/opt/mcp/usage.db</code> · only the first 16 chars of the IP SHA256 are kept (irreversible)</div>
 <div class="cards">
-<div class="card"><div class="k">总调用</div><div class="v">{d["total_calls"]}</div></div>
-<div class="card"><div class="k">错误</div><div class="v">{d["errors"]}</div></div>
-<div class="card"><div class="k">独立客户端</div><div class="v">{d["unique_clients"]}</div></div>
-<div class="card"><div class="k">持 Key 调用</div><div class="v">{d["keyed_calls"]}</div></div>
-<div class="card"><div class="k">有效 Key 数</div><div class="v">{d["active_keys"]}</div></div>
+<div class="card"><div class="k">Total calls</div><div class="v">{d["total_calls"]}</div></div>
+<div class="card"><div class="k">Errors</div><div class="v">{d["errors"]}</div></div>
+<div class="card"><div class="k">Unique clients</div><div class="v">{d["unique_clients"]}</div></div>
+<div class="card"><div class="k">Keyed calls</div><div class="v">{d["keyed_calls"]}</div></div>
+<div class="card"><div class="k">Active keys</div><div class="v">{d["active_keys"]}</div></div>
 </div>
-<h2>每小时调用量</h2><div class="bars">{bars}</div>
-<h2>工具排行</h2>
-<table><tr><th>工具</th><th>调用数</th><th>占比</th><th>平均耗时</th></tr>{rows}</table>
-<p class="sub" style="margin-top:18px">JSON 版本：<a href="/mcp/stats?hours={hours}&amp;format=json">/mcp/stats?format=json</a> ·
-其他窗口：<a href="/mcp/stats?hours=1">1h</a> · <a href="/mcp/stats?hours=6">6h</a> · <a href="/mcp/stats?hours=24">24h</a> · <a href="/mcp/stats?hours=168">7d</a></p>
+<h2>Calls per hour</h2><div class="bars">{bars}</div>
+<h2>Tool ranking</h2>
+<table><tr><th>Tool</th><th>Calls</th><th>Share</th><th>Avg latency</th></tr>{rows}</table>
+<p class="sub" style="margin-top:18px">JSON: <a href="/mcp/stats?hours={hours}&amp;format=json">/mcp/stats?format=json</a> ·
+other windows: <a href="/mcp/stats?hours=1">1h</a> · <a href="/mcp/stats?hours=6">6h</a> · <a href="/mcp/stats?hours=24">24h</a> · <a href="/mcp/stats?hours=168">7d</a></p>
 </div></body></html>"""
             return self._send(200, page, "text/html; charset=utf-8")
         if self.path.startswith("/tools"):
@@ -930,7 +943,8 @@ h2{{font-size:15px;margin:26px 0 10px;color:#ffc46b}}</style></head><body><div c
             if isinstance(m, dict) and m.get("method") == "tools/call":
                 name = ((m.get("params") or {}).get("name") or "?")
                 ok = not ((r.get("result") or {}).get("isError") is True)
-                log_call(name, ok, (time.time() - started) * 1000, self.client_address[0], plan)
+                log_call(name, ok, (time.time() - started) * 1000,
+                             (self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For") or self.client_address[0]), plan)
         if not responses:
             return self._send(202, b"")
         payload = responses if batch else responses[0]
@@ -944,4 +958,4 @@ h2{{font-size:15px;margin:26px 0 10px;color:#ffc46b}}</style></head><body><div c
 
 if __name__ == "__main__":
     init_usage()
-    ThreadingHTTPServer((os.environ.get("RB_BIND", "127.0.0.1"), PORT), H).serve_forever()
+    ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
