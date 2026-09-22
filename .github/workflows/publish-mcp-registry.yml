@@ -1,0 +1,37 @@
+name: Publish to MCP Registry
+
+# Publishes mcp-registry.json to the official MCP Registry using GitHub OIDC, so a
+# version bump only needs a commit (or a v* tag) instead of a manual CLI + device flow.
+#
+# The registry validates namespace ownership: the workflow must run in
+# wygogogo19/robotbase-mcp to publish io.github.wygogogo19/robotbase-mcp.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "mcp-registry.json"
+      - ".github/workflows/publish-mcp-registry.yml"
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write      # required for OIDC authentication
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Authenticate to the MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish mcp-registry.json
+        run: ./mcp-publisher publish mcp-registry.json

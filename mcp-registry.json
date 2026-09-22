@@ -1,0 +1,18 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.wygogogo19/robotbase-mcp",
+  "description": "Read-only on-chain data (15 tools) for BTC, KAS, ZEC, RVN, LTC and DOGE.",
+  "version": "0.4.0",
+  "repository": {
+    "url": "https://github.com/wygogogo19/robotbase-mcp",
+    "source": "github",
+    "id": "1368415872"
+  },
+  "websiteUrl": "https://robotbase.cc/mcp",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://robotbase.cc/mcp"
+    }
+  ]
+}
