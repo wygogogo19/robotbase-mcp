@@ -33,5 +33,20 @@ jobs:
       - name: Authenticate to the MCP Registry (GitHub OIDC)
         run: ./mcp-publisher login github-oidc
 
+      - name: Skip if this version is already published
+        id: registry
+        run: |
+          VERSION=$(python3 -c "import json;print(json.load(open('mcp-registry.json'))['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if curl -fsS "https://registry.modelcontextprotocol.io/v0/servers?search=io.github.wygogogo19/robotbase-mcp" \
+               | python3 -c "import json,sys;d=json.load(sys.stdin);sys.exit(0 if any(i['server']['version']=='$VERSION' for i in d.get('servers',[])) else 1)"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Already published::$VERSION is already in the MCP Registry — nothing to do."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Publishing::$VERSION is new — will publish."
+          fi
+
       - name: Publish mcp-registry.json
+        if: steps.registry.outputs.skip != 'true'
         run: ./mcp-publisher publish mcp-registry.json
