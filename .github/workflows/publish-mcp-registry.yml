@@ -33,6 +33,11 @@ jobs:
       - name: Authenticate to the MCP Registry (GitHub OIDC)
         run: ./mcp-publisher login github-oidc
 
+      # Fail fast with the registry's own error text instead of a red publish step.
+      # (The registry rejects e.g. descriptions longer than 100 characters.)
+      - name: Validate the manifest
+        run: ./mcp-publisher validate mcp-registry.json
+
       - name: Skip if this version is already published
         id: registry
         run: |
