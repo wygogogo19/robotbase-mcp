@@ -5,7 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("RB_PORT", "8090"))
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "robotbase-mcp", "version": "0.4.0", "title": "RobotBase on-chain data MCP (six PoW chains)"}
+SERVER_INFO = {"name": "robotbase-mcp", "version": "0.5.0", "title": "RobotBase on-chain data MCP (six PoW chains)"}
 # Optional env file holding BTC_RPC_URL / BTC_RPC_USER / BTC_RPC_PASS
 BTC_ENV = os.environ.get("RB_BTC_ENV", "")
 ZEC_BASE = os.environ.get("RB_ZEC_BASE", "http://127.0.0.1:8080")
@@ -537,6 +537,309 @@ def verify_key(key):
         return "anon"
 
 
+# =================== v0.5.0: mining / fee / attribution intelligence =============
+# Every datum here comes from infrastructure we run ourselves. Chains where we have
+# no source are reported as unavailable rather than filled with a guess.
+
+KAS_BLOCK_DB = os.environ.get("RB_KAS_BLOCK_DB", "/var/lib/robotbase-home/kas_blocks.db")
+# KAS stratum bridges (one HTTP stats endpoint per tier). The host comes from a single
+# constant so the public build can swap it for RB_KAS_BRIDGE_BASE.
+KAS_BRIDGE_BASE = os.environ.get("RB_KAS_BRIDGE_BASE", "http://127.0.0.1")
+HOME = HOME_BASE
+
+# Halving schedules (public consensus rules) + the live height comes from our nodes.
+HALVING = {
+    "btc":  {"next_height": 1050000, "interval": 210000, "reward": "3.125", "next_reward": "1.5625",
+             "block_time_s": 600, "unit": "BTC", "note": "4-year epoch, 210,000 blocks"},
+    "zec":  {"next_height": 4406400, "interval": 1680000, "reward": "1.5625", "next_reward": "0.78125",
+             "block_time_s": 75, "unit": "ZEC", "note": "post-Blossom 1,680,000-block interval"},
+    "ltc":  {"next_height": 3360000, "interval": 840000, "reward": "6.25", "next_reward": "3.125",
+             "block_time_s": 150, "unit": "LTC", "note": "840,000-block interval"},
+    "rvn":  {"next_height": 6300000, "interval": 2100000, "reward": "2500", "next_reward": "1250",
+             "block_time_s": 60, "unit": "RVN", "note": "2,100,000-block interval"},
+    "doge": {"next_height": None, "interval": None, "reward": "10000", "next_reward": "10000",
+             "block_time_s": 60, "unit": "DOGE",
+             "note": "no further halvings: flat 10,000 DOGE per block since block 600,000"},
+}
+
+ZIP317_FEE = 0.00001          # Zcash conventional fee per logical action (ZIP-317)
+
+
+def _heights():
+    """Live heights from the gateway (our own nodes)."""
+    d = cached("nodes", 15, lambda: _http_json(HOME + "/api/nodes"))
+    out = {}
+    for cid, node in (d.get("nodes") or {}).items():
+        h = str(node.get("height") or "").replace("#", "").replace(",", "")
+        try:
+            out[cid] = int(float(h))
+        except ValueError:
+            out[cid] = None
+    return out
+
+
+def t_pow_halving_oracle():
+    heights = _heights()
+    out = []
+    for cid, spec in HALVING.items():
+        cur = heights.get(cid)
+        if spec["next_height"] is None:
+            out.append({"chain": cid.upper(), "next_halving": None,
+                        "reason": spec["note"], "current_reward": spec["reward"] + " " + spec["unit"]})
+            continue
+        remaining = None if cur is None else max(0, spec["next_height"] - cur)
+        item = {"chain": cid.upper(), "height": cur, "next_halving_height": spec["next_height"],
+                "blocks_remaining": remaining,
+                "eta_days": round(remaining * spec["block_time_s"] / 86400, 1) if remaining is not None else None,
+                "reward_now": spec["reward"] + " " + spec["unit"],
+                "reward_after": spec["next_reward"] + " " + spec["unit"],
+                "schedule": spec["note"]}
+        out.append(item)
+    # Kaspa: epoch-based reduction, read from our own node
+    try:
+        k = (_http_json(HOME + "/api/node/kas").get("node") or {})
+        out.append({"chain": "KAS", "height": k.get("network_height"),
+                    "next_halving_utc": k.get("next_halving_utc"),
+                    "reward_now": f"{k.get('block_reward_kas')} KAS" if k.get("block_reward_kas") else None,
+                    "reward_after": f"{k.get('next_halving_reward_kas')} KAS" if k.get("next_halving_reward_kas") else None,
+                    "schedule": "deflationary epoch reduction (monthly, 2^(1/12) per epoch)", "source": "our kaspad"})
+    except Exception:  # noqa: BLE001
+        out.append({"chain": "KAS", "next_halving_utc": None, "reason": "kas node unreachable"})
+    return {"chains": out, "source": "our own full nodes + published consensus schedules",
+            "note": "heights are read live; schedules are protocol constants, not estimates"}
+
+
+def t_pow_network_mining_intel():
+    """Network hashrate / difficulty per chain, with the method stated per chain."""
+    out = {}
+    try:                                                        # BTC: real node RPC
+        out["BTC"] = {"difficulty": btc_rpc("getdifficulty"),
+                      "network_hashrate_hs": btc_rpc("getnetworkhashps"),
+                      "source": "our bitcoind getnetworkhashps"}
+    except Exception as exc:  # noqa: BLE001
+        out["BTC"] = {"error": type(exc).__name__}
+    try:                                                        # KAS: our node API
+        n = (_http_json(HOME + "/api/node/kas").get("node") or {})
+        out["KAS"] = {"difficulty": n.get("difficulty"), "network_hashrate_hs": n.get("network_hashrate_hs"),
+                      "height": n.get("network_height"), "bps": n.get("bps"), "source": "our kaspad"}
+    except Exception as exc:  # noqa: BLE001
+        out["KAS"] = {"error": type(exc).__name__}
+    try:                                                        # RVN: our node stats API
+        n = (_http_json(HOME + "/api/pools").get("pools", {}).get("rvnpool") or {})
+        out["RVN"] = {"difficulty": n.get("difficulty"), "network_hashrate": n.get("network"),
+                      "height": n.get("height"), "source": "our ravend"}
+    except Exception as exc:  # noqa: BLE001
+        out["RVN"] = {"error": type(exc).__name__}
+    for cid, key, base, factor, block_s in (("ZEC", "zec", ZEC_BASE, 8192, 75),
+                                            ("LTC", "ltc", LTC_BASE, 65536, 150),
+                                            ("DOGE", "doge", DOGE_BASE, 65536, 60)):
+        try:
+            d = _http_json(base + "/api/status")
+            diff = d.get("difficulty")
+            out[cid] = {"difficulty": diff, "height": d.get("blocks"),
+                        "network_hashrate_hs": (float(diff) * factor / block_s) if diff else None,
+                        "hashrate_method": "difficulty-derived (difficulty * %d / %ds)" % (factor, block_s),
+                        "source": "our %s node status API" % key}
+        except Exception as exc:  # noqa: BLE001
+            out[cid] = {"error": type(exc).__name__}
+    return {"chains": out,
+            "note": "BTC/KAS/RVN are node-reported; ZEC/LTC/DOGE hashrate is derived from difficulty with the "
+                    "factor printed next to it. No third-party API is involved."}
+
+
+def t_get_recommended_fee_rate(chain=None):
+    cid = (chain or "btc").lower()
+    if cid == "btc":
+        try:
+            fast = btc_rpc("estimatesmartfee", [1]) or {}
+            med = btc_rpc("estimatesmartfee", [3]) or {}
+            slow = btc_rpc("estimatesmartfee", [10]) or {}
+            mi = btc_rpc("getmempoolinfo") or {}
+            to_sat = lambda f: round(float(f) * 1e8 / 1000, 2) if f else None
+            return {"chain": "BTC", "unit": "sat/vB",
+                    "fast": {"target_blocks": 1, "sat_vb": to_sat(fast.get("feerate"))},
+                    "medium": {"target_blocks": 3, "sat_vb": to_sat(med.get("feerate"))},
+                    "slow": {"target_blocks": 10, "sat_vb": to_sat(slow.get("feerate"))},
+                    "mempool_min_sat_vb": to_sat(mi.get("mempoolminfee")),
+                    "source": "our bitcoind estimatesmartfee + getmempoolinfo",
+                    "note": "agent can pick a tier and broadcast with broadcast_raw_transaction"}
+        except Exception as exc:  # noqa: BLE001
+            return {"chain": "BTC", "error": type(exc).__name__}
+    if cid == "zec":
+        return {"chain": "ZEC", "unit": "ZEC per logical action",
+                "conventional_fee": ZIP317_FEE,
+                "source": "ZIP-317 conventional fee (protocol rule)",
+                "note": "Zcash has no mempool fee auction like Bitcoin — ZIP-317 defines a fixed "
+                        "conventional fee; we report the protocol value, not a market estimate."}
+    return {"chain": cid.upper(), "available": False,
+            "reason": "we do not run a fee estimator for this chain yet (no node RPC exposed to the gateway)",
+            "what_we_do_have": ["chain_status", "utxo_chain_status", "mempool_congestion_status"]}
+
+
+def t_mempool_congestion_status(chain=None):
+    cid = (chain or "btc").lower()
+    if cid == "btc":
+        try:
+            mi = btc_rpc("getmempoolinfo") or {}
+            return {"chain": "BTC", "txs": mi.get("size"), "bytes": mi.get("bytes"),
+                    "usage_bytes": mi.get("usage"), "max_mempool_bytes": mi.get("maxmempool"),
+                    "min_fee_btc_per_kvb": mi.get("mempoolminfee"),
+                    "total_fees_btc": mi.get("total_fee"),
+                    "load_pct": round(100 * (mi.get("usage") or 0) / (mi.get("maxmempool") or 1), 1),
+                    "verdict": "busy" if (mi.get("usage") or 0) > 0.5 * (mi.get("maxmempool") or 1) else "normal",
+                    "source": "our bitcoind getmempoolinfo"}
+        except Exception as exc:  # noqa: BLE001
+            return {"chain": "BTC", "error": type(exc).__name__}
+    if cid in ("ltc", "doge"):
+        try:
+            d = svc_status(cid)
+            return {"chain": cid.upper(), "txs": d.get("mempool_txs"),
+                    "bytes": None, "min_fee": None,
+                    "source": "our %s node status API" % cid,
+                    "note": "tx count is live; byte size and min-fee are not exposed by that node API yet"}
+        except Exception as exc:  # noqa: BLE001
+            return {"chain": cid.upper(), "error": type(exc).__name__}
+    return {"chain": cid.upper(), "available": False,
+            "reason": "no mempool endpoint exposed for this chain on our nodes yet"}
+
+
+def t_zec_shielded_pools_metrics():
+    """Six Zcash value pools with share-of-supply and 1h/24h deltas."""
+    d = cached("factors", 60, lambda: _http_json(HOME + "/api/factors"))
+    g = ((d.get("groups") or {}).get("zec") or {})
+    meta = ((d.get("groups") or {}).get("meta") or {})
+    if not g:
+        return {"available": False, "reason": "ZEC factor sampler unavailable"}
+    has24 = str(meta.get("has_24h", "")).lower() not in ("", "no", "false")
+    pools = []
+    for pid in ("transparent", "sprout", "sapling", "orchard", "ironwood", "lockbox"):
+        bal = g.get(pid)
+        if not bal or bal == "—":
+            continue
+        try:
+            num = float(str(bal).replace(",", "").split()[0])
+        except ValueError:
+            num = None
+        entry = {"pool": pid, "balance": bal,
+                 "share_of_supply_pct": (round(num / float(str(g.get("supply", "0")).replace(",", "").split()[0]) * 100, 2)
+                                         if num and g.get("supply") else None),
+                 "delta_24h": g.get(pid + "_delta") if has24 else None,
+                 "delta_1h": g.get(pid + "_delta_1h")}
+        pools.append(entry)
+    return {"pools": pools, "shielded_total": g.get("shielded"), "supply": g.get("supply"),
+            "shielded_pct": g.get("shielded_pct"),
+            "shielded_delta_24h": g.get("shielded_delta_24h") if has24 else None,
+            "window": "24h" if has24 else "1h",
+            "source": "our Zebra node value-pool RPC, sampled by our own factor index",
+            "why_it_matters": "pool-by-pool capital allocation across privacy pools is not exposed by "
+                              "ordinary block explorers or by any other MCP server we know of"}
+
+
+def t_kas_pool_attribution_intel(hours=24):
+    """Local Kaspa block->pool attribution index (we index every block ourselves)."""
+    hours = max(1, min(24 * 30, int(hours or 24)))
+    since = int(time.time()) - hours * 3600
+    try:
+        con = sqlite3.connect("file:" + KAS_BLOCK_DB + "?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        total = con.execute("SELECT COUNT(*) c FROM blocks WHERE ts>=?", (since,)).fetchone()["c"]
+        rows = con.execute("SELECT pool, COUNT(*) c FROM blocks WHERE ts>=? GROUP BY pool ORDER BY c DESC",
+                           (since,)).fetchall()
+        overall = con.execute("SELECT COUNT(*) c, MIN(ts) a, MAX(ts) b FROM blocks").fetchone()
+        latest = [dict(r) for r in con.execute("SELECT hash, ts, blue, pool FROM blocks ORDER BY ts DESC LIMIT 3")]
+        con.close()
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "reason": f"{type(exc).__name__}: {str(exc)[:80]}"}
+    pools = [{"pool": r["pool"], "blocks": r["c"],
+              "share_pct": round(100.0 * r["c"] / total, 2) if total else None} for r in rows]
+    return {"window_hours": hours, "blocks_in_window": total,
+            "pool_distribution": pools,
+            "index": {"blocks_indexed": overall["c"],
+                      "from": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(overall["a"])),
+                      "to": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(overall["b"]))},
+            "latest_blocks": latest,
+            "source": "our own Kaspa block index (every block we sample from our kaspad is attributed to the "
+                      "pool that found it)",
+            "note": "this is chain-wide pool attribution computed locally — not a third-party API"}
+
+
+def t_robotbase_pool_worker_query(chain=None, wallet=None, worker=None):
+    """Per-worker stats for a miner, straight from our pool engines."""
+    cid = (chain or "").lower()
+    if not cid or not (wallet or worker):
+        return {"error": "pass chain (kas|zec|rvn) plus wallet or worker"}
+    wallet = (wallet or "").strip()
+    worker = (worker or "").strip()
+    if cid == "kas":
+        found = []
+        for spec in ((KAS_BRIDGE_BASE + ":2114", 5555), (KAS_BRIDGE_BASE + ":2115", 5558),
+                     (KAS_BRIDGE_BASE + ":2116", 5559)):
+            try:
+                d = _http_json(spec[0] + "/api/stats", timeout=8)
+            except Exception:  # noqa: BLE001
+                continue
+            for w in d.get("workers") or []:
+                if (wallet and str(w.get("wallet")) == wallet) or (worker and str(w.get("worker")) == worker):
+                    found.append({"port": spec[1], "worker": w.get("worker"),
+                                  "wallet": _mask(w.get("wallet")),
+                                  "status": w.get("status"), "hashrate_ghs": w.get("hashrate"),
+                                  "shares": w.get("shares"), "stale": w.get("stale"),
+                                  "invalid": w.get("invalid"), "blocks": w.get("blocks"),
+                                  "current_difficulty": w.get("currentDifficulty"),
+                                  "last_seen": w.get("lastSeen")})
+        if not found:
+            return {"chain": "KAS", "found": False,
+                    "reason": "no worker on our KAS hashport matches that wallet/worker right now "
+                              "(miners are only listed while connected)"}
+        return {"chain": "KAS", "found": True, "workers": found,
+                "source": "our Kaspa stratum bridges (ports 5555/5558/5559)"}
+    if cid in ("zec", "rvn"):
+        return {"chain": cid.upper(), "found": False, "available": False,
+                "reason": "our %s pool engine does not expose a per-worker query endpoint to the gateway yet "
+                          "(pool-level telemetry is available via %s_pool_status)"
+                          % (cid.upper(), cid)}
+    return {"error": "chain must be kas, zec or rvn"}
+
+
+def t_broadcast_raw_transaction(chain=None, signed_raw_tx_hex=None):
+    """Relay an already-signed transaction to the network through our own node.
+
+    Non-custodial by construction: we never see a key. Disabled unless the operator
+    sets RB_ENABLE_BROADCAST=1, and every relay is validated with testmempoolaccept
+    first so our nodes are not used as a blind spam relay.
+    """
+    if os.environ.get("RB_ENABLE_BROADCAST", "0") != "1":
+        return {"enabled": False,
+                "reason": "broadcast is switched off on this deployment (RB_ENABLE_BROADCAST=0)",
+                "policy": "sign locally, then ask the operator to enable relaying — we never take custody"}
+    cid = (chain or "").lower()
+    raw = (signed_raw_tx_hex or "").strip()
+    if not raw:
+        return {"error": "signed_raw_tx_hex is required"}
+    if cid != "btc":
+        return {"chain": cid.upper() or None, "available": False,
+                "reason": "relay is wired for BTC only right now"}
+    try:
+        check = btc_rpc("testmempoolaccept", [[raw]]) or []
+        verdict = check[0] if check else {}
+        if not verdict.get("allowed"):
+            return {"chain": "BTC", "accepted": False,
+                    "reject_reason": verdict.get("reject-reason") or "rejected by our node",
+                    "note": "nothing was relayed"}
+        txid = btc_rpc("sendrawtransaction", [raw])
+        return {"chain": "BTC", "accepted": True, "txid": txid,
+                "source": "relayed through our own bitcoind", "vsize": verdict.get("vsize")}
+    except Exception as exc:  # noqa: BLE001
+        return {"chain": "BTC", "accepted": False, "error": type(exc).__name__,
+                "detail": str(exc)[:160]}
+
+
+def _mask(addr):
+    a = str(addr or "")
+    return a[:10] + "…" + a[-6:] if len(a) > 20 else a
+
+
+
 TOOLS = [
     ("list_chains",
      "Every chain this service supports (BTC/KAS/ZEC/RVN/DOGE/LTC) with live availability and block height. "
@@ -610,6 +913,60 @@ TOOLS = [
      "When to use: is the RVN hashport open, is anyone mining, what endpoint do I point a GPU rig at. "
      "Do not use: node-level data → rvn_node_status.",
      {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_rvn_pool_status()),
+    ("pow_halving_oracle",
+     "Halving countdown for every chain we run: height, next halving height, blocks remaining, ETA in days, and the reward before/after. "
+     "When to use: an agent needs a precise schedule anchor (emissions, mining economics, long-horizon planning). "
+     "Note: heights are read live from our own nodes, schedules are protocol constants. DOGE has no further halvings (flat subsidy).",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_pow_halving_oracle()),
+    ("pow_network_mining_intel",
+     "Network hashrate and difficulty for BTC/KAS/ZEC/RVN/LTC/DOGE, with the method stated per chain (node-reported vs difficulty-derived). "
+     "When to use: mining economics, security budget, or comparing chain weight. "
+     "Do not use: pool-level stats → kas_pool_status / rvn_pool_status.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_pow_network_mining_intel()),
+    ("get_recommended_fee_rate",
+     "Fee recommendation tiers for a chain: fast / medium / slow plus the mempool minimum. "
+     "BTC is computed from our own node's fee estimator; ZEC returns the ZIP-317 conventional fee (protocol rule, not a market estimate); "
+     "chains without an estimator say so instead of guessing. "
+     "When to use: an autonomous agent is about to send a transaction and must pick a fee.",
+     {"type": "object", "properties": {"chain": {"type": "string", "enum": ["btc", "zec", "ltc", "doge", "rvn"],
+                                                 "description": "btc / zec / ltc / doge / rvn"}},
+      "required": ["chain"], "additionalProperties": False}, lambda a: t_get_recommended_fee_rate(a.get("chain"))),
+    ("mempool_congestion_status",
+     "Mempool congestion for BTC (txs, bytes, usage vs capacity, min fee, total fees, busy/normal verdict) and tx counts for LTC/DOGE where our node API exposes them. "
+     "When to use: decide whether now is a good moment for an on-chain settlement.",
+     {"type": "object", "properties": {"chain": {"type": "string", "enum": ["btc", "ltc", "doge"],
+                                                 "description": "btc / ltc / doge"}},
+      "required": ["chain"], "additionalProperties": False}, lambda a: t_mempool_congestion_status(a.get("chain"))),
+    ("zec_shielded_pools_metrics",
+     "All six Zcash value pools (transparent, sprout, sapling, orchard, ironwood, lockbox) with balances, share of supply and 1h/24h deltas. "
+     "When to use: privacy-pool capital allocation, shielded-supply trends, ZEC macro flows. "
+     "Do not use: node health → chain_status(zec).",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_zec_shielded_pools_metrics()),
+    ("kas_pool_attribution_intel",
+     "Kaspa chain-wide pool attribution computed locally: which pool found how many blocks, with percentage share, over a window of 1-720 hours, plus the newest attributed blocks. "
+     "When to use: Kaspa mining decentralisation, competitor share, or checking how a pool performs. "
+     "Powered by our own block index (hundreds of thousands of blocks attributed), not a third-party API.",
+     {"type": "object", "properties": {"hours": {"type": "integer", "minimum": 1, "maximum": 720, "default": 24,
+                                                 "description": "Look-back window in hours (default 24)"}},
+      "additionalProperties": False}, lambda a: t_kas_pool_attribution_intel(a.get("hours", 24))),
+    ("robotbase_pool_worker_query",
+     "Look up one miner on our own hashports: hashrate, shares, stale/invalid, current difficulty and last-seen, by wallet address or worker name. "
+     "When to use: a miner asks their agent \"how is my rig doing on robotbase?\". "
+     "Privacy: the address is masked in the reply, and only an exact wallet/worker match returns data (no listings).",
+     {"type": "object", "properties": {"chain": {"type": "string", "enum": ["kas", "zec", "rvn"]},
+                                       "wallet": {"type": "string", "description": "Miner payout address (optional)"},
+                                       "worker": {"type": "string", "description": "Worker name (optional)"}},
+      "required": ["chain"], "additionalProperties": False},
+     lambda a: t_robotbase_pool_worker_query(a.get("chain"), a.get("wallet"), a.get("worker"))),
+    ("broadcast_raw_transaction",
+     "Relay an already-signed raw transaction to the network through our own full node (non-custodial: we never see a private key). "
+     "The transaction is first validated with testmempoolaccept; rejected transactions are never relayed. "
+     "Disabled by default on this deployment and enabled per-operator with RB_ENABLE_BROADCAST=1. "
+     "When to use: an agent signed locally and wants a high-availability broadcast path.",
+     {"type": "object", "properties": {"chain": {"type": "string", "enum": ["btc"]},
+                                       "signed_raw_tx_hex": {"type": "string", "description": "Raw signed transaction hex"}},
+      "required": ["chain", "signed_raw_tx_hex"], "additionalProperties": False},
+     lambda a: t_broadcast_raw_transaction(a.get("chain"), a.get("signed_raw_tx_hex"))),
     ("utxo_chain_status",
      "Node status for DOGE or LTC (height, sync progress, peers, mempool tx count). "
      "When to use: Dogecoin or Litecoin node progress. For BTC/KAS/ZEC/RVN use chain_status (any chain in one call).",
@@ -777,6 +1134,11 @@ def docs_html():
         ("④ Kaspa (KAS)", ["kas_node_status", "kas_pool_status"]),
         ("⑤ Ravencoin (RVN)", ["rvn_node_status", "rvn_pool_status"]),
         ("⑥ Dogecoin / Litecoin", ["utxo_chain_status"]),
+        ("⑦ Mining & fee intelligence", ["pow_halving_oracle", "pow_network_mining_intel",
+                                         "get_recommended_fee_rate", "mempool_congestion_status",
+                                         "robotbase_pool_worker_query"]),
+        ("⑧ Exclusive local indexes", ["zec_shielded_pools_metrics", "kas_pool_attribution_intel",
+                                       "broadcast_raw_transaction"]),
     ]
     desc = {n: d for n, d, _s, _f in TOOLS}
     rows = ""
@@ -798,7 +1160,7 @@ def server_card():
     return {
         "name": "robotbase-mcp",
         "title": "RobotBase MCP Server",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "description": "Read-only multi-chain data for AI agents: BTC / KAS / ZEC / RVN / DOGE / LTC. "
                        "First MCP server covering six classic proof-of-work chains: mempool & fee estimates, "
                        "transaction lookup, address summary, shielded-pool supply, node status. No auth required, no tracking.",

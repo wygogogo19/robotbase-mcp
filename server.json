@@ -1,7 +1,7 @@
 {
  "name": "robotbase-mcp",
  "title": "RobotBase MCP Server",
- "version": "0.4.0",
+ "version": "0.5.0",
  "description": "Read-only multi-chain data for AI agents: BTC / KAS / ZEC / RVN / DOGE / LTC. First MCP server covering six classic proof-of-work chains: mempool & fee estimates, transaction lookup, address summary, shielded-pool supply, node status. No auth required, no tracking.",
  "homepage": "https://robotbase.cc/mcp",
  "transport": {
@@ -89,6 +89,38 @@
   {
    "name": "rvn_pool_status",
    "description": "RobotBase Ravencoin solo hashport: engine state, pool hashrate, connected miners, shares, share difficulty, the Stratum endpoint, fee and the per-miner independent coinbase payout mode. When to use: is the RVN hashport open, is anyone mining, what endpoint do I point a GPU rig at. Do not use: node-level data → rvn_node_status."
+  },
+  {
+   "name": "pow_halving_oracle",
+   "description": "Halving countdown for every chain we run: height, next halving height, blocks remaining, ETA in days, and the reward before/after. When to use: an agent needs a precise schedule anchor (emissions, mining economics, long-horizon planning). Note: heights are read live from our own nodes, schedules are protocol constants. DOGE has no further halvings (flat subsidy)."
+  },
+  {
+   "name": "pow_network_mining_intel",
+   "description": "Network hashrate and difficulty for BTC/KAS/ZEC/RVN/LTC/DOGE, with the method stated per chain (node-reported vs difficulty-derived). When to use: mining economics, security budget, or comparing chain weight. Do not use: pool-level stats → kas_pool_status / rvn_pool_status."
+  },
+  {
+   "name": "get_recommended_fee_rate",
+   "description": "Fee recommendation tiers for a chain: fast / medium / slow plus the mempool minimum. BTC is computed from our own node's fee estimator; ZEC returns the ZIP-317 conventional fee (protocol rule, not a market estimate); chains without an estimator say so instead of guessing. When to use: an autonomous agent is about to send a transaction and must pick a fee."
+  },
+  {
+   "name": "mempool_congestion_status",
+   "description": "Mempool congestion for BTC (txs, bytes, usage vs capacity, min fee, total fees, busy/normal verdict) and tx counts for LTC/DOGE where our node API exposes them. When to use: decide whether now is a good moment for an on-chain settlement."
+  },
+  {
+   "name": "zec_shielded_pools_metrics",
+   "description": "All six Zcash value pools (transparent, sprout, sapling, orchard, ironwood, lockbox) with balances, share of supply and 1h/24h deltas. When to use: privacy-pool capital allocation, shielded-supply trends, ZEC macro flows. Do not use: node health → chain_status(zec)."
+  },
+  {
+   "name": "kas_pool_attribution_intel",
+   "description": "Kaspa chain-wide pool attribution computed locally: which pool found how many blocks, with percentage share, over a window of 1-720 hours, plus the newest attributed blocks. When to use: Kaspa mining decentralisation, competitor share, or checking how a pool performs. Powered by our own block index (hundreds of thousands of blocks attributed), not a third-party API."
+  },
+  {
+   "name": "robotbase_pool_worker_query",
+   "description": "Look up one miner on our own hashports: hashrate, shares, stale/invalid, current difficulty and last-seen, by wallet address or worker name. When to use: a miner asks their agent \"how is my rig doing on robotbase?\". Privacy: the address is masked in the reply, and only an exact wallet/worker match returns data (no listings)."
+  },
+  {
+   "name": "broadcast_raw_transaction",
+   "description": "Relay an already-signed raw transaction to the network through our own full node (non-custodial: we never see a private key). The transaction is first validated with testmempoolaccept; rejected transactions are never relayed. Disabled by default on this deployment and enabled per-operator with RB_ENABLE_BROADCAST=1. When to use: an agent signed locally and wants a high-availability broadcast path."
   },
   {
    "name": "utxo_chain_status",
