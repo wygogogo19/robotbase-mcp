@@ -11,7 +11,7 @@ description: >-
   state, node status, a halving oracle, fee/mempool oracles, Zcash coinbase attribution and
   the Ravencoin asset registry — indexes and native endpoints nobody else publishes for
   these chains. No auth, no tracking. Free beta keys: see the README.
-version: 0.5.1
+version: 0.5.2
 license: MIT
 homepage: https://robotbase.cc/mcp
 repository: https://github.com/<your-org>/robotbase-mcp

@@ -5,7 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("RB_PORT", "8090"))
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "robotbase-mcp", "version": "0.5.1", "title": "RobotBase on-chain data MCP (six PoW chains)"}
+SERVER_INFO = {"name": "robotbase-mcp", "version": "0.5.2", "title": "RobotBase on-chain data MCP (six PoW chains)"}
 # Optional env file holding BTC_RPC_URL / BTC_RPC_USER / BTC_RPC_PASS
 BTC_ENV = os.environ.get("RB_BTC_ENV", "")
 ZEC_BASE = os.environ.get("RB_ZEC_BASE", "http://127.0.0.1:8080")
@@ -841,18 +841,19 @@ def _mask(addr):
 
 
 
-# =================== v0.5.1: ZEC coinbase attribution + RVN assets ==============
+# ============ v0.5.1/v0.5.2: ZEC coinbase attribution + RVN assets =============
 # Both endpoints live on our own nodes and are read-only by construction.
 RVN_ASSET_BASE = os.environ.get("RB_RVN_ASSET_BASE", "http://127.0.0.1:18081")
 
 
 def t_zec_block_attribution_intel(blocks=200):
-    """MVP attribution: shielded-vs-transparent coinbases and our own tag.
+    """MVP attribution: shielded coinbases, output roles and readable pool tags.
 
-    Scope is deliberately narrow and provable from the chain itself: we classify
-    every coinbase in the last N blocks by (a) whether the reward went into a
-    shielded pool and (b) whether the coinbase carries a /RobotBase/ style tag.
-    We do not claim pool names we cannot prove.
+    Everything here is provable from the chain itself: (a) whether a coinbase
+    carries a shielded output, (b) which coinbase outputs are consensus funding
+    streams (the lockbox, seen in ~every block) versus real miner payouts, and
+    (c) the pool tag a miner printed into its own coinbase text. No third-party
+    label list is applied, so we only ever repeat what a miner wrote itself.
     """
     try:
         blocks = max(10, min(500, int(blocks or 200)))
@@ -865,14 +866,26 @@ def t_zec_block_attribution_intel(blocks=200):
     return {
         "window": d.get("window"),
         "scanned_blocks": d.get("scanned_blocks"),
+        "rpc_errors": d.get("rpc_errors"),
         "shielded_coinbase_blocks": d.get("shielded_coinbase_blocks"),
         "shielded_coinbase_pct": d.get("shielded_coinbase_pct"),
+        "recurring_funding_outputs": d.get("recurring_funding_outputs"),
+        "miner_payout_addresses_top": d.get("miner_payout_addresses_top"),
+        "coinbase_tags_top": d.get("coinbase_tags_top"),
+        "tag_named_blocks": d.get("tag_named_blocks"),
+        "tag_named_pct": d.get("tag_named_pct"),
         "tagged_blocks": d.get("tagged_blocks"),
         "tag_matched": d.get("tag_matched"),
-        "payout_addresses_top": d.get("payout_addresses_top"),
         "shielded_heights_sample": d.get("shielded_heights_sample"),
-        "source": "our Zebra node, getblock verbosity 2 (coinbase script + vShieldedOutput count)",
-        "scope": "chain facts only — a third-party pool label list is intentionally NOT applied",
+        "source": "our Zebra node, getblock verbosity 2 (coinbase script + vout + vShieldedOutput)",
+        "scope": "chain facts only — no third-party pool label list is applied",
+        "reading_the_data": {
+            "recurring_funding_outputs": "an address paying out in >=60% of blocks is a consensus "
+                                         "funding stream (lockbox), NOT a miner payout",
+            "miner_payout_addresses_top": "coinbase outputs with those funding streams excluded",
+            "coinbase_tags_top": "the pool name each miner printed into its own coinbase text; "
+                                 "'no readable tag' means the miner embedded none",
+        },
         "why_it_matters": "the share of block rewards that land in a shielded pool is a privacy metric "
                           "the usual block explorers do not expose to models at all",
     }
@@ -1026,9 +1039,9 @@ TOOLS = [
       "required": ["chain", "signed_raw_tx_hex"], "additionalProperties": False},
      lambda a: t_broadcast_raw_transaction(a.get("chain"), a.get("signed_raw_tx_hex"))),
     ("zec_block_attribution_intel",
-     "Zcash coinbase attribution over the last 10-500 blocks: how many block rewards went straight into a shielded pool (privacy mining), the transparent payout addresses by frequency, and any /RobotBase/ tag. "
+     "Zcash coinbase attribution over the last 10-500 blocks: the shielded-pool share of block rewards (privacy mining), coinbase outputs split into consensus funding streams (lockbox) vs real miner payout addresses, and the pool tags miners printed into their own coinbase text plus our own /RobotBase/ tag. "
      "When to use: privacy-pool mining trends, shielded adoption, or checking whether our own pool found blocks. "
-     "Scope: chain facts only — we deliberately do not apply a third-party pool label list.",
+     "Scope: chain facts only — no third-party pool label list is applied.",
      {"type": "object", "properties": {"blocks": {"type": "integer", "minimum": 10, "maximum": 500, "default": 200,
                                                   "description": "How many recent blocks to classify (default 200)"}},
       "additionalProperties": False}, lambda a: t_zec_block_attribution_intel(a.get("blocks", 200))),
@@ -1233,7 +1246,7 @@ def server_card():
     return {
         "name": "robotbase-mcp",
         "title": "RobotBase MCP Server",
-        "version": "0.5.1",
+        "version": "0.5.2",
         "description": "Read-only multi-chain data for AI agents: BTC / KAS / ZEC / RVN / DOGE / LTC. "
                        "First MCP server covering six classic proof-of-work chains: mempool & fee estimates, "
                        "transaction lookup, address summary, shielded-pool supply, node status. No auth required, no tracking.",
