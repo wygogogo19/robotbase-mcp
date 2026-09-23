@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """RobotBase MCP Server — read-only multi-chain data tools (BTC / KAS / ZEC / RVN / DOGE / LTC)."""
-import base64, hashlib, html, json, os, re, socket, sqlite3, threading, time, urllib.error, urllib.request
+import base64, hashlib, html, json, os, re, socket, sqlite3, threading, time, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("RB_PORT", "8090"))
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "robotbase-mcp", "version": "0.5.0", "title": "RobotBase on-chain data MCP (six PoW chains)"}
+SERVER_INFO = {"name": "robotbase-mcp", "version": "0.5.1", "title": "RobotBase on-chain data MCP (six PoW chains)"}
 # Optional env file holding BTC_RPC_URL / BTC_RPC_USER / BTC_RPC_PASS
 BTC_ENV = os.environ.get("RB_BTC_ENV", "")
 ZEC_BASE = os.environ.get("RB_ZEC_BASE", "http://127.0.0.1:8080")
@@ -840,6 +840,64 @@ def _mask(addr):
 
 
 
+
+# =================== v0.5.1: ZEC coinbase attribution + RVN assets ==============
+# Both endpoints live on our own nodes and are read-only by construction.
+RVN_ASSET_BASE = os.environ.get("RB_RVN_ASSET_BASE", "http://127.0.0.1:18081")
+
+
+def t_zec_block_attribution_intel(blocks=200):
+    """MVP attribution: shielded-vs-transparent coinbases and our own tag.
+
+    Scope is deliberately narrow and provable from the chain itself: we classify
+    every coinbase in the last N blocks by (a) whether the reward went into a
+    shielded pool and (b) whether the coinbase carries a /RobotBase/ style tag.
+    We do not claim pool names we cannot prove.
+    """
+    try:
+        blocks = max(10, min(500, int(blocks or 200)))
+    except (TypeError, ValueError):
+        blocks = 200
+    try:
+        d = _http_json(ZEC_BASE + "/api/coinbase-scan?blocks=%d" % blocks, timeout=90)
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "reason": "%s: %s" % (type(exc).__name__, str(exc)[:100])}
+    return {
+        "window": d.get("window"),
+        "scanned_blocks": d.get("scanned_blocks"),
+        "shielded_coinbase_blocks": d.get("shielded_coinbase_blocks"),
+        "shielded_coinbase_pct": d.get("shielded_coinbase_pct"),
+        "tagged_blocks": d.get("tagged_blocks"),
+        "tag_matched": d.get("tag_matched"),
+        "payout_addresses_top": d.get("payout_addresses_top"),
+        "shielded_heights_sample": d.get("shielded_heights_sample"),
+        "source": "our Zebra node, getblock verbosity 2 (coinbase script + vShieldedOutput count)",
+        "scope": "chain facts only — a third-party pool label list is intentionally NOT applied",
+        "why_it_matters": "the share of block rewards that land in a shielded pool is a privacy metric "
+                          "the usual block explorers do not expose to models at all",
+    }
+
+
+def t_rvn_asset_lookup(asset=None, limit=20):
+    """Ravencoin native assets: one asset by name/id, or a listing."""
+    name = (asset or "").strip()
+    try:
+        if name:
+            d = _http_json(RVN_ASSET_BASE + "/api/asset/" + urllib.parse.quote(name), timeout=30)
+            if not d.get("ok"):
+                return {"found": False, "asset": name, "reason": d.get("error") or "not found"}
+            return {"found": True, "asset": d.get("result"),
+                    "source": "our ravend getassetdata",
+                    "note": "Ravencoin assets are UTXO-native: amount, units, reissuable and IPFS metadata"}
+        limit = max(1, min(200, int(limit or 20)))
+        d = _http_json(RVN_ASSET_BASE + "/api/assets?limit=%d" % limit, timeout=30)
+        return {"count": d.get("count"), "assets": d.get("assets"),
+                "source": "our ravend listassets", "hint": "pass asset=<name or id> for full details"}
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "reason": "%s: %s" % (type(exc).__name__, str(exc)[:100])}
+
+
+
 TOOLS = [
     ("list_chains",
      "Every chain this service supports (BTC/KAS/ZEC/RVN/DOGE/LTC) with live availability and block height. "
@@ -967,6 +1025,20 @@ TOOLS = [
                                        "signed_raw_tx_hex": {"type": "string", "description": "Raw signed transaction hex"}},
       "required": ["chain", "signed_raw_tx_hex"], "additionalProperties": False},
      lambda a: t_broadcast_raw_transaction(a.get("chain"), a.get("signed_raw_tx_hex"))),
+    ("zec_block_attribution_intel",
+     "Zcash coinbase attribution over the last 10-500 blocks: how many block rewards went straight into a shielded pool (privacy mining), the transparent payout addresses by frequency, and any /RobotBase/ tag. "
+     "When to use: privacy-pool mining trends, shielded adoption, or checking whether our own pool found blocks. "
+     "Scope: chain facts only — we deliberately do not apply a third-party pool label list.",
+     {"type": "object", "properties": {"blocks": {"type": "integer", "minimum": 10, "maximum": 500, "default": 200,
+                                                  "description": "How many recent blocks to classify (default 200)"}},
+      "additionalProperties": False}, lambda a: t_zec_block_attribution_intel(a.get("blocks", 200))),
+    ("rvn_asset_lookup",
+     "Ravencoin native assets straight from our ravend: pass an asset name or id for amount, units, reissuable flag and IPFS metadata, or omit it to list recent assets. "
+     "When to use: token/asset checks on Ravencoin, where assets are UTXO-native rather than smart contracts.",
+     {"type": "object", "properties": {"asset": {"type": "string", "description": "Asset name or id (optional)"},
+                                       "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20,
+                                                 "description": "How many assets to list when no name is given"}},
+      "additionalProperties": False}, lambda a: t_rvn_asset_lookup(a.get("asset"), a.get("limit", 20))),
     ("utxo_chain_status",
      "Node status for DOGE or LTC (height, sync progress, peers, mempool tx count). "
      "When to use: Dogecoin or Litecoin node progress. For BTC/KAS/ZEC/RVN use chain_status (any chain in one call).",
@@ -1138,6 +1210,7 @@ def docs_html():
                                          "get_recommended_fee_rate", "mempool_congestion_status",
                                          "robotbase_pool_worker_query"]),
         ("⑧ Exclusive local indexes", ["zec_shielded_pools_metrics", "kas_pool_attribution_intel",
+                                       "zec_block_attribution_intel", "rvn_asset_lookup",
                                        "broadcast_raw_transaction"]),
     ]
     desc = {n: d for n, d, _s, _f in TOOLS}
@@ -1160,7 +1233,7 @@ def server_card():
     return {
         "name": "robotbase-mcp",
         "title": "RobotBase MCP Server",
-        "version": "0.5.0",
+        "version": "0.5.1",
         "description": "Read-only multi-chain data for AI agents: BTC / KAS / ZEC / RVN / DOGE / LTC. "
                        "First MCP server covering six classic proof-of-work chains: mempool & fee estimates, "
                        "transaction lookup, address summary, shielded-pool supply, node status. No auth required, no tracking.",
