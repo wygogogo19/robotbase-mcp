@@ -1,0 +1,49 @@
+name: Retire an old MCP Registry version
+
+# One-shot maintenance workflow. The registry keeps every published version, and
+# 0.3.0 still advertises the pre-six-chain scope ("BTC/XMR/ZEC/DOGE/LTC, 16 tools"),
+# which no longer matches the service. This retires such versions via GitHub OIDC.
+# Reversible: run it again with status=active.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/retire-registry-version.yml"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Registry version to retire"
+        required: true
+        default: "0.3.0"
+      status:
+        description: "active | deprecated | deleted"
+        required: true
+        default: "deleted"
+
+permissions:
+  id-token: write      # required for OIDC authentication
+  contents: read
+
+jobs:
+  retire:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Authenticate to the MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Update version status
+        run: |
+          VERSION="${{ github.event.inputs.version || '0.3.0' }}"
+          STATUS="${{ github.event.inputs.status || 'deleted' }}"
+          echo "setting io.github.wygogogo19/robotbase-mcp@$VERSION -> $STATUS"
+          ./mcp-publisher status --status "$STATUS" \
+            --message "Superseded by 0.4.0: six-chain scope, 15 tools, Monero support removed" \
+            io.github.wygogogo19/robotbase-mcp "$VERSION"
