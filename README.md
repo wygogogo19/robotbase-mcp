@@ -4,7 +4,7 @@
 
 **免鉴权 · 无追踪 · 只读** ｜ 面向 AI Agent 的六大经典 PoW 公链数据接口
 
-[![Tools](https://img.shields.io/badge/tools-15-brightgreen)](https://robotbase.cc/mcp/tools)
+[![Tools](https://img.shields.io/badge/tools-23-brightgreen)](https://robotbase.cc/mcp/tools)
 [![Protocol](https://img.shields.io/badge/MCP-2025--06--18-blue)](https://modelcontextprotocol.io)
 [![Transport](https://img.shields.io/badge/transport-streamable--http-orange)](https://robotbase.cc/mcp)
 [![Glama](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp/badges/score.svg)](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp)
@@ -18,7 +18,7 @@ Listed in the **official MCP Registry** as `io.github.wygogogo19/robotbase-mcp` 
 
 ## Why
 
-Ask any LLM today to check **Bitcoin mempool fees**, whether **our Kaspa solo hashport ever found a real mainnet block**, or the **Zcash shielded-pool supply** and it has nowhere to look: the MCP ecosystem is rich for EVM/Solana and nearly empty for the classic proof-of-work chains. This server fills that gap with 15 strictly read-only tools backed by our own full nodes.
+Ask any LLM today to check **Bitcoin mempool fees**, whether **our Kaspa solo hashport ever found a real mainnet block**, or the **Zcash shielded-pool supply** and it has nowhere to look: the MCP ecosystem is rich for EVM/Solana and nearly empty for the classic proof-of-work chains. This server fills that gap with 23 strictly read-only tools backed by our own full nodes, our own pool engines and two local indexes.
 
 ## Pioneer Beta — free API keys
 
@@ -46,7 +46,7 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
        "params":{"name":"btc_fee_estimates","arguments":{}}}'
 ```
 
-## Tools (15)
+## Tools (23)
 
 | Tool | What it does | Typical question |
 |---|---|---|
@@ -64,7 +64,24 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
 | `kas_pool_status` | Our Kaspa solo hashport: tiers, hashrate, miners, shares, blocks found, last block hash + blue score, stale/invalid | "Did the KAS pool ever find a real mainnet block?" |
 | `rvn_node_status` | Ravencoin node: height, sync, network hashrate, difficulty, client | "How far has the Ravencoin node synced?" |
 | `rvn_pool_status` | Our Ravencoin solo hashport: state, miners, shares, stratum endpoint, fee, per-miner coinbase | "Is the RVN hashport open and where do I point a GPU rig?" |
+| `pow_halving_oracle` | Halving countdown for every chain we run: next height, blocks remaining, ETA, reward before/after | "When is the next Kaspa reduction?" |
+| `pow_network_mining_intel` | Network hashrate + difficulty per chain, with the method stated (node-reported vs difficulty-derived) | "How much hashpower secures Litecoin right now?" |
+| `get_recommended_fee_rate` | Fee tiers (fast / medium / slow) + mempool minimum; BTC from our own estimator, ZEC returns the ZIP-317 conventional fee | "What fee gets my BTC confirmed next block?" |
+| `mempool_congestion_status` | BTC mempool size, bytes, capacity load, min fee, total fees + a busy/normal verdict; tx counts for LTC/DOGE | "Is now a good time to settle on-chain?" |
+| `zec_shielded_pools_metrics` | All six Zcash value pools with share of supply and 1h/24h deltas | "How much ZEC sits in Orchard vs Ironwood?" |
+| `kas_pool_attribution_intel` | Chain-wide Kaspa pool attribution computed from our own block index: blocks and share per pool over 1-720h | "Who is winning Kaspa blocks today?" |
+| `robotbase_pool_worker_query` | Look up one miner on our hashports by wallet or worker: hashrate, shares, stale/invalid, difficulty | "How is my rig doing on robotbase?" |
+| `broadcast_raw_transaction` | Relay an already-signed transaction through our own node (testmempoolaccept first; operator-gated) | "Broadcast this signed tx for me" |
 | `utxo_chain_status(doge\|ltc)` | Dogecoin / Litecoin node status | "How far has DOGE synced?" |
+
+## Beyond a generic reader
+
+Most MCP servers wrap a third-party API. These four capabilities come from infrastructure we operate, which is why they are hard to find elsewhere:
+
+1. **Mining intelligence** — `pow_halving_oracle`, `pow_network_mining_intel` and the two pool tools read our own nodes and pool engines, not a public API.
+2. **Fee & mempool oracles** — `mempool_congestion_status` + `get_recommended_fee_rate` answer the first question any autonomous agent has before it sends a transaction.
+3. **Two local indexes** — `zec_shielded_pools_metrics` (six value pools with deltas) and `kas_pool_attribution_intel` (hundreds of thousands of Kaspa blocks attributed to the pool that found them).
+4. **Optional relay** — `broadcast_raw_transaction` lets an agent sign locally and use us purely as a high-availability broadcast path; it is disabled unless the operator sets `RB_ENABLE_BROADCAST=1`.
 
 ## Architecture
 
