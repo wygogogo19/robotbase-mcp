@@ -1,7 +1,7 @@
 {
  "name": "robotbase-mcp",
  "title": "RobotBase MCP Server",
- "version": "0.5.1",
+ "version": "0.5.2",
  "description": "Read-only multi-chain data for AI agents: BTC / KAS / ZEC / RVN / DOGE / LTC. First MCP server covering six classic proof-of-work chains: mempool & fee estimates, transaction lookup, address summary, shielded-pool supply, node status. No auth required, no tracking.",
  "homepage": "https://robotbase.cc/mcp",
  "transport": {
@@ -124,7 +124,7 @@
   },
   {
    "name": "zec_block_attribution_intel",
-   "description": "Zcash coinbase attribution over the last 10-500 blocks: how many block rewards went straight into a shielded pool (privacy mining), the transparent payout addresses by frequency, and any /RobotBase/ tag. When to use: privacy-pool mining trends, shielded adoption, or checking whether our own pool found blocks. Scope: chain facts only — we deliberately do not apply a third-party pool label list."
+   "description": "Zcash coinbase attribution over the last 10-500 blocks: the shielded-pool share of block rewards (privacy mining), coinbase outputs split into consensus funding streams (lockbox) vs real miner payout addresses, and the pool tags miners printed into their own coinbase text plus our own /RobotBase/ tag. When to use: privacy-pool mining trends, shielded adoption, or checking whether our own pool found blocks. Scope: chain facts only — no third-party pool label list is applied."
   },
   {
    "name": "rvn_asset_lookup",
