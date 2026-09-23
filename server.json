@@ -1,7 +1,7 @@
 {
  "name": "robotbase-mcp",
  "title": "RobotBase MCP Server",
- "version": "0.5.0",
+ "version": "0.5.1",
  "description": "Read-only multi-chain data for AI agents: BTC / KAS / ZEC / RVN / DOGE / LTC. First MCP server covering six classic proof-of-work chains: mempool & fee estimates, transaction lookup, address summary, shielded-pool supply, node status. No auth required, no tracking.",
  "homepage": "https://robotbase.cc/mcp",
  "transport": {
@@ -121,6 +121,14 @@
   {
    "name": "broadcast_raw_transaction",
    "description": "Relay an already-signed raw transaction to the network through our own full node (non-custodial: we never see a private key). The transaction is first validated with testmempoolaccept; rejected transactions are never relayed. Disabled by default on this deployment and enabled per-operator with RB_ENABLE_BROADCAST=1. When to use: an agent signed locally and wants a high-availability broadcast path."
+  },
+  {
+   "name": "zec_block_attribution_intel",
+   "description": "Zcash coinbase attribution over the last 10-500 blocks: how many block rewards went straight into a shielded pool (privacy mining), the transparent payout addresses by frequency, and any /RobotBase/ tag. When to use: privacy-pool mining trends, shielded adoption, or checking whether our own pool found blocks. Scope: chain facts only — we deliberately do not apply a third-party pool label list."
+  },
+  {
+   "name": "rvn_asset_lookup",
+   "description": "Ravencoin native assets straight from our ravend: pass an asset name or id for amount, units, reissuable flag and IPFS metadata, or omit it to list recent assets. When to use: token/asset checks on Ravencoin, where assets are UTXO-native rather than smart contracts."
   },
   {
    "name": "utxo_chain_status",

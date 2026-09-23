@@ -8,9 +8,10 @@ description: >-
   Read-only multi-chain data for AI agents: the first MCP server covering the six classic
   proof-of-work chains (Bitcoin, Kaspa, Zcash, Ravencoin, Dogecoin, Litecoin). Mempool & fee
   estimates, transaction and address lookup, Zcash shielded-pool supply, Kaspa DAG + hashport
-  state, node status, a halving oracle, fee/mempool oracles and two indexes nobody else
-  publishes for these chains. No auth, no tracking. Free beta keys: see the README.
-version: 0.5.0
+  state, node status, a halving oracle, fee/mempool oracles, Zcash coinbase attribution and
+  the Ravencoin asset registry — indexes and native endpoints nobody else publishes for
+  these chains. No auth, no tracking. Free beta keys: see the README.
+version: 0.5.1
 license: MIT
 homepage: https://robotbase.cc/mcp
 repository: https://github.com/<your-org>/robotbase-mcp
@@ -44,6 +45,7 @@ startCommand:
     RB_ZEC_BASE: "http://127.0.0.1:8080"
     RB_DOGE_BASE: "http://127.0.0.1:8080"
     RB_LTC_BASE: "http://127.0.0.1:8080"
+    RB_RVN_ASSET_BASE: "http://127.0.0.1:18081"
     RB_HOME_BASE: "http://127.0.0.1:8081"
 
 categories:
