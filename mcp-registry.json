@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.wygogogo19/robotbase-mcp",
-  "description": "Read-only on-chain intelligence (23 tools) for BTC, KAS, ZEC, RVN, LTC and DOGE: node and pool telemetry, halving oracle, fee and mempool oracles, the six Zcash shielded pools and locally computed Kaspa pool attribution.",
+  "description": "Read-only chain intelligence (23 tools) for BTC, KAS, ZEC, RVN, LTC and DOGE.",
   "version": "0.5.0",
   "repository": {
     "url": "https://github.com/wygogogo19/robotbase-mcp",
