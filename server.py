@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""RobotBase MCP Server — read-only multi-chain data tools (BTC / KAS / ZEC / RVN / DOGE / LTC)."""
+"""RobotBase MCP Server — read-only multi-chain data tools (BTC / ETH / XMR / ZEC)."""
 import base64, hashlib, html, json, os, re, socket, sqlite3, threading, time, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("RB_PORT", "8090"))
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "robotbase-mcp", "version": "0.5.2", "title": "RobotBase on-chain data MCP (six PoW chains)"}
+SERVER_INFO = {"name": "robotbase-mcp", "version": "0.6.0", "title": "RobotBase on-chain data MCP (BTC / ETH / XMR / ZEC)"}
 # Optional env file holding BTC_RPC_URL / BTC_RPC_USER / BTC_RPC_PASS
 BTC_ENV = os.environ.get("RB_BTC_ENV", "")
 ZEC_BASE = os.environ.get("RB_ZEC_BASE", "http://127.0.0.1:8080")
@@ -95,18 +95,18 @@ def truncate(obj, limit=3800):
     return s if len(s) <= limit else s[:limit] + '…(truncated)'
 
 
-SIX_CHAINS = ("btc", "kas", "zec", "rvn", "doge", "ltc")
+CHAINS = ("btc", "eth", "xmr", "zec")
 
 
 def t_list_chains():
-    """The six chains this gateway serves, with live node state and height."""
+    """The four chains this service covers (BTC / ETH / XMR / ZEC), with live node state and height."""
     d = cached("nodes", 15, lambda: _http_json(HOME_BASE + "/api/nodes"))
     nodes = d.get("nodes") or {}
     out = [{"chain": c, "ok": bool((nodes.get(c) or {}).get("ok")),
             "synced": bool((nodes.get(c) or {}).get("synced")),
             "height": (nodes.get(c) or {}).get("height"),
             "state": (nodes.get(c) or {}).get("state")}
-           for c in SIX_CHAINS]
+           for c in CHAINS]
     return {"chains": out, "updated_utc": d.get("updated_utc")}
 
 
@@ -117,21 +117,17 @@ def t_chain_status(chain):
         return {k: d.get(k) for k in ("chain", "blocks", "headers", "verification_progress_pct", "initial_block_download",
                                       "connections", "connections_out", "mempool_txs", "mempool_usage_mb",
                                       "size_on_disk_gb", "version", "rpc_ok")}
-    if chain == "kas":
-        d = cached("kas_node", 10, lambda: _http_json(HOME_BASE + "/api/node/kas"))
-        n = d.get("node") or {}
-        return {k: n.get(k) for k in ("chain", "client", "status", "network_height", "daa_score", "difficulty",
-                                      "network_hashrate_hs", "dag_tips", "block_reward_kas", "block_time_s",
-                                      "bps", "next_halving_utc", "next_halving_reward_kas")}
-    if chain == "rvn":
-        d = cached("nodes", 10, lambda: _http_json(HOME_BASE + "/api/nodes"))
-        n = (d.get("nodes") or {}).get("rvn") or {}
-        return {k: n.get(k) for k in ("height", "network", "difficulty", "client", "synced", "state", "ok")}
-    if chain in ("zec", "doge", "ltc"):
+    if chain == "eth":
+        n = (cached("nodes", 10, lambda: _http_json(HOME_BASE + "/api/nodes")).get("nodes") or {}).get("eth") or {}
+        return {k: n.get(k) for k in ("ok", "synced", "state", "height", "progress", "peers",
+                                      "exec", "cons", "slot", "client")}
+    if chain == "xmr":
+        n = (cached("nodes", 10, lambda: _http_json(HOME_BASE + "/api/nodes")).get("nodes") or {}).get("xmr") or {}
+        return {k: n.get(k) for k in ("ok", "synced", "height", "txpool", "difficulty", "db",
+                                      "txc", "sync", "state")}
+    if chain == "zec":
         return svc_status(chain)
-    if chain == "utxo":
-        raise ValueError("use utxo_chain_status with doge or ltc")
-    raise ValueError("chain must be one of: btc, kas, zec, rvn, doge, ltc")
+    raise ValueError("chain must be one of: btc, eth, xmr, zec")
 
 
 def t_zec_chain_info():
@@ -553,13 +549,6 @@ HALVING = {
              "block_time_s": 600, "unit": "BTC", "note": "4-year epoch, 210,000 blocks"},
     "zec":  {"next_height": 4406400, "interval": 1680000, "reward": "1.5625", "next_reward": "0.78125",
              "block_time_s": 75, "unit": "ZEC", "note": "post-Blossom 1,680,000-block interval"},
-    "ltc":  {"next_height": 3360000, "interval": 840000, "reward": "6.25", "next_reward": "3.125",
-             "block_time_s": 150, "unit": "LTC", "note": "840,000-block interval"},
-    "rvn":  {"next_height": 6300000, "interval": 2100000, "reward": "2500", "next_reward": "1250",
-             "block_time_s": 60, "unit": "RVN", "note": "2,100,000-block interval"},
-    "doge": {"next_height": None, "interval": None, "reward": "10000", "next_reward": "10000",
-             "block_time_s": 60, "unit": "DOGE",
-             "note": "no further halvings: flat 10,000 DOGE per block since block 600,000"},
 }
 
 ZIP317_FEE = 0.00001          # Zcash conventional fee per logical action (ZIP-317)
@@ -618,21 +607,16 @@ def t_pow_network_mining_intel():
                       "source": "our bitcoind getnetworkhashps"}
     except Exception as exc:  # noqa: BLE001
         out["BTC"] = {"error": type(exc).__name__}
-    try:                                                        # KAS: our node API
-        n = (_http_json(HOME + "/api/node/kas").get("node") or {})
-        out["KAS"] = {"difficulty": n.get("difficulty"), "network_hashrate_hs": n.get("network_hashrate_hs"),
-                      "height": n.get("network_height"), "bps": n.get("bps"), "source": "our kaspad"}
+    try:                                                        # XMR: p2pool reports Monero network state
+        p = cached("xmr_pool", 15, lambda: _http_json(XMR_P2POOL_API, timeout=10))
+        mn = p.get("monero") or {}
+        out["XMR"] = {"difficulty": mn.get("difficulty"), "network_hashrate_hs": mn.get("network_hashrate"),
+                      "height": mn.get("height"), "source": "p2pool pool.json"}
     except Exception as exc:  # noqa: BLE001
-        out["KAS"] = {"error": type(exc).__name__}
-    try:                                                        # RVN: our node stats API
-        n = (_http_json(HOME + "/api/pools").get("pools", {}).get("rvnpool") or {})
-        out["RVN"] = {"difficulty": n.get("difficulty"), "network_hashrate": n.get("network"),
-                      "height": n.get("height"), "source": "our ravend"}
-    except Exception as exc:  # noqa: BLE001
-        out["RVN"] = {"error": type(exc).__name__}
-    for cid, key, base, factor, block_s in (("ZEC", "zec", ZEC_BASE, 8192, 75),
-                                            ("LTC", "ltc", LTC_BASE, 65536, 150),
-                                            ("DOGE", "doge", DOGE_BASE, 65536, 60)):
+        out["XMR"] = {"error": type(exc).__name__}
+    out["ETH"] = {"difficulty": None, "network_hashrate_hs": None, "source": "n/a",
+                  "note": "Ethereum is proof-of-stake (post-Merge): no PoW difficulty or hashrate"}
+    for cid, key, base, factor, block_s in (("ZEC", "zec", ZEC_BASE, 8192, 75),):
         try:
             d = _http_json(base + "/api/status")
             diff = d.get("difficulty")
@@ -643,8 +627,9 @@ def t_pow_network_mining_intel():
         except Exception as exc:  # noqa: BLE001
             out[cid] = {"error": type(exc).__name__}
     return {"chains": out,
-            "note": "BTC/KAS/RVN are node-reported; ZEC/LTC/DOGE hashrate is derived from difficulty with the "
-                    "factor printed next to it. No third-party API is involved."}
+            "note": "BTC/XMR are node-reported (bitcoind / p2pool); ZEC hashrate is derived from the node's "
+                    "difficulty with the factor printed next to it; ETH is proof-of-stake. "
+                    "No third-party API is involved."}
 
 
 def t_get_recommended_fee_rate(chain=None):
@@ -673,7 +658,7 @@ def t_get_recommended_fee_rate(chain=None):
                         "conventional fee; we report the protocol value, not a market estimate."}
     return {"chain": cid.upper(), "available": False,
             "reason": "we do not run a fee estimator for this chain yet (no node RPC exposed to the gateway)",
-            "what_we_do_have": ["chain_status", "utxo_chain_status", "mempool_congestion_status"]}
+            "what_we_do_have": ["chain_status", "mempool_congestion_status", "btc_fee_estimates"]}
 
 
 def t_mempool_congestion_status(chain=None):
@@ -913,17 +898,17 @@ def t_rvn_asset_lookup(asset=None, limit=20):
 
 TOOLS = [
     ("list_chains",
-     "Every chain this service supports (BTC/KAS/ZEC/RVN/DOGE/LTC) with live availability and block height. "
+     "Every chain this service supports (BTC / ETH / XMR / ZEC) with live availability and block height. "
      "When to use: the user asks which chains you support, which nodes are online, or how high each chain is. "
      "Do not use: for detail on one chain, use chain_status.",
      {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_list_chains()),
     ("chain_status",
      "Run-time status of one chain's node: block height, sync progress, connected peers, mempool tx count, client version. "
      "When to use: whether a given chain's node is synced, healthy or lagging. "
-     "Do not use: fees → btc_fee_estimates; address balance → btc_address_summary; pool detail → kas_pool_status / rvn_pool_status.",
+     "Do not use: fees → btc_fee_estimates; address balance → btc_address_summary; Monero pool detail → xmr_pool_status.",
      {"type": "object", "properties": {"chain": {"type": "string",
-                                                 "enum": ["btc", "kas", "zec", "rvn", "doge", "ltc"],
-                                                 "description": "Chain id: btc / kas / zec / rvn / doge / ltc"}},
+                                                 "enum": ["btc", "eth", "xmr", "zec"],
+                                                 "description": "Chain id: btc / eth / xmr / zec"}},
       "required": ["chain"], "additionalProperties": False}, lambda a: t_chain_status(a.get("chain"))),
     ("zec_chain_info",
      "Zcash mainnet info including the supply of all six value pools (transparent/sprout/sapling/orchard/lockbox/ironwood) — i.e. shielded-pool state. "
@@ -990,9 +975,9 @@ TOOLS = [
      "Note: heights are read live from our own nodes, schedules are protocol constants. DOGE has no further halvings (flat subsidy).",
      {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_pow_halving_oracle()),
     ("pow_network_mining_intel",
-     "Network hashrate and difficulty for BTC/KAS/ZEC/RVN/LTC/DOGE, with the method stated per chain (node-reported vs difficulty-derived). "
+     "Network hashrate and difficulty for BTC / XMR / ZEC (node-reported or difficulty-derived, stated per chain), plus an explicit proof-of-stake note for ETH. "
      "When to use: mining economics, security budget, or comparing chain weight. "
-     "Do not use: pool-level stats → kas_pool_status / rvn_pool_status.",
+     "Do not use: pool-level stats → xmr_pool_status or robotbase_pool_worker_query.",
      {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_pow_network_mining_intel()),
     ("get_recommended_fee_rate",
      "Fee recommendation tiers for a chain: fast / medium / slow plus the mempool minimum. "
@@ -1003,7 +988,7 @@ TOOLS = [
                                                  "description": "btc / zec / ltc / doge / rvn"}},
       "required": ["chain"], "additionalProperties": False}, lambda a: t_get_recommended_fee_rate(a.get("chain"))),
     ("mempool_congestion_status",
-     "Mempool congestion for BTC (txs, bytes, usage vs capacity, min fee, total fees, busy/normal verdict) and tx counts for LTC/DOGE where our node API exposes them. "
+     "Mempool congestion for BTC (txs, bytes, usage vs capacity, min fee, total fees, busy/normal verdict). "
      "When to use: decide whether now is a good moment for an on-chain settlement.",
      {"type": "object", "properties": {"chain": {"type": "string", "enum": ["btc", "ltc", "doge"],
                                                  "description": "btc / ltc / doge"}},
@@ -1061,8 +1046,27 @@ TOOLS = [
     ("robotbase_services",
      "Live availability of every service behind the RobotBase gateway: the chain nodes, hashport engines, Web3 Agent Hub, AITOKENS and MCP itself. "
      "When to use: an overall health check, or which services are down.",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_robotbase_services()),
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_robotbase_services()),    ("xmr_node_status",
+     "Monero node state: height vs target, sync flag, difficulty, txpool size, database size, monerod version and peer counts. "
+     "When to use: whether the XMR node is synced and healthy, or how big its chain/txpool is. "
+     "Do not use: p2pool/mining side → xmr_pool_status.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_xmr_node_status()),    ("xmr_pool_status",
+     "Monero p2pool (mini + nano sidechains) plus Monero network state: per-sidechain hashrate, miners, sidechain height/difficulty, blocks found, last block age, this node's workers, fee and the non-custodial flag. "
+     "When to use: solo/p2pool mining economics on Monero, sidechain health, or which stratum endpoint to point a rig at. "
+     "Do not use: plain node RPC state → xmr_node_status.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_xmr_pool_status()),    ("eth_node_status",
+     "Ethereum node state from a Reth execution client + Lighthouse consensus client: sync state, height/head slot, peers, clients, and — while the node is still being provisioned — an explicit provisioning status. "
+     "When to use: whether the ETH node is up/synced, or what stage its provisioning/sync is at. "
+     "Do not use: for PoW hashrate questions — Ethereum is proof-of-stake (see pow_network_mining_intel).",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_eth_node_status()),
 ]
+
+# ---------------------------------------------------------------- 2026-09-27 四链收敛
+# 平台已按 BTC / ETH / XMR / ZEC 四条链运营；以下工具对应的链已下线，注册表里统一摘除
+# （实现函数保留在文件里，便于将来重新启用，但不再对外暴露）。
+RETIRED_TOOLS = {"kas_node_status", "kas_pool_status", "kas_pool_attribution_intel",
+                 "rvn_node_status", "rvn_pool_status", "rvn_asset_lookup", "utxo_chain_status"}
+TOOLS = [t for t in TOOLS if t[0] not in RETIRED_TOOLS]
 
 
 def tools_list():
@@ -1084,7 +1088,7 @@ def handle(msg):
         return {"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": PROTOCOL_VERSION, "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": SERVER_INFO,
-            "instructions": ("RobotBase read-only on-chain data service: BTC/KAS/ZEC/RVN/DOGE/LTC. "
+            "instructions": ("RobotBase read-only on-chain data service: BTC/ETH/XMR/ZEC. "
                              "Every tool is a read-only query; none of them execute trades or touch funds.")}}
     if method == "notifications/initialized" or mid is None:
         return None
@@ -1110,7 +1114,7 @@ def handle(msg):
 
 DOC_TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>RobotBase MCP · read-only data API for AI agents on six PoW chains</title>
+<title>RobotBase MCP · read-only data API for AI agents on BTC / ETH / XMR / ZEC</title>
 <meta name="description" content="Read-only MCP server covering the classic non-EVM PoW chains (BTC/KAS/ZEC/RVN/DOGE/LTC). No API key, no tracking.">
 <style>
 :root{--bg:#070a0f;--panel:#0f141c;--line:#1f2733;--text:#e8eef6;--muted:#8b98a9;--brand:#ff7a2f;--brand2:#ffc46b}
@@ -1137,8 +1141,8 @@ a{color:var(--brand2)}.muted{color:var(--muted);font-size:12.5px}.ok{color:#2ee6
 border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;pointer-events:none}.toast.on{opacity:1}
 </style></head><body><div class="wrap">
 <h1>RobotBase MCP Server</h1>
-<div class="tag">Read-only MCP server for the six classic PoW chains — BTC / KAS / ZEC / RVN / DOGE / LTC · no API key · no tracking</div>
-<div class="sub">Let Claude, Cursor, Codex, VS Code or any MCP-capable agent query Bitcoin mempool fees, Zcash shielded-pool supply, Kaspa and Ravencoin node + hashport state and more — straight from our own bare-metal nodes. Every tool is read-only; none touch trading or funds.</div>
+<div class="tag">Read-only MCP server for four production chains — BTC / ETH / XMR / ZEC · no API key · no tracking</div>
+<div class="sub">Let Claude, Cursor, Codex, VS Code or any MCP-capable agent query Bitcoin mempool fees, Ethereum node and sync state, Monero node + p2pool telemetry, and Zcash shielded-pool supply — straight from our own nodes. Every tool is read-only; none touch trading or funds.</div>
 
 <div class="card">
   <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
@@ -1167,7 +1171,7 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
        "params":{"name":"zec_chain_info","arguments":{}}}'</pre>
 </div>
 
-<h2>All 16 read-only tools</h2>
+<h2>All __TOOL_COUNT__ read-only tools</h2>
 <div class="card" style="padding:0;overflow:hidden">
 <table><tr><th style="width:230px">Tool</th><th>What it returns</th></tr>__TOOLS_ROWS__</table>
 </div>
@@ -1178,9 +1182,9 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
                                             ▼
                       9108 gateway (/mcp reverse proxy) ──► MCP service (:8090)
                         ├── BTC  9382   full node RPC + electrs (address/tx index)
-                        ├── ZEC  9308   Zebra full node (incl. value-pool / shielded supply)
-                        ├── DOGE 9309   full node
-                        ├── LTC  9310   full node
+                        ├── ETH  Reth execution + Lighthouse consensus
+                        ├── XMR  monerod + p2pool (mini / nano sidechains)
+                        ├── ZEC  Zebra full node (incl. value-pool / shielded supply)
                         └── gateway service aggregation (status pages / dashboards)</pre></div>
 
 <h2>Rate limits and privacy</h2>
@@ -1195,9 +1199,9 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
 <div class="card"><ul style="margin:0;padding-left:20px">
 <li>"What is the cheapest BTC fee right now?" → <code>btc_fee_estimates</code></li>
 <li>"How much ZEC is in the Zcash shielded pools?" → <code>zec_chain_info</code></li>
-<li>"Did our Kaspa hashport ever find a real mainnet block?" → <code>kas_pool_status</code></li>
+<li>"How much hashrate is on the Monero mini sidechain right now?" → <code>xmr_pool_status</code></li>
 <li>"What is the balance of this Bitcoin address?" → <code>btc_address_summary</code></li>
-<li>"How far along is the Dogecoin node?" → <code>utxo_chain_status</code></li>
+<li>"Is our Ethereum node synced yet, and what stage is it at?" → <code>eth_node_status</code></li>
 </ul></div>
 
 <p class="muted" style="margin-top:26px">RobotBase · read-only on-chain data infrastructure · <a href="https://robotbase.cc/">robotbase.cc</a> ·
@@ -1215,15 +1219,13 @@ def docs_html():
     groups = [
         ("① Chain overview", ["list_chains", "chain_status", "robotbase_services"]),
         ("② Bitcoin (BTC)", ["btc_fee_estimates", "btc_mempool_summary", "btc_tx_lookup", "btc_block_summary", "btc_address_summary"]),
-        ("③ Zcash (ZEC)", ["zec_chain_info", "zec_recent_blocks"]),
-        ("④ Kaspa (KAS)", ["kas_node_status", "kas_pool_status"]),
-        ("⑤ Ravencoin (RVN)", ["rvn_node_status", "rvn_pool_status"]),
-        ("⑥ Dogecoin / Litecoin", ["utxo_chain_status"]),
-        ("⑦ Mining & fee intelligence", ["pow_halving_oracle", "pow_network_mining_intel",
+        ("③ Ethereum (ETH)", ["eth_node_status"]),
+        ("④ Monero (XMR)", ["xmr_node_status", "xmr_pool_status"]),
+        ("⑤ Zcash (ZEC)", ["zec_chain_info", "zec_recent_blocks"]),
+        ("⑥ Mining & fee intelligence", ["pow_halving_oracle", "pow_network_mining_intel",
                                          "get_recommended_fee_rate", "mempool_congestion_status",
                                          "robotbase_pool_worker_query"]),
-        ("⑧ Exclusive local indexes", ["zec_shielded_pools_metrics", "kas_pool_attribution_intel",
-                                       "zec_block_attribution_intel", "rvn_asset_lookup",
+        ("⑦ Exclusive local indexes", ["zec_shielded_pools_metrics", "zec_block_attribution_intel",
                                        "broadcast_raw_transaction"]),
     ]
     desc = {n: d for n, d, _s, _f in TOOLS}
@@ -1231,6 +1233,8 @@ def docs_html():
     for gname, names in groups:
         rows += '<tr class="grp"><td colspan="2">' + gname + '</td></tr>'
         for n in names:
+            if n not in desc:      # 分组里若残留已退役的工具名，跳过而不是渲染成空行
+                continue
             d = desc.get(n, "")
             short = d.split("When to use")[0].split("Do not use")[0].split("Note:")[0].strip().rstrip(".") + "."
             when = ""
@@ -1238,7 +1242,8 @@ def docs_html():
                 when = d.split("When to use:")[1].split("Do not use")[0].split("Note:")[0].strip().rstrip(".")
             rows += ('<tr><td><code>' + n + '</code></td><td>' + short +
                      ('<div class="when">When to use: ' + when + '</div>' if when else '') + '</td></tr>')
-    return DOC_TEMPLATE.replace("__TOOLS_ROWS__", rows)
+    return (DOC_TEMPLATE.replace("__TOOLS_ROWS__", rows)
+                .replace("__TOOL_COUNT__", str(len(TOOLS))))
 
 
 def server_card():
@@ -1246,21 +1251,130 @@ def server_card():
     return {
         "name": "robotbase-mcp",
         "title": "RobotBase MCP Server",
-        "version": "0.5.2",
-        "description": "Read-only multi-chain data for AI agents: BTC / KAS / ZEC / RVN / DOGE / LTC. "
-                       "First MCP server covering six classic proof-of-work chains: mempool & fee estimates, "
-                       "transaction lookup, address summary, shielded-pool supply, node status. No auth required, no tracking.",
+        "version": "0.6.0",
+        "description": "Read-only on-chain data for AI agents across four production chains: Bitcoin "
+                       "(mempool, fees, tx/address/block lookup), Ethereum (execution + consensus node state), "
+                       "Monero (node state, p2pool sidechains) and Zcash (chain info, shielded value pools, "
+                       "recent blocks, pool attribution). No auth required, no tracking.",
         "homepage": "https://robotbase.cc/mcp",
         "transport": {"type": "streamable-http", "url": "https://robotbase.cc/mcp"},
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {"tools": {"listChanged": False}},
         "auth": {"type": "none", "optional": "X-API-Key header or ?key= raises rate limit to 600/min per IP"},
         "rateLimits": {"anonymous": "120/min per IP", "withApiKey": "600/min per IP"},
-        "tags": ["bitcoin", "kaspa", "zcash", "ravencoin", "dogecoin", "litecoin", "blockchain-data", "onchain",
+        "tags": ["bitcoin", "ethereum", "monero", "zcash", "blockchain-data", "onchain",
                  "mempool", "fees", "privacy-coins", "read-only", "mcp-server"],
         "tools": [{"name": n, "description": desc[n]} for n, _d, _s, _f in TOOLS],
     }
 
+
+# ============================================================ 2026-09-27 四链扩展（BTC/ETH/XMR/ZEC）
+# 全部上游都可用环境变量覆盖，默认指向本机（参考实现按自己的部署改这些变量即可）
+XMR_HELPER = os.environ.get("RB_XMR_HELPER", "http://127.0.0.1:18085/rpc")
+XMR_P2POOL_API = os.environ.get("RB_XMR_P2POOL_API", "http://127.0.0.1:9327/pool.json")
+ETH_EXEC_RPC = os.environ.get("RB_ETH_EXEC_RPC", "http://127.0.0.1:8545")
+ETH_CONS_RPC = os.environ.get("RB_ETH_CONS_RPC", "http://127.0.0.1:5052")
+
+
+def eth_rpc(method, params=None):
+    """Minimal JSON-RPC call against an Ethereum execution endpoint."""
+    d = _http_json(ETH_EXEC_RPC, {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}, timeout=8)
+    if d.get("error"):
+        raise RuntimeError(d["error"].get("message") if isinstance(d["error"], dict) else str(d["error"]))
+    return d.get("result")
+
+
+def t_xmr_node_status():
+    """Monero node state from a monerod JSON-RPC endpoint (get_info)."""
+    d = cached("xmr_info", 10, lambda: _http_json(
+        XMR_HELPER, {"jsonrpc": "2.0", "id": 1, "method": "get_info"}, timeout=10))
+    r = (d or {}).get("result") or {}
+    if not r:
+        return {"available": False, "reason": "monerod JSON-RPC unreachable"}
+    return {
+        "height": r.get("height"), "target_height": r.get("target_height"),
+        "synced": bool(r.get("synchronized")) and not bool(r.get("busy_syncing")),
+        "status": r.get("status"),
+        "network": "mainnet" if r.get("mainnet") else "stagenet/testnet",
+        "difficulty": r.get("difficulty"),
+        "txpool_txs": r.get("tx_pool_size"),
+        "database_size_gb": round((r.get("database_size") or 0) / 1e9, 2),
+        "version": r.get("version"),
+        "incoming_connections": r.get("incoming_connections_count"),
+        "outgoing_connections": r.get("outgoing_connections_count"),
+        "block_size_limit": r.get("block_size_limit"),
+        "source": "monerod get_info",
+    }
+
+
+def t_xmr_pool_status():
+    """Monero p2pool sidechains (mini/nano) plus Monero network state."""
+    p = cached("xmr_pool", 15, lambda: _http_json(XMR_P2POOL_API, timeout=10))
+    if not p:
+        return {"available": False, "reason": "p2pool pool.json unreachable"}
+    mn = p.get("monero") or {}
+    sides = p.get("p2pool") or {}
+
+    def side(name, stratum_port):
+        s = sides.get(name) or {}
+        node = s.get("this_node") or {}
+        last = s.get("last_block_found_time")
+        return {
+            "sidechain": name,
+            "endpoint": s.get("stratum") or ("127.0.0.1:%d" % stratum_port),
+            "pool_hashrate_hs": s.get("pool_hashrate"),
+            "miners": s.get("pool_miners"),
+            "sidechain_height": s.get("sidechain_height"),
+            "difficulty": s.get("sidechain_difficulty"),
+            "blocks_found": s.get("blocks_found"),
+            "last_block_found_ago_s": (int(time.time()) - int(last)) if last else None,
+            "pplns_window": s.get("pplns_window"),
+            "this_node_workers": node.get("active_workers"),
+            "this_node_hashrate_hs": node.get("hashrate"),
+        }
+
+    return {
+        "host": p.get("host"), "sidechains": p.get("sidechains"),
+        "fee_percent": p.get("fee_percent"), "custody": p.get("custody"),
+        "monero": {"height": mn.get("height"), "difficulty": mn.get("difficulty"),
+                   "network_hashrate_hs": mn.get("network_hashrate"),
+                   "block_reward_xmr": mn.get("block_reward_xmr")},
+        "mini": side("mini", 3333), "nano": side("nano", 3334),
+        "hosted_instances": p.get("hosted_instances"),
+        "worker_count": p.get("worker_count"),
+        "generated_at": p.get("generated_at"),
+        "source": "p2pool pool.json",
+    }
+
+
+def t_eth_node_status():
+    """Ethereum node state: gateway collector first, then direct execution/consensus probes."""
+    out = {"chain": "ETH", "clients": {"execution": "Reth", "consensus": "Lighthouse"}}
+    try:
+        nodes = cached("nodes", 15, lambda: _http_json(HOME_BASE + "/api/nodes")).get("nodes") or {}
+        n = nodes.get("eth") or {}
+        out.update({k: n.get(k) for k in ("ok", "synced", "state", "height", "progress",
+                                          "peers", "exec", "cons", "slot", "client")})
+    except Exception as exc:  # noqa: BLE001
+        out["gateway_error"] = type(exc).__name__
+    try:
+        out["block_number"] = int(eth_rpc("eth_blockNumber"), 16)
+        out["execution_syncing"] = eth_rpc("eth_syncing")
+        out["execution_peers"] = int(eth_rpc("net_peerCount"), 16)
+        out["execution_client"] = eth_rpc("web3_clientVersion")
+    except Exception as exc:  # noqa: BLE001
+        out["execution_probe_error"] = type(exc).__name__
+    try:
+        s = (_http_json(ETH_CONS_RPC + "/eth/v1/node/syncing", timeout=6) or {}).get("data") or {}
+        out["consensus_head_slot"] = s.get("head_slot")
+        out["consensus_syncing"] = s.get("is_syncing")
+        out["consensus_sync_distance"] = s.get("sync_distance")
+    except Exception as exc:  # noqa: BLE001
+        out["consensus_probe_error"] = type(exc).__name__
+    if out.get("execution_probe_error") and out.get("consensus_probe_error") and not out.get("ok"):
+        out["note"] = ("the execution/consensus endpoints are not answering yet; this tool reports "
+                       "the provisioning/sync state instead of masking it")
+    return out
 
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"

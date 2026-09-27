@@ -1,18 +1,18 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.wygogogo19/robotbase-mcp",
-  "description": "Read-only chain intelligence (25 tools) for BTC, KAS, ZEC, RVN, LTC and DOGE.",
-  "version": "0.5.2",
-  "repository": {
-    "url": "https://github.com/wygogogo19/robotbase-mcp",
-    "source": "github",
-    "id": "1368415872"
-  },
-  "websiteUrl": "https://robotbase.cc/mcp",
-  "remotes": [
-    {
-      "type": "streamable-http",
-      "url": "https://robotbase.cc/mcp"
-    }
-  ]
+ "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+ "name": "io.github.wygogogo19/robotbase-mcp",
+ "description": "Read-only chain intelligence (21 tools) for BTC, ETH, XMR and ZEC: mempool & fees, tx/address/block lookup, node and consensus state, Monero p2pool sidechains, Zcash shielded value pools and pool attribution.",
+ "version": "0.6.0",
+ "repository": {
+  "url": "https://github.com/wygogogo19/robotbase-mcp",
+  "source": "github",
+  "id": "1368415872"
+ },
+ "websiteUrl": "https://robotbase.cc/mcp",
+ "remotes": [
+  {
+   "type": "streamable-http",
+   "url": "https://robotbase.cc/mcp"
+  }
+ ]
 }
