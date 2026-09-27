@@ -1,8 +1,8 @@
 {
  "name": "robotbase-mcp",
  "title": "RobotBase MCP Server",
- "version": "0.5.2",
- "description": "Read-only multi-chain data for AI agents: BTC / KAS / ZEC / RVN / DOGE / LTC. First MCP server covering six classic proof-of-work chains: mempool & fee estimates, transaction lookup, address summary, shielded-pool supply, node status. No auth required, no tracking.",
+ "version": "0.6.0",
+ "description": "Read-only on-chain data for AI agents across four production chains: Bitcoin (mempool, fees, tx/address/block lookup), Ethereum (execution + consensus node state), Monero (node state, p2pool sidechains) and Zcash (chain info, shielded value pools, recent blocks, pool attribution). No auth required, no tracking.",
  "homepage": "https://robotbase.cc/mcp",
  "transport": {
   "type": "streamable-http",
@@ -24,11 +24,9 @@
  },
  "tags": [
   "bitcoin",
-  "kaspa",
+  "ethereum",
+  "monero",
   "zcash",
-  "ravencoin",
-  "dogecoin",
-  "litecoin",
   "blockchain-data",
   "onchain",
   "mempool",
@@ -40,11 +38,11 @@
  "tools": [
   {
    "name": "list_chains",
-   "description": "Every chain this service supports (BTC/KAS/ZEC/RVN/DOGE/LTC) with live availability and block height. When to use: the user asks which chains you support, which nodes are online, or how high each chain is. Do not use: for detail on one chain, use chain_status."
+   "description": "Every chain this service supports (BTC / ETH / XMR / ZEC) with live availability and block height. When to use: the user asks which chains you support, which nodes are online, or how high each chain is. Do not use: for detail on one chain, use chain_status."
   },
   {
    "name": "chain_status",
-   "description": "Run-time status of one chain's node: block height, sync progress, connected peers, mempool tx count, client version. When to use: whether a given chain's node is synced, healthy or lagging. Do not use: fees → btc_fee_estimates; address balance → btc_address_summary; pool detail → kas_pool_status / rvn_pool_status."
+   "description": "Run-time status of one chain's node: block height, sync progress, connected peers, mempool tx count, client version. When to use: whether a given chain's node is synced, healthy or lagging. Do not use: fees → btc_fee_estimates; address balance → btc_address_summary; Monero pool detail → xmr_pool_status."
   },
   {
    "name": "zec_chain_info",
@@ -75,28 +73,12 @@
    "description": "Balance and activity of a Bitcoin address: confirmed/unconfirmed balance, UTXO count and total, tx count, last 10 transactions. Supports P2PKH (1…), P2SH (3…), bech32 (bc1q…), bech32m (bc1p…). When to use: how much BTC this address holds, whether it received funds, how active it is. Note: ultra-active addresses such as exchange cold wallets may return a degraded response under index load."
   },
   {
-   "name": "kas_node_status",
-   "description": "Kaspa node status: network height, DAA score, difficulty, network hashrate, DAG tips, block reward, 10 BPS cadence, next halving and the hashport ports this node serves. When to use: how high and how healthy the Kaspa node is, or the halving schedule. Do not use: our own pool's miners/blocks → kas_pool_status."
-  },
-  {
-   "name": "kas_pool_status",
-   "description": "RobotBase Kaspa solo hashport: tier state, pool hashrate, connected miners, accepted shares, blocks found, uptime, share difficulty, the last block found (hash, blue score, age) and stale/invalid counts. When to use: is the KAS hashport live, who is mining on it, did it ever find a real mainnet block. Do not use: chain-level hashrate → kas_node_status."
-  },
-  {
-   "name": "rvn_node_status",
-   "description": "Ravencoin node status: height, sync state, network hashrate, difficulty and client version. When to use: whether the RVN node is synced and how big the network is right now."
-  },
-  {
-   "name": "rvn_pool_status",
-   "description": "RobotBase Ravencoin solo hashport: engine state, pool hashrate, connected miners, shares, share difficulty, the Stratum endpoint, fee and the per-miner independent coinbase payout mode. When to use: is the RVN hashport open, is anyone mining, what endpoint do I point a GPU rig at. Do not use: node-level data → rvn_node_status."
-  },
-  {
    "name": "pow_halving_oracle",
    "description": "Halving countdown for every chain we run: height, next halving height, blocks remaining, ETA in days, and the reward before/after. When to use: an agent needs a precise schedule anchor (emissions, mining economics, long-horizon planning). Note: heights are read live from our own nodes, schedules are protocol constants. DOGE has no further halvings (flat subsidy)."
   },
   {
    "name": "pow_network_mining_intel",
-   "description": "Network hashrate and difficulty for BTC/KAS/ZEC/RVN/LTC/DOGE, with the method stated per chain (node-reported vs difficulty-derived). When to use: mining economics, security budget, or comparing chain weight. Do not use: pool-level stats → kas_pool_status / rvn_pool_status."
+   "description": "Network hashrate and difficulty for BTC / XMR / ZEC (node-reported or difficulty-derived, stated per chain), plus an explicit proof-of-stake note for ETH. When to use: mining economics, security budget, or comparing chain weight. Do not use: pool-level stats → xmr_pool_status or robotbase_pool_worker_query."
   },
   {
    "name": "get_recommended_fee_rate",
@@ -111,10 +93,6 @@
    "description": "All six Zcash value pools (transparent, sprout, sapling, orchard, ironwood, lockbox) with balances, share of supply and 1h/24h deltas. When to use: privacy-pool capital allocation, shielded-supply trends, ZEC macro flows. Do not use: node health → chain_status(zec)."
   },
   {
-   "name": "kas_pool_attribution_intel",
-   "description": "Kaspa chain-wide pool attribution computed locally: which pool found how many blocks, with percentage share, over a window of 1-720 hours, plus the newest attributed blocks. When to use: Kaspa mining decentralisation, competitor share, or checking how a pool performs. Powered by our own block index (hundreds of thousands of blocks attributed), not a third-party API."
-  },
-  {
    "name": "robotbase_pool_worker_query",
    "description": "Look up one miner on our own hashports: hashrate, shares, stale/invalid, current difficulty and last-seen, by wallet address or worker name. When to use: a miner asks their agent \"how is my rig doing on robotbase?\". Privacy: the address is masked in the reply, and only an exact wallet/worker match returns data (no listings)."
   },
@@ -127,16 +105,20 @@
    "description": "Zcash coinbase attribution over the last 10-500 blocks: the shielded-pool share of block rewards (privacy mining), coinbase outputs split into consensus funding streams (lockbox) vs real miner payout addresses, and the pool tags miners printed into their own coinbase text plus our own /RobotBase/ tag. When to use: privacy-pool mining trends, shielded adoption, or checking whether our own pool found blocks. Scope: chain facts only — no third-party pool label list is applied."
   },
   {
-   "name": "rvn_asset_lookup",
-   "description": "Ravencoin native assets straight from our ravend: pass an asset name or id for amount, units, reissuable flag and IPFS metadata, or omit it to list recent assets. When to use: token/asset checks on Ravencoin, where assets are UTXO-native rather than smart contracts."
-  },
-  {
-   "name": "utxo_chain_status",
-   "description": "Node status for DOGE or LTC (height, sync progress, peers, mempool tx count). When to use: Dogecoin or Litecoin node progress. For BTC/KAS/ZEC/RVN use chain_status (any chain in one call)."
-  },
-  {
    "name": "robotbase_services",
    "description": "Live availability of every service behind the RobotBase gateway: the chain nodes, hashport engines, Web3 Agent Hub, AITOKENS and MCP itself. When to use: an overall health check, or which services are down."
+  },
+  {
+   "name": "xmr_node_status",
+   "description": "Monero node state: height vs target, sync flag, difficulty, txpool size, database size, monerod version and peer counts. When to use: whether the XMR node is synced and healthy, or how big its chain/txpool is. Do not use: p2pool/mining side → xmr_pool_status."
+  },
+  {
+   "name": "xmr_pool_status",
+   "description": "Our Monero p2pool (mini + nano sidechains) plus Monero network state: per-sidechain hashrate, miners, sidechain height/difficulty, blocks found, last block age, this node's workers, fee and the non-custodial flag. When to use: solo/p2pool mining economics on Monero, sidechain health, or which stratum endpoint to point a rig at. Do not use: plain node RPC state → xmr_node_status."
+  },
+  {
+   "name": "eth_node_status",
+   "description": "Ethereum node state from our own Reth (execution) + Lighthouse (consensus): sync state, height/head slot, peers, clients, and — while the node is still being provisioned — an explicit provisioning status. When to use: whether the ETH node is up/synced, or what stage its provisioning/sync is at. Do not use: for PoW hashrate questions — Ethereum is proof-of-stake (see pow_network_mining_intel)."
   }
  ]
 }

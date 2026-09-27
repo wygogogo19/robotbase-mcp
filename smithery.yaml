@@ -5,10 +5,10 @@
 name: robotbase-mcp
 displayName: RobotBase MCP Server
 description: >-
-  Read-only multi-chain data for AI agents: the first MCP server covering the six classic
-  proof-of-work chains (Bitcoin, Kaspa, Zcash, Ravencoin, Dogecoin, Litecoin). Mempool & fee
-  estimates, transaction and address lookup, Zcash shielded-pool supply, Kaspa DAG + hashport
-  state, node status, a halving oracle, fee/mempool oracles, Zcash coinbase attribution and
+  Read-only multi-chain data for AI agents across four production chains (Bitcoin, Ethereum,
+  Monero, Zcash). Mempool & fee estimates, transaction and address lookup, Ethereum execution +
+  consensus state, Monero node + p2pool telemetry, Zcash shielded-pool supply and pool
+  attribution, node status, a halving oracle, fee/mempool oracles, Zcash coinbase attribution and
   the Ravencoin asset registry — indexes and native endpoints nobody else publishes for
   these chains. No auth, no tracking. Free beta keys: see the README.
 version: 0.5.2
