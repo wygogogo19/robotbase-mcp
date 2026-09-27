@@ -1,7 +1,7 @@
 {
  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
  "name": "io.github.wygogogo19/robotbase-mcp",
- "description": "Read-only chain intelligence (21 tools) for BTC, ETH, XMR and ZEC: mempool & fees, tx/address/block lookup, node and consensus state, Monero p2pool sidechains, Zcash shielded value pools and pool attribution.",
+ "description": "Read-only MCP for BTC, ETH, XMR and ZEC: fees, nodes, p2pool, shielded pools.",
  "version": "0.6.0",
  "repository": {
   "url": "https://github.com/wygogogo19/robotbase-mcp",
