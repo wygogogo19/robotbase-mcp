@@ -22,6 +22,7 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -38,20 +39,57 @@ jobs:
       - name: Validate the manifest
         run: ./mcp-publisher validate mcp-registry.json
 
+      # Reads the per-server /versions endpoint, not ?search=. The search
+      # endpoint took 57-180s per call under load on 2026-10-14 (and timed out
+      # past 120s in one shot) while /versions answers in ~3s, so this gate
+      # used to sit for minutes in the flakiest part of the registry.
       - name: Skip if this version is already published
         id: registry
         run: |
           VERSION=$(python3 -c "import json;print(json.load(open('mcp-registry.json'))['version'])")
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          if curl -fsS "https://registry.modelcontextprotocol.io/v0/servers?search=io.github.wygogogo19/robotbase-mcp" \
-               | python3 -c "import json,sys;d=json.load(sys.stdin);sys.exit(0 if any(i['server']['version']=='$VERSION' for i in d.get('servers',[])) else 1)"; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Already published::$VERSION is already in the MCP Registry — nothing to do."
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Publishing::$VERSION is new — will publish."
+          URL="https://registry.modelcontextprotocol.io/v0/servers/io.github.wygogogo19%2Frobotbase-mcp/versions"
+          STATE=unknown
+          if BODY=$(curl -fsS --retry 5 --retry-all-errors --retry-delay 5 --max-time 90 "$URL"); then
+            if printf '%s' "$BODY" \
+                 | python3 -c "import json,sys;d=json.load(sys.stdin);sys.exit(0 if any(i['server']['version']=='$VERSION' for i in d.get('servers',[])) else 1)"; then
+              STATE=published
+            else
+              STATE=new
+            fi
           fi
+          case "$STATE" in
+            published)
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "::notice title=Already published::$VERSION is already in the MCP Registry — nothing to do."
+              ;;
+            new)
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              echo "::notice title=Publishing::$VERSION is new — will publish."
+              ;;
+            *)
+              # Inconclusive lookup: attempt the publish anyway and let the
+              # registry be the source of truth. A version that silently never
+              # ships is worse than a red run that says so.
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              echo "::warning title=Version lookup inconclusive::the registry read endpoint did not answer; attempting a publish."
+              ;;
+          esac
 
       - name: Publish mcp-registry.json
         if: steps.registry.outputs.skip != 'true'
-        run: ./mcp-publisher publish mcp-registry.json
+        run: |
+          # 2026-10-14 10:31 +08: the v0.8.0 publish call failed after exactly
+          # 60s while the registry was slow, then went through in 2s when the
+          # run was re-triggered. Retry in-step instead of waking us up.
+          VERSION=$(python3 -c "import json;print(json.load(open('mcp-registry.json'))['version'])")
+          for attempt in 1 2 3; do
+            if ./mcp-publisher publish mcp-registry.json; then
+              echo "::notice title=Published::$VERSION publish succeeded on attempt $attempt"
+              exit 0
+            fi
+            echo "::warning title=Publish attempt $attempt failed::retrying in 20s"
+            sleep 20
+          done
+          echo "::error title=Publish failed::all 3 attempts returned an error from the registry."
+          exit 1
