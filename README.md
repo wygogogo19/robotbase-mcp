@@ -1,10 +1,12 @@
 # RobotBase MCP Server
 
-**Read-only multi-chain data for AI agents across four production chains: Bitcoin · Ethereum · Monero · Zcash.**
+**The semantic risk & verification layer for Web3 agents — one read-only MCP endpoint.**
 
-**免鉴权 · 无追踪 · 只读** ｜ 面向 AI Agent 的六大经典 PoW 公链数据接口
+**免鉴权 · 无追踪 · 只读** ｜ 自建裸金属全节点，对 Agent 暴露统一的「验证 + 风控」语义入口
 
-[![Tools](https://img.shields.io/badge/tools-21-brightgreen)](https://robotbase.cc/mcp/tools)
+Live today: **Bitcoin · Ethereum · Monero · Zcash**. Provisioning: **Solana · Base · Tron**.
+
+[![Tools](https://img.shields.io/badge/tools-13-brightgreen)](https://robotbase.cc/mcp/tools)
 [![Protocol](https://img.shields.io/badge/MCP-2025--06--18-blue)](https://modelcontextprotocol.io)
 [![Transport](https://img.shields.io/badge/transport-streamable--http-orange)](https://robotbase.cc/mcp)
 [![Glama](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp/badges/score.svg)](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp)
@@ -18,15 +20,15 @@ Listed in the **official MCP Registry** as `io.github.wygogogo19/robotbase-mcp` 
 
 ## Why
 
-Ask any LLM today to check **Bitcoin mempool fees**, **whether our Ethereum node is in sync**, **how much hashrate is on our Monero p2pool sidechains**, or the **Zcash shielded-pool supply** and it has nowhere to look: the MCP ecosystem is rich for hosted-indexer SaaS and thin on self-run nodes. This server fills that gap with 21 strictly read-only tools backed by our own full nodes, our own pool engines and local indexes.
+An autonomous agent handling crypto has exactly two blocking questions: **did this payment actually settle**, and **what will the next one cost**. Ask an LLM those today and it has nowhere reliable to look — the MCP ecosystem is rich in wrappers around hosted indexers and thin on self-run infrastructure.
 
-## Pioneer Beta — free API keys
+This server answers both with **13 strictly read-only tools** backed by our own full nodes and local indexes: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, and node telemetry for the rest of the roster.
 
-The hosted endpoint is free to use anonymously (120 req/min). For the **first 100 developers** we hand out a dedicated Bearer key that raises the limit to **600 req/min** and unlocks all 21 tools, free during the public beta:
+## Pricing
 
-**→ [Request Free Beta Key](https://github.com/wygogogo19/robotbase-mcp/issues/new?title=[Beta+Key+Request]&body=Project+Name:+%0AContact+(GitHub/Telegram/Email):)** — open an issue with your project name and a way to reach you; we reply with an `rb_…` key.
+The hosted endpoint is **free during launch**: anonymous access, 120 req/min per IP, no key, no signup, no card.
 
-No card, no payment, no custody. The beta is a public stress test — feedback is the currency.
+When billing opens it will be a **prepaid API key topped up in USDT**, metered per call — the only model every mainstream MCP client can actually use today. Machine-to-machine X402 settlement stays a lab track until mainstream clients can answer a `402 Payment Required` challenge.
 
 ## Connect (3 lines)
 
@@ -43,42 +45,36 @@ Works with Claude Desktop, Cursor, VS Code (remote MCP), and any MCP client supp
 ```bash
 curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
-       "params":{"name":"btc_fee_estimates","arguments":{}}}'
+       "params":{"name":"btc_get_fee_rates","arguments":{}}}'
 ```
 
-## Tools (21)
+## Tools (13)
 
 | Tool | What it does | Typical question |
 |---|---|---|
-| `list_chains` | Supported chains + live status | "Which chains do you support? Are they online?" |
-| `chain_status(chain)` | Node height, sync progress, peers, mempool, version (`btc\|eth\|xmr\|zec`) | "Is the Monero node synced?" |
+| `list_chains` | Every chain on the roster with its state (`live\|provisioning\|planned`) and availability | "Which chains do you support? Are they online?" |
+| `chain_status(chain)` | Node height, sync progress, peers, mempool, version (`btc\|eth\|xmr\|zec\|base\|sol\|tron`) | "Is the Monero node synced?" |
+| `robotbase_capabilities` | What each node can and cannot answer, incl. pruning/retention limits | "Can you still read that far back?" |
 | `robotbase_services` | Gateway-wide service health | "Give me an overall health check" |
-| `btc_fee_estimates` | Recommended fees for 1/2/3/6/12/24 blocks + mempool min fee | "What fee should I pay right now?" |
-| `btc_mempool_summary` | Mempool congestion: pending txs, size, min fee | "Is Bitcoin congested?" |
-| `btc_tx_lookup(txid)` | BTC transaction: confirmations, block, I/O summary | "Is this BTC tx confirmed?" |
-| `btc_block_summary(height\|blockhash)` | Block summary (defaults to tip) | "How many txs in the latest block?" |
-| `btc_address_summary(address)` | Balance, UTXOs, tx count, recent txs (P2PKH/P2SH/bech32/bech32m) | "How much BTC is in this address?" |
-| `zec_chain_info` | Zcash chain info **incl. shielded-pool supply** (transparent/sprout/sapling/orchard/lockbox/ironwood) | "How much ZEC is shielded?" |
-| `zec_recent_blocks(n)` | Recent Zcash blocks | "Are ZEC blocks healthy?" |
-| `eth_node_status` | Ethereum node: execution (Reth) + consensus (Lighthouse) sync state, height/head slot, peers, and an explicit provisioning status while the node is being built | "Is our Ethereum node synced yet?" |
-| `xmr_node_status` | Monero node: height vs target, sync flag, difficulty, txpool, database size, monerod version, peers | "Is the Monero node synced?" |
-| `xmr_pool_status` | Our Monero p2pool mini + nano sidechains: pool hashrate, miners, sidechain height/difficulty, blocks found, last block age, our workers, fee, non-custodial flag — plus Monero network difficulty/hashrate/reward | "How much hashrate is on the Monero mini sidechain?" |
-| `pow_halving_oracle` | Halving countdown for the PoW chains we run (BTC / ZEC): next height, blocks remaining, ETA, reward before/after | "When is the next Zcash halving?" |
-| `pow_network_mining_intel` | Network hashrate + difficulty for BTC / XMR / ZEC (method stated per chain) plus a proof-of-stake note for ETH | "How much hashpower secures Zcash right now?" |
-| `get_recommended_fee_rate` | Fee tiers (fast / medium / slow) + mempool minimum; BTC from our own estimator, ZEC returns the ZIP-317 conventional fee | "What fee gets my BTC confirmed next block?" |
-| `mempool_congestion_status` | BTC mempool size, bytes, capacity load, min fee, total fees + a busy/normal verdict | "Is now a good time to settle on-chain?" |
-| `zec_shielded_pools_metrics` | All six Zcash value pools with share of supply and 1h/24h deltas | "How much ZEC sits in Orchard vs Ironwood?" |
-| `zec_block_attribution_intel` | Coinbase attribution over the last N Zcash blocks from our own node scan: shielded-pool share of block rewards, coinbase outputs split into consensus funding streams (lockbox) vs real miner payout addresses, and the pool tags miners printed into their own coinbase text (plus our `/RobotBase/` tag) | "Who is mining Zcash right now, and how much of the reward is shielded?" |
-| `robotbase_pool_worker_query` | Look up one miner on our hashports by wallet or worker: hashrate, shares, stale/invalid, difficulty | "How is my rig doing on robotbase?" |
-| `broadcast_raw_transaction` | Relay an already-signed transaction through our own node (testmempoolaccept first; operator-gated) | "Broadcast this signed tx for me" |
+| `btc_get_fee_rates` | Fees for 1/2/3/6/12/24-block targets + mempool floor, in sat/vB | "What fee should I pay right now?" |
+| `btc_get_mempool_state` | Mempool depth, capacity load, min fee, total fees + busy/normal verdict | "Is Bitcoin congested right now?" |
+| `btc_get_transaction(txid)` | BTC transaction: confirmations, block, I/O summary | "Did this payment actually settle?" |
+| `btc_get_block(height\|blockhash)` | Block summary (defaults to tip) | "How many txs in the latest block?" |
+| `btc_get_address(address)` | Balance, UTXOs, tx count, recent txs (P2PKH/P2SH/bech32/bech32m) | "How much BTC is in this address?" |
+| `zec_get_pool_status` | Zcash node state **plus all six value pools** (transparent/sprout/sapling/orchard/ironwood/lockbox) with 1h/24h deltas | "How much ZEC is shielded, and is it growing?" |
+| `zec_get_recent_blocks(n)` | Recent Zcash blocks | "Are ZEC blocks healthy?" |
+| `xmr_get_node_status` | Monero node: height vs target, sync flag, difficulty, txpool, database size, monerod version, peers | "Is the Monero node synced?" |
+| `broadcast_raw_transaction` | Relay an already-signed BTC transaction through our own node (testmempoolaccept first; operator-gated) | "Broadcast this signed tx for me" |
+
+Boundary worth stating plainly: RobotBase does **not** index Monero transactions, wallets or ring signatures, and does **not** label or risk-score Bitcoin addresses. Where a node cannot answer, the tool says so instead of guessing.
 
 ## Beyond a generic reader
 
-Most MCP servers wrap a third-party API. These four capabilities come from infrastructure we operate, which is why they are hard to find elsewhere:
+Most MCP servers wrap a third-party API. These come from infrastructure we operate, which is why they are hard to find elsewhere:
 
-1. **Mining intelligence** — `pow_halving_oracle`, `pow_network_mining_intel` and the two pool tools read our own nodes and pool engines, not a public API.
-2. **Fee & mempool oracles** — `mempool_congestion_status` + `get_recommended_fee_rate` answer the first question any autonomous agent has before it sends a transaction.
-3. **Local indexes** — `zec_shielded_pools_metrics` (six value pools with deltas) and `zec_block_attribution_intel` (shielded-coinbase share + `/RobotBase/`-tagged blocks from our own node scan), plus `xmr_pool_status` reading our own p2pool sidechains rather than a public explorer.
+1. **Settlement verification** — `btc_get_transaction` / `btc_get_block` / `btc_get_address` answer the first question an agent has once a payment is claimed, from our own `txindex` node.
+2. **Fee & mempool oracles** — `btc_get_fee_rates` + `btc_get_mempool_state` answer the second: what the next transaction will cost, and whether now is a good moment.
+3. **Local indexes** — `zec_get_pool_status` reads our own Zebra node and value-pool index (all six pools with deltas) rather than a public explorer.
 4. **Optional relay** — `broadcast_raw_transaction` lets an agent sign locally and use us purely as a high-availability broadcast path; it is disabled unless the operator sets `RB_ENABLE_BROADCAST=1`.
 
 ## Architecture
@@ -93,8 +89,9 @@ Most MCP servers wrap a third-party API. These four capabilities come from infra
    MCP server (dependency-free Python, this repo)
             ├── BTC  : Bitcoin Core RPC + electrs (address/tx index)
             ├── ETH  : Reth (execution) + Lighthouse (consensus)
-            ├── XMR  : monerod JSON-RPC + p2pool (mini / nano sidechains)
+            ├── XMR  : monerod JSON-RPC (node telemetry only)
             ├── ZEC  : Zebra RPC (valuePools → shielded-pool supply)
+            ├── SOL / BASE / TRON : provisioning — light API aggregation refined in our middle layer
             └── meta : gateway service aggregation
 ```
 
@@ -117,13 +114,12 @@ export RB_BTC_RPC_URL=http://127.0.0.1:8332
 export RB_BTC_RPC_USER=rpcuser
 export RB_BTC_RPC_PASS=...
 export RB_BTC_DASHBOARD=http://127.0.0.1:8600/api/node   # optional
-export RB_ELECTRS_HOST=127.0.0.1  # electrs for btc_address_summary
+export RB_ELECTRS_HOST=127.0.0.1  # electrs for btc_get_address
 export RB_ELECTRS_PORT=50001
 export RB_ZEC_BASE=http://127.0.0.1:8080                  # status API with /api/chaininfo
-export RB_ETH_EXEC_RPC=http://127.0.0.1:8545              # Reth execution RPC (eth_node_status)
-export RB_ETH_CONS_RPC=http://127.0.0.1:5052              # Lighthouse beacon API (eth_node_status)
-export RB_XMR_HELPER=http://127.0.0.1:18085/rpc           # monerod JSON-RPC (xmr_node_status)
-export RB_XMR_P2POOL_API=http://<your-p2pool-host>:9327/pool.json   # p2pool pool.json (xmr_pool_status)
+export RB_ETH_EXEC_RPC=http://127.0.0.1:8545              # Reth execution RPC (chain_status: eth)
+export RB_ETH_CONS_RPC=http://127.0.0.1:5052              # Lighthouse beacon API (chain_status: eth)
+export RB_XMR_HELPER=http://127.0.0.1:18085/rpc           # monerod JSON-RPC (xmr_get_node_status)
 export RB_HOME_BASE=http://127.0.0.1:8081                 # gateway: /api/nodes /api/pools /api/services
 export RB_USAGE_DB=./usage.db                      # optional usage audit
 export RB_BILLING_DB=./billing.db              # optional: API-key verification
@@ -138,4 +134,4 @@ MIT — see [LICENSE](./LICENSE).
 
 ---
 
-<sub>RobotBase · read-only on-chain data infrastructure · <https://robotbase.cc/></sub>
+<sub>RobotBase · verification & risk intelligence for Web3 agents · <https://robotbase.cc/></sub>
