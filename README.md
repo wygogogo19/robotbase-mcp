@@ -138,9 +138,9 @@ export RB_ELECTRS_PORT=50001
 export RB_ZEC_BASE=http://127.0.0.1:8080                  # status API with /api/chaininfo
 export RB_XMR_HELPER=http://127.0.0.1:18085/rpc           # monerod JSON-RPC (xmr_get_node_status)
 export RB_HOME_BASE=http://127.0.0.1:8081                 # gateway aggregation: /api/nodes (eth + xmr telemetry) /api/services
-export RB_USAGE_DB=./usage.db                      # optional usage audit
-export RB_BILLING_DB=./billing.db              # optional: API-key verification
-export RB_RISK_DB=./risk_quota.db                  # optional: daily risk-tool allowance bookkeeping
+export RB_USAGE_DB=./usage.db                             # optional usage audit
+export RB_BILLING_DB=./billing.db                         # optional: API-key verification
+export RB_RISK_DB=./risk_quota.db                         # optional: daily risk-tool allowance bookkeeping
 python3 server.py
 ```
 
