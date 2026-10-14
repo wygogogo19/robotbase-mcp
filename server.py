@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PORT = int(os.environ.get("RB_PORT", "8090"))
 BIND = os.environ.get("RB_BIND", "127.0.0.1")
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "robotbase-mcp", "version": "0.9.0", "title": "RobotBase MCP — on-chain verification & risk intelligence for Web3 agents"}
+SERVER_INFO = {"name": "robotbase-mcp", "version": "0.10.0", "title": "RobotBase MCP — on-chain verification & risk intelligence for Web3 agents"}
 BTC_ENV = os.environ.get("RB_BTC_ENV", "")
 BTC_DASHBOARD = os.environ.get("RB_BTC_DASHBOARD", "http://127.0.0.1:8600")
 ZEC_BASE = os.environ.get("RB_ZEC_BASE", "http://127.0.0.1:8080")
@@ -887,7 +887,8 @@ def t_rvn_asset_lookup(asset=None, limit=20):
 # 用户指令：P1 主打「高价值风控工具 + 轻量聚合」，不做通用 RPC 转发。
 # 数据源一律是公开聚合接口（GoPlus Labs + TronGrid），只读、不接触私钥、不托管资金。
 # 计费：每个 IP 每天 5 次免费；带 X-API-Key 的用户不受此限（Key 由网关的 billing 服务发放）。
-RISK_TOOLS = ("tron_check_address_risk", "tron_verify_usdt_transfer", "sol_check_token_safety")
+RISK_TOOLS = ("tron_check_address_risk", "tron_verify_usdt_transfer", "sol_check_token_safety",
+              "base_check_contract_risk")
 RISK_FREE_PER_DAY = 5
 RISK_DB = os.environ.get("RB_RISK_DB", "risk_quota.db")
 GOPLUS_BASE = os.environ.get("RB_GOPLUS_BASE", "https://api.gopluslabs.io/api/v1")
@@ -922,8 +923,42 @@ def init_risk_db():
     con.execute("""CREATE TABLE IF NOT EXISTS risk_quota(
         day TEXT NOT NULL, ip_hash TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(day, ip_hash))""")
+    # P2: 按 Key 计数（/billing/v1/usage 的用量看板数据源），只存 key 的 SHA256，不存明文。
+    con.execute("""CREATE TABLE IF NOT EXISTS key_usage(
+        day TEXT NOT NULL, key_hash TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(day, key_hash))""")
     con.commit()
     con.close()
+
+
+def _key_hash():
+    k = getattr(_REQ, "key", "") or ""
+    return hashlib.sha256(k.encode()).hexdigest() if k else ""
+
+
+def _count_key_call():
+    """带 Key 的调用计一次数，返回今天该 Key 的累计次数。"""
+    kh = _key_hash()
+    if not kh:
+        return None
+    d = _bj_day()
+    con = _db(RISK_DB)
+    try:
+        con.execute("INSERT INTO key_usage(day,key_hash,used) VALUES(?,?,1) "
+                    "ON CONFLICT(day,key_hash) DO UPDATE SET used=used+1", (d, kh))
+        con.commit()
+        row = con.execute("SELECT used FROM key_usage WHERE day=? AND key_hash=?", (d, kh)).fetchone()
+        return row["used"] if row else None
+    finally:
+        con.close()
+
+
+def _key_meter():
+    used = _count_key_call()
+    return {"api_key": {"recognized": True, "unlimited": True,
+                        "calls_today": used,
+                        "resets": "00:00 Asia/Shanghai",
+                        "usage_endpoint": "https://robotbase.cc/billing/v1/usage (pass your key)"}}
 
 
 def _risk_quota(consume=True):
@@ -1327,6 +1362,214 @@ def t_sol_check_token_safety(mint):
     return out
 
 
+
+
+# ---- P2 (2026-10-14): Base 合约与代币风控（EVM，GoPlus chain_id 8453，纯聚合）---
+BASE_CHAIN_ID = 8453
+BASESCAN = "https://basescan.org"
+
+_BASE_HARD_FLAGS = ("is_honeypot", "cannot_sell_all", "owner_change_balance", "hidden_owner",
+                    "can_take_back_ownership", "is_blacklisted", "selfdestruct")
+_BASE_WARN_FLAGS = ("is_proxy", "transfer_pausable", "trading_cooldown", "slippage_modifiable",
+                    "personal_slippage_modifiable", "external_call", "is_anti_whale", "is_mintable")
+# 受监管发行方代币（USDC/USDT 这类）本来就有代理升级、暂停、增发权，这些是合规控制而不是
+# 拉盘后门；不区分就会把主流稳定币误判成中危。命中这些关键词的告警在 issuer_backed 时
+# 挪到 issuer_control[]，只说明事实，不参与扣分。
+_BASE_ISSUER_SOFT = ("upgradeable", "mintable", "can be paused", "slippage/tax can be changed",
+                     "anti-whale limits", "trading cooldown")
+
+
+def _goplus_evm_token(chain_id, contract):
+    d = _http_json("%s/token_security/%s?contract_addresses=%s" % (GOPLUS_BASE, chain_id, contract),
+                   timeout=15)
+    res = d.get("result") or {}
+    return res.get(contract) or res.get(contract.lower()) or {}
+
+
+def _pct(v):
+    """GoPlus 的税率是小数（0.05 = 5%）。"""
+    try:
+        return round(float(v) * 100, 3)
+    except (TypeError, ValueError):
+        return None
+
+
+def _flag(res, key):
+    return str(res.get(key) or "0") == "1"
+
+
+def t_base_check_contract_risk(contract):
+    """Base 合约/代币风控：貔貅、税率、开源、后门与 LP 锁定，一次给全。"""
+    c = (contract or "").strip()
+    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", c):
+        return {"contract": c, "chain": "BASE", "checked": False,
+                "error": "not an EVM contract address (0x + 40 hex chars)", "_no_charge": True}
+    c = c.lower()
+    out = {"contract": c, "chain": "BASE", "chain_id": BASE_CHAIN_ID, "asset_scope": "ERC-20 on Base",
+           "sources": ["GoPlus Labs token_security (EVM chain 8453)", BASESCAN + "/address/" + c]}
+    try:
+        res = _goplus_evm_token(BASE_CHAIN_ID, c)
+    except Exception as exc:  # noqa: BLE001
+        return {"contract": c, "chain": "BASE", "checked": False,
+                "error": "%s: %s" % (type(exc).__name__, str(exc)[:120]), "_no_charge": True}
+    if not res:
+        return {"contract": c, "chain": "BASE", "checked": False,
+                "reason": "no token-security record: the contract is not indexed by GoPlus on Base, "
+                          "is not an ERC-20, or was deployed in the last minutes",
+                "how_to_check": BASESCAN + "/address/" + c,
+                "note": "no record is not the same as safe"}
+
+    honeypot = _flag(res, "is_honeypot") or _flag(res, "cannot_sell_all")
+    buy_tax = _pct(res.get("buy_tax"))
+    sell_tax = _pct(res.get("sell_tax"))
+    holders = res.get("holders") or []
+    try:
+        top10 = round(sum(float(h.get("percent") or 0) for h in holders[:10]) * 100, 2)
+    except (TypeError, ValueError):
+        top10 = None
+    lp = res.get("lp_holders") or []
+    try:
+        lp_total = round(sum(float(x.get("percent") or 0) for x in lp) * 100, 2)
+        lp_locked = round(sum(float(x.get("percent") or 0) for x in lp if x.get("is_locked")) * 100, 2)
+    except (TypeError, ValueError):
+        lp_total, lp_locked = None, None
+
+    try:
+        holders_n = int(str(res.get("holder_count") or "0"))
+    except ValueError:
+        holders_n = 0
+    # trust_list 是 GoPlus 自己维护的白名单；稳定币的 top-10 里坐的是交易所与财库地址，
+    # 集中度高不等于控盘，所以这里不再拿集中度当门槛，而是把发行方控制类告警单独列出。
+    issuer_backed = bool(_flag(res, "trust_list") and holders_n >= 100000)
+
+    warnings, hard = [], []
+    if _flag(res, "is_honeypot"):
+        hard.append("GoPlus flags this token as a honeypot")
+    if _flag(res, "cannot_sell_all"):
+        hard.append("holders cannot sell the full balance")
+    if _flag(res, "owner_change_balance"):
+        hard.append("the owner can rewrite holder balances")
+    if _flag(res, "hidden_owner"):
+        hard.append("a hidden owner exists")
+    if _flag(res, "can_take_back_ownership"):
+        hard.append("ownership can be taken back after renouncing")
+    if _flag(res, "selfdestruct"):
+        hard.append("the contract can selfdestruct")
+    if _flag(res, "is_blacklisted"):
+        hard.append("the token is blacklisted by GoPlus")
+    if sell_tax is not None and sell_tax >= 10:
+        warnings.append("sell tax is %.2f%% - a large part of the exit is confiscated" % sell_tax)
+    elif sell_tax:
+        warnings.append("sell tax is %.2f%%" % sell_tax)
+    if buy_tax:
+        warnings.append("buy tax is %.2f%%" % buy_tax)
+    if not _flag(res, "is_open_source") and res.get("is_open_source") is not None:
+        warnings.append("contract source is NOT verified/open")
+    if _flag(res, "is_proxy"):
+        warnings.append("contract is upgradeable (proxy) - the logic can be replaced")
+    if _flag(res, "transfer_pausable"):
+        warnings.append("transfers can be paused")
+    if _flag(res, "is_mintable"):
+        warnings.append("supply is mintable")
+    if _flag(res, "trading_cooldown"):
+        warnings.append("a trading cooldown is enforced")
+    if _flag(res, "slippage_modifiable") or _flag(res, "personal_slippage_modifiable"):
+        warnings.append("slippage/tax can be changed by the owner")
+    if _flag(res, "external_call"):
+        warnings.append("contract makes external calls (a rug vector)")
+    if _flag(res, "is_anti_whale"):
+        warnings.append("anti-whale limits are active")
+    if top10 is not None and top10 >= 50:
+        warnings.append("top-10 holders control %.1f%% of supply" % top10)
+    if lp_total is not None and lp_total > 0 and (lp_locked or 0) <= 0:
+        warnings.append("liquidity is not locked")
+    if _flag(res, "honeypot_with_same_creator"):
+        warnings.append("the same creator has shipped honeypots before")
+    if _flag(res, "fake_token") or (res.get("is_true_token") is not None and not _flag(res, "is_true_token")):
+        warnings.append("GoPlus does not treat this as the genuine token")
+    if _flag(res, "is_airdrop_scam"):
+        warnings.append("flagged as an airdrop scam")
+
+    score = 100
+    score -= 45 * len([k for k in _BASE_HARD_FLAGS if _flag(res, k)])
+    if honeypot:
+        score = min(score, 15)
+    tax_penalty = 0
+    if sell_tax is not None and sell_tax >= 10:
+        tax_penalty += 25
+    elif sell_tax is not None and sell_tax >= 5:
+        tax_penalty += 10
+    if buy_tax is not None and buy_tax >= 10:
+        tax_penalty += 15
+    score -= tax_penalty
+    if res.get("is_open_source") is not None and not _flag(res, "is_open_source"):
+        score -= 15
+    issuer_control = []
+    if issuer_backed:
+        issuer_control = [w for w in warnings if any(k in w for k in _BASE_ISSUER_SOFT)]
+        warnings = [w for w in warnings if w not in issuer_control]
+    else:
+        for k in _BASE_WARN_FLAGS:
+            if _flag(res, k):
+                score -= 8
+    if top10 is not None:
+        score -= min(25, int(max(0, top10 - 30) / 2))
+    if lp_total and not lp_locked:
+        score -= 15
+    score = max(0, min(100, score))
+    if hard or honeypot or (sell_tax or 0) >= 10:
+        level = "high"
+    elif warnings:
+        level = "medium"
+    else:
+        level = "low"
+    if issuer_backed and level == "high" and not honeypot:
+        level = "medium"
+
+    out.update({
+        "checked": True, "risk_level": level, "safety_score": score,
+        "token_name": res.get("token_name"), "token_symbol": res.get("token_symbol"),
+        "is_honeypot": _flag(res, "is_honeypot"),
+        "cannot_sell_all": _flag(res, "cannot_sell_all"),
+        "buy_tax_pct": buy_tax, "sell_tax_pct": sell_tax,
+        "is_open_source": None if res.get("is_open_source") is None else _flag(res, "is_open_source"),
+        "is_proxy": _flag(res, "is_proxy"), "is_mintable": _flag(res, "is_mintable"),
+        "owner_change_balance": _flag(res, "owner_change_balance"),
+        "hidden_owner": _flag(res, "hidden_owner"),
+        "can_take_back_ownership": _flag(res, "can_take_back_ownership"),
+        "transfer_pausable": _flag(res, "transfer_pausable"),
+        "selfdestruct": _flag(res, "selfdestruct"),
+        "is_blacklisted": _flag(res, "is_blacklisted"),
+        "honeypot_with_same_creator": _flag(res, "honeypot_with_same_creator"),
+        "holder_count": res.get("holder_count"),
+        "top10_holder_pct": top10,
+        "lp_holder_pct": lp_total, "lp_locked_pct": lp_locked,
+        "trust_list": _flag(res, "trust_list"), "issuer_backed": issuer_backed,
+        "issuer_control": issuer_control or None,
+        "issuer_note": ("this token is on GoPlus's trust list with a wide holder base, so upgradeable "
+                        "proxy / pausable / mintable control is read as issuer compliance control "
+                        "(how regulated stablecoins work) rather than as a rug signal"
+                        if issuer_backed else None),
+        "owner_address": res.get("owner_address"),
+        "dex": [{"name": d.get("name"), "liquidity": d.get("liquidity"),
+                 "pair": d.get("pair")} for d in (res.get("dex") or [])[:5]],
+        "creators": [x.get("address") for x in (res.get("creators") or [])][:3],
+        "warnings": (hard + warnings) or ["no red flag in the checked dimensions"],
+        "scoring": "100 minus 45 per hard backdoor flag (honeypot caps the score at 15), 25 if the sell "
+                   "tax is >=10% (15 if the buy tax is), 15 if the source is not verified, 8 per "
+                   "upgrade/pause/mint/slippage flag, up to 25 for top-10 concentration, 15 if "
+                   "liquidity is unlocked",
+        "not_covered": [
+            "a live sell simulation with a real quote (no swap simulator is queried here)",
+            "whether the owner key is compromised, or off-chain rug intent",
+            "liquidity depth in USD (no DEX aggregator is queried)",
+            "contracts and tokens that GoPlus has not indexed on Base yet"],
+        "disclaimer": "Derived from the public GoPlus Labs dataset as fetched at call time. A risk screen, "
+                      "not investment advice; no record does not mean safe.",
+    })
+    return out
+
+
 TOOLS = [    ("list_chains",
      "List every chain on the RobotBase roster with its state. "
      "When to use: the user asks which chains are supported, which nodes are online, or where to start. "
@@ -1456,6 +1699,23 @@ TOOLS = [    ("list_chains",
      {"type": "object", "properties": {"mint": {"type": "string", "description": "Solana token mint address (base58)"}},
       "required": ["mint"], "additionalProperties": False},
      lambda a: t_sol_check_token_safety(a.get("mint"))),
+    ("base_check_contract_risk",
+     "Base (EVM) token and contract risk screen: honeypot, transfer taxes, verified source, backdoors "
+     "and liquidity lock. "
+     "When to use: before an agent trades, quotes or accepts a token on Base, or when an address shows up "
+     "in an AgentKit / onchain-agent flow and you need the hard facts first - can it be sold, what does "
+     "the exit cost, who can change the rules. "
+     "Do not use: for Solana mints (that is sol_check_token_safety) or for TRON addresses "
+     "(tron_check_address_risk); it does not simulate a live sell. "
+     "Returns: risk_level (low|medium|high), safety_score, is_honeypot, cannot_sell_all, buy_tax_pct, "
+     "sell_tax_pct, is_open_source, is_proxy, is_mintable, owner_change_balance, hidden_owner, "
+     "can_take_back_ownership, transfer_pausable, selfdestruct, holder_count, top10_holder_pct, "
+     "lp_locked_pct, dex pairs, warnings[], not_covered[] and a disclaimer. "
+     "Metered: 5 free calls per day per IP, unlimited with an API key.",
+     {"type": "object", "properties": {"contract": {"type": "string",
+                                                    "description": "Base ERC-20 contract address (0x...)"}},
+      "required": ["contract"], "additionalProperties": False},
+     lambda a: t_base_check_contract_risk(a.get("contract"))),
 ]
 
 
@@ -1467,8 +1727,18 @@ def call_tool(name, args):
     for n, _d, _s, fn in TOOLS:
         if n == name:
             if n not in RISK_TOOLS:
+                if _client_plan() == "key":
+                    _count_key_call()
                 return fn(args or {})
             gate = _risk_gate()                      # 额度用尽则抛 PaymentRequired，不消耗上游
+            if _client_plan() == "key":
+                out = fn(args or {})
+                meter = _key_meter()
+                if isinstance(out, dict):
+                    out["_metering"] = meter
+                else:
+                    out = {"result": out, "_metering": meter}
+                return out
             tier = gate.get("free_tier") or {}
             used_before, limit = tier.get("used_today", 0), tier.get("limit_per_day", -1)
             out = fn(args or {})
@@ -1499,8 +1769,11 @@ def handle(msg):
                              "funds or hold keys, and RobotBase operates no mining pool. For payment "
                              "safety use tron_check_address_risk before accepting USDT and "
                              "tron_verify_usdt_transfer before releasing value; sol_check_token_safety "
-                             "screens a Solana mint before a trade. Those three risk tools are metered "
-                             "(free daily allowance per IP, then an API key).")}}
+                             "screens a Solana mint before a trade; base_check_contract_risk screens a Base "
+                             "ERC-20 before touching it (honeypot, taxes, verified source, backdoors). "
+                             "Those four risk tools are metered (free daily allowance per IP, then an API "
+                             "key; every answer carries its own _metering block, and a key holder can read "
+                             "usage at https://robotbase.cc/billing/v1/usage).")}}
     if method == "notifications/initialized" or mid is None:
         return None
     if method == "ping":
@@ -1627,6 +1900,7 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
 <li><code>tron_check_address_risk</code> - judicial / black-market labels, account age, 0-100 safety score</li>
 <li><code>tron_verify_usdt_transfer</code> - finalized?, amount, sender, recipient, matched against what you expect</li>
 <li><code>sol_check_token_safety</code> - mint &amp; freeze authority, liquidity lock, top-10 concentration</li>
+<li><code>base_check_contract_risk</code> - Base honeypot screen, buy/sell tax, verified source, backdoors, LP lock</li>
 </ul>
   <p class="muted" style="margin-bottom:0">Free allowance: <b>__RISK_FREE__ calls per day per IP</b>. After that the
   tool answers <code>Payment Required</code> and points at the top-up page. An API key lifts the cap.</p>
@@ -1635,7 +1909,7 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
 <h2 id="pricing">Pricing</h2>
 <div class="card"><div class="grid">
 <div><div class="muted">Verification tools (13)</div><div><b>$0</b> — free forever, no key, no signup</div></div>
-<div><div class="muted">Risk intelligence (3 tools)</div><div><b>__RISK_FREE__ calls/day per IP free</b>, then a prepaid API key</div></div>
+<div><div class="muted">Risk intelligence (4 tools)</div><div><b>__RISK_FREE__ calls/day per IP free</b>, then a prepaid API key</div></div>
 <div><div class="muted">Pioneer beta</div><div><b>Free key for the first 100 developers</b> — 600 req/min, unlimited risk calls</div></div>
 <div><div class="muted">After the beta</div><div>prepaid API key, topped up in <b>USDT (TRC-20)</b> or <b>BTC</b> on-chain</div></div>
 </div>
@@ -1673,7 +1947,7 @@ def docs_html():
         ("③ Zcash (ZEC) — shielded-pool intelligence", ["zec_get_pool_status", "zec_get_recent_blocks"]),
         ("④ Monero (XMR) — node telemetry", ["xmr_get_node_status"]),
         ("⑤ Risk intelligence — metered", ["tron_check_address_risk", "tron_verify_usdt_transfer",
-                                           "sol_check_token_safety"]),
+                                           "sol_check_token_safety", "base_check_contract_risk"]),
     ]
     desc = {n: d for n, d, _s, _f in TOOLS}
     rows = ""
@@ -1699,14 +1973,15 @@ def server_card():
     return {
         "name": "robotbase-mcp",
         "title": "RobotBase MCP Server - on-chain verification & risk intelligence for Web3 agents",
-        "version": "0.9.0",
+        "version": "0.10.0",
         "description": "The semantic verification and risk-intelligence layer for Web3 agents, as one "
                        "read-only MCP endpoint. Live: Bitcoin (fees, mempool state, tx/block/address "
                        "verification, optional raw-tx relay), Ethereum (Reth execution + Lighthouse "
                        "consensus state), Monero (node telemetry - no tx or wallet indexing) and Zcash "
                        "(node state + all six shielded value pools + recent blocks). Risk intelligence "
                        "as light aggregation over public datasets: TRON address risk, TRC-20 USDT "
-                       "settlement verification and Solana rug-pull screening. RobotBase publishes no "
+                       "settlement verification, Solana rug-pull screening and Base (EVM) contract "
+                       "honeypot/tax/backdoor screening. RobotBase publishes no "
                        "RPC endpoint of any kind. Verification tools are free; risk tools include a "
                        "daily free allowance with a prepaid API key above it.",
         "homepage": "https://robotbase.cc/mcp",
@@ -1716,7 +1991,8 @@ def server_card():
         "auth": {"type": "none", "optional": "X-API-Key header or ?key= raises rate limit to 600/min per IP"},
         "rateLimits": {"anonymous": "120/min per IP", "withApiKey": "600/min per IP"},
         "tags": ["bitcoin", "ethereum", "monero", "zcash", "solana", "base", "tron", "blockchain-data",
-                 "onchain", "verification", "risk-intelligence", "aml", "rug-pull", "usdt", "mempool",
+                 "onchain", "verification", "risk-intelligence", "aml", "rug-pull", "honeypot", "evm",
+                 "usdt", "mempool",
                  "fees", "privacy-coins", "read-only", "mcp-server", "web3-agents"],
         "pricing": {"verification_tools": "free", "risk_tools": "%d free calls/day per IP, then a prepaid API key" % RISK_FREE_PER_DAY,
                     "top_up": TOPUP_URL},
@@ -1862,6 +2138,8 @@ other windows: <a href="/mcp/stats?hours=1">1h</a> · <a href="/mcp/stats?hours=
         plan = self._plan()
         _REQ.ip = (self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For")
                    or self.client_address[0])
+        _REQ.key = (self.headers.get("X-API-Key") or
+                    (self.path.split("key=", 1)[1].split("&")[0] if "key=" in self.path else ""))
         _REQ.plan = plan
         limit = 600 if plan == "key" else RATE_LIMIT_PER_MIN
         if not self._rate_ok(limit):

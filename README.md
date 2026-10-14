@@ -6,7 +6,7 @@
 
 Live today: **Bitcoin · Ethereum · Monero · Zcash**. Provisioning: **Solana · Base · Tron**.
 
-[![Tools](https://img.shields.io/badge/tools-16-brightgreen)](https://robotbase.cc/mcp/tools)
+[![Tools](https://img.shields.io/badge/tools-17-brightgreen)](https://robotbase.cc/mcp/tools)
 [![Protocol](https://img.shields.io/badge/MCP-2025--06--18-blue)](https://modelcontextprotocol.io)
 [![Transport](https://img.shields.io/badge/transport-streamable--http-orange)](https://robotbase.cc/mcp)
 [![Glama](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp/badges/score.svg)](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp)
@@ -22,15 +22,15 @@ Listed in the **official MCP Registry** as `io.github.wygogogo19/robotbase-mcp` 
 
 An autonomous agent handling crypto has exactly two blocking questions: **did this payment actually settle**, and **what will the next one cost**. Ask an LLM those today and it has nowhere reliable to look — the MCP ecosystem is rich in wrappers around hosted indexers and thin on self-run infrastructure.
 
-This server answers both with **16 strictly read-only tools** (13 free verification tools + 3 metered risk tools) backed by our own full nodes and local indexes: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, and node telemetry for the rest of the roster.
+This server answers both with **17 strictly read-only tools** (13 free verification tools + 4 metered risk tools) backed by our own full nodes and local indexes: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, and node telemetry for the rest of the roster.
 
 ## Pricing
 
 | Tier | What it covers | Limit |
 |---|---|---|
 | **Verification (13 tools)** | Fee, mempool, tx/block/address verification, node and shielded-pool telemetry, optional raw-tx relay | **Free forever**, no key, no signup |
-| **Risk intelligence (3 tools)** | `tron_check_address_risk`, `tron_verify_usdt_transfer`, `sol_check_token_safety` | **5 calls/day per IP** free, resets 00:00 Asia/Shanghai |
-| **Prepaid API key** | Lifts the risk-tool cap and raises the rate limit | USDT (TRC-20) or BTC on-chain, top up at <https://robotbase.cc/billing/pricing> |
+| **Risk intelligence (4 tools)** | `tron_check_address_risk`, `tron_verify_usdt_transfer`, `sol_check_token_safety`, `base_check_contract_risk` | **5 calls/day per IP** free, resets 00:00 Asia/Shanghai |
+| **Prepaid API key** | Lifts the risk-tool cap and raises the rate limit | USDT (TRC-20) or BTC on-chain at <https://robotbase.cc/billing/pricing> — the key is issued **automatically** the moment the payment confirms, and usage is readable at `/billing/v1/usage?key=…` |
 
 Every metered answer carries its own `_metering` block (allowance, reset time, calls left), and a call that fails local validation — a malformed address or txid — does **not** consume the allowance. Past the free allowance the tool returns `Payment Required` and names the top-up page instead of a partial result.
 
@@ -54,7 +54,7 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
        "params":{"name":"btc_get_fee_rates","arguments":{}}}'
 ```
 
-## Tools (16)
+## Tools (17)
 
 | Tool | What it does | Typical question |
 |---|---|---|
@@ -74,13 +74,14 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
 
 ### Risk intelligence (metered)
 
-Three tools answer what a free block explorer cannot. They are aggregation over public datasets refined in our own middle layer — deliberately **no** heavy local Solana or Tron node.
+Four tools answer what a free block explorer cannot. They are aggregation over public datasets refined in our own middle layer — deliberately **no** heavy local node for Solana, Tron or Base.
 
 | Tool | What it does | Typical question |
 |---|---|---|
 | `tron_check_address_risk(address)` | TRC-20 counterparty screening: judicial / black-market / mixer / phishing labels, account activation and age, 0-100 safety score, plus an explicit `not_covered` list | "Is it safe to accept USDT from this address?" |
 | `tron_verify_usdt_transfer(txid, expected_to?, expected_amount_usdt?)` | USDT settlement check: finalized on the solidity chain, confirmations, amount, sender, recipient, matched against what you expect | "Did this USDT payment land, irreversibly, for the right amount?" |
 | `sol_check_token_safety(mint)` | Solana rug screen: mint authority, freeze authority, liquidity-lock percentage, top-10 concentration, transfer fee / hook | "Is this token a rug before my agent buys it?" |
+| `base_check_contract_risk(contract)` | Base (EVM) screen: honeypot / cannot-sell, buy & sell tax, verified source, upgradeable proxy, hidden owner, balance-rewrite, pausable transfers, mintable supply, selfdestruct, blacklist, LP lock, top-10 concentration | "Can this Base token be sold, and what does the exit cost?" |
 
 Each one returns `risk_level`, a 0-100 `safety_score`, the verbatim upstream flags it was derived from, a `not_covered` list and a disclaimer — it relays public labels and **forms no legal opinion**. Issuer-backed tokens (regulated stablecoins) are read as issuer control rather than as a rug signal, and that decision is stated in the response.
 
