@@ -1872,11 +1872,11 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
 <div class="card"><pre>External AI agent ──HTTPS (Streamable HTTP)──► https://robotbase.cc/mcp
                                             │ Cloudflare Tunnel
                                             ▼
-                      gateway (/mcp reverse proxy) ──► MCP tool service
-                        ├── BTC  full node RPC + electrs (address/tx index)
-                        ├── ETH  Reth execution + Lighthouse consensus
-                        ├── XMR  monerod full node
-                        ├── ZEC  Zebra full node (incl. value-pool / shielded supply)
+                      gateway (/mcp reverse proxy) ──► MCP service (:8090)
+                        ├── BTC   full node RPC + electrs (address/tx index)
+                        ├── ETH   Reth execution + Lighthouse consensus
+                        ├── XMR   monerod full node
+                        ├── ZEC   Zebra full node (incl. value-pool / shielded supply)
                         ├── SOL / BASE / TRON   provisioning - light API aggregation, no heavy node on this host
                         └── gateway service aggregation (status pages / dashboards)</pre></div>
 
@@ -1893,9 +1893,10 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
 
 <h2>Risk intelligence (metered)</h2>
 <div class="card">
-  <p class="muted" style="margin-top:0">Three tools answer questions a free block explorer cannot:
-  is this counterparty tainted, did the USDT really arrive irreversibly, and is this Solana token a
-  rug. They are aggregations over public datasets (GoPlus Labs + TronGrid), read-only, no keys, no custody.</p>
+  <p class="muted" style="margin-top:0">Four tools answer questions a free block explorer cannot:
+  is this counterparty tainted, did the USDT really arrive irreversibly, is this Solana token a
+  rug, and can this Base contract be sold at all. They are aggregations over public datasets
+  (GoPlus Labs + TronGrid), read-only, no keys, no custody.</p>
 <ul style="margin:0;padding-left:20px">
 <li><code>tron_check_address_risk</code> - judicial / black-market labels, account age, 0-100 safety score</li>
 <li><code>tron_verify_usdt_transfer</code> - finalized?, amount, sender, recipient, matched against what you expect</li>
