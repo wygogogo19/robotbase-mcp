@@ -1,8 +1,8 @@
 {
  "name": "robotbase-mcp",
- "title": "RobotBase MCP Server — on-chain verification & risk intelligence for Web3 agents",
- "version": "0.8.0",
- "description": "The semantic verification and risk-intelligence layer for Web3 agents, as one read-only MCP endpoint. Live: Bitcoin (fees, mempool state, tx/block/address verification, optional raw-tx relay), Ethereum (Reth execution + Lighthouse consensus state), Monero (node telemetry) and Zcash (node state + all six shielded value pools + recent blocks). Provisioning: Solana, Base and Tron, wired through light API aggregation rather than heavy local nodes. No public RPC endpoint is published, no tracking, no custody.",
+ "title": "RobotBase MCP Server - on-chain verification & risk intelligence for Web3 agents",
+ "version": "0.9.0",
+ "description": "The semantic verification and risk-intelligence layer for Web3 agents, as one read-only MCP endpoint. Live: Bitcoin (fees, mempool state, tx/block/address verification, optional raw-tx relay), Ethereum (Reth execution + Lighthouse consensus state), Monero (node telemetry - no tx or wallet indexing) and Zcash (node state + all six shielded value pools + recent blocks). Risk intelligence as light aggregation over public datasets: TRON address risk, TRC-20 USDT settlement verification and Solana rug-pull screening. RobotBase publishes no RPC endpoint of any kind. Verification tools are free; risk tools include a daily free allowance with a prepaid API key above it.",
  "homepage": "https://robotbase.cc/mcp",
  "transport": {
   "type": "streamable-http",
@@ -23,12 +23,9 @@
   "withApiKey": "600/min per IP"
  },
  "pricing": {
-  "current": "free during launch, no key required",
-  "planned": [
-   "prepaid API key (USDT top-up), metered per call",
-   "miner & merchant subscription"
-  ],
-  "experimental": "X402 M2M settlement — lab track, not the billing system"
+  "verification_tools": "free",
+  "risk_tools": "5 free calls/day per IP, then a prepaid API key",
+  "top_up": "https://robotbase.cc/billing/pricing"
  },
  "tags": [
   "bitcoin",
@@ -42,6 +39,9 @@
   "onchain",
   "verification",
   "risk-intelligence",
+  "aml",
+  "rug-pull",
+  "usdt",
   "mempool",
   "fees",
   "privacy-coins",
@@ -52,55 +52,67 @@
  "tools": [
   {
    "name": "list_chains",
-   "description": "Every chain on the RobotBase roster with its state (live / provisioning / planned), live availability and block height. When to use: the user asks which chains are supported, which nodes are online, or where to start. Do not use: for one chain's live health use chain_status; for what a node can and cannot answer use robotbase_capabilities."
+   "description": "List every chain on the RobotBase roster with its state. When to use: the user asks which chains are supported, which nodes are online, or where to start. Do not use: for one chain's live health call chain_status; for what a node can and cannot answer call robotbase_capabilities. Returns: chains[], each {chain, tier (live|provisioning|planned), ok, synced, height, state}."
   },
   {
    "name": "chain_status",
-   "description": "Run-time state of one chain's node: block height, sync progress, connected peers, mempool depth, client version. When to use: whether a given chain's node is synced, healthy or lagging. Do not use: fees -> btc_get_fee_rates; a specific payment -> btc_get_transaction; ZEC pool distribution -> zec_get_pool_status."
+   "description": "Live run-time state of one chain's node. When to use: is this chain's node synced, healthy or lagging; what is its height, peer count, mempool depth or client version. Do not use: fees (that is btc_get_fee_rates); a specific payment (that is btc_get_transaction); ZEC pool distribution (that is zec_get_pool_status). Returns: chain, ok, synced, height, peers, mempool, client, state; a chain that is not live yet returns served=false plus its tier instead of an error."
   },
   {
    "name": "robotbase_capabilities",
-   "description": "What every node can and cannot answer, including pruning and retention limits, plus the fee models we support. When to use: before promising that a query is possible, or after a tool refused one as out of range. RobotBase publishes no RPC endpoint - every read path is this MCP surface."
-  },
-  {
-   "name": "robotbase_services",
-   "description": "Live availability of every service behind the RobotBase gateway: the chain nodes, Web3 Agent Hub and MCP itself. When to use: an overall platform health check, or finding which service is down. Do not use: for a single chain's node state (chain_status)."
+   "description": "Per-chain capability, retention boundary and fee model. When to use: before promising that some query is possible, or when a tool refused a query as out of range. Do not use: for live numbers (that is chain_status). Returns: one row per chain {chain, tier, name, client, state, capability}, plus the fee models we support and an honesty note. Key fact: RobotBase publishes no RPC endpoint - every read path is this MCP surface."
   },
   {
    "name": "zec_get_pool_status",
-   "description": "Zcash chain state plus the distribution of all six value pools (transparent / sprout / sapling / orchard / ironwood / lockbox) with balances, share of supply and 1h/24h deltas, in one call. When to use: how much ZEC sits in each shielded pool and what share of supply is shielded. Do not use: we do not index Zcash transactions or wallets; node peers and disk usage -> chain_status."
+   "description": "Zcash chain state plus the distribution of all six value pools, in one call. When to use: how much ZEC sits in each shielded pool, the shielded share of supply, and whether the ZEC node is caught up. Do not use: we do not index Zcash transactions or wallets; for node peers and disk usage call chain_status. Returns: blocks/headers/estimated_height/chain_supply/difficulty/size_on_disk_gb, node_value_pools, pools[] with {pool, balance, share_of_supply_pct, delta_1h, delta_24h}, shielded_total, shielded_pct."
   },
   {
    "name": "zec_get_recent_blocks",
-   "description": "Height, hash, block time and difficulty of the most recent N Zcash blocks (default 5, max 20). When to use: checking whether ZEC is producing blocks normally and at what interval. Do not use: for shielded-pool supply -> zec_get_pool_status."
+   "description": "The most recent Zcash blocks. When to use: checking whether ZEC is producing blocks normally and at what interval. Do not use: for shielded-pool supply (that is zec_get_pool_status). Returns: for the last N blocks (default 5, max 20): height, hash, time, difficulty."
   },
   {
    "name": "btc_get_fee_rates",
-   "description": "Bitcoin fee rates for 1/2/3/6/12/24-block confirmation targets plus the mempool floor, reported in sat/vB and BTC/kvB. When to use: pricing a Bitcoin transaction, or deciding when a sweep will confirm cheaply. Do not use: to measure backlog depth -> btc_get_mempool_state. There is no equivalent for Zcash: ZEC fees are protocol-fixed."
+   "description": "Bitcoin fee rates for confirmation targets, plus the mempool floor. When to use: pricing a Bitcoin transaction, or deciding when a sweep will confirm cheaply. Do not use: to measure backlog depth (that is btc_get_mempool_state). There is no equivalent for Zcash: ZEC fees are protocol-fixed, see robotbase_capabilities. Returns: estimates for 1/2/3/6/12/24-block targets in BTC/kvB, recommended.fast_1_block_sat_vb / medium_3_block_sat_vb / slow_12_block_sat_vb, mempool_min_sat_vb."
   },
   {
    "name": "btc_get_mempool_state",
-   "description": "Bitcoin mempool depth, capacity load, minimum fee, total fees and a busy/normal verdict. When to use: deciding whether now is a good moment to settle on-chain, or how large the backlog is. Do not use: to choose a fee -> btc_get_fee_rates."
+   "description": "Bitcoin mempool depth, capacity load and a busy/normal verdict. When to use: deciding whether now is a good moment to settle on-chain, or how large the backlog is. Do not use: to choose a fee (that is btc_get_fee_rates). Returns: txs, bytes, usage_mb, max_mempool_mb, load_pct, min_fee_btc_kvb, total_fees_btc, verdict."
   },
   {
    "name": "btc_get_transaction",
-   "description": "Look up one Bitcoin transaction by txid: confirmations, block, time, size/vsize, inputs and up to 12 outputs. When to use: the core settlement check - has this payment arrived, which block is it in, how deep is it. Do not use: a whole block -> btc_get_block; an address balance -> btc_get_address."
+   "description": "Look up one Bitcoin transaction by txid - the core settlement check. When to use: has this payment arrived, which block is it in, how many confirmations does it have. Do not use: for a whole block (that is btc_get_block); for an address balance (that is btc_get_address). Returns: txid, blockhash, confirmations, time, size/vsize, vin_count, up to 12 outputs with address and value, value_out_btc."
   },
   {
    "name": "btc_get_block",
-   "description": "Bitcoin block summary by height or block hash; omit both for the chain tip. Returns hash, height, time, tx count, size, weight, confirmations, previous block hash. When to use: an overview of a block, or confirming which block a payment landed in. Do not use: to fetch a single payment -> btc_get_transaction."
+   "description": "Bitcoin block summary by height or hash; omit both for the chain tip. When to use: an overview of a block, or confirming which block a payment landed in. Do not use: to fetch a single payment (that is btc_get_transaction). Returns: hash, height, time, txs, size, weight, confirmations, previousblockhash."
   },
   {
    "name": "btc_get_address",
-   "description": "Balance and activity of a Bitcoin address with no key involved: confirmed/unconfirmed balance, UTXO count and total, tx count, last 10 transactions. Supports P2PKH, P2SH, bech32 and bech32m. When to use: reconciling a merchant wallet. Do not use: we do not label or risk-score addresses; for a single payment -> btc_get_transaction."
+   "description": "Balance and activity of a Bitcoin address, with no key involved. When to use: reconciling a merchant wallet, or checking whether an address received funds and how active it is. Do not use: we do not label or risk-score addresses; for a single payment use btc_get_transaction. Returns: address, confirmed/unconfirmed balance, utxo count and total, tx count, last 10 transactions. Supports P2PKH (1..), P2SH (3..), bech32 (bc1q..), bech32m (bc1p..). Ultra-active addresses may return a degraded=true response under index load rather than hanging."
   },
   {
    "name": "xmr_get_node_status",
-   "description": "Monero node state: height, sync flag, difficulty, txpool size, database size, monerod version and peer counts. When to use: whether the XMR node is synced and healthy, or how big its chain and txpool are. Boundary: RobotBase does not index Monero transactions, wallets or ring signatures - this tool is node telemetry only."
+   "description": "Monero node state: height vs target, sync flag, difficulty, txpool size, database size, monerod version and peer counts. When to use: whether the XMR node is synced and healthy, or how big its chain and txpool are. Do not use: RobotBase does not index Monero transactions, wallets or ring signatures - a Monero payment cannot be verified or risk-scored from here. Returns: height, target_height, synced, status, network, difficulty, txpool_txs, database_size_gb, block_size_limit, version, incoming_connections / outgoing_connections."
   },
   {
    "name": "broadcast_raw_transaction",
-   "description": "Relay an already-signed raw Bitcoin transaction to the network through our own full node (non-custodial: we never see a private key). When to use: an agent signed a transaction locally and wants a high-availability broadcast path. Disabled by default; the operator enables it with RB_ENABLE_BROADCAST=1."
+   "description": "Relay an already-signed raw transaction to the network through our own full node (non-custodial: we never see a private key). When to use: an agent signed a transaction locally and wants a high-availability broadcast path into the Bitcoin network. Do not use: to build or sign a transaction (we never hold keys), or to look up a payment (that is btc_get_transaction). Returns: {accepted, txid, chain, relayed} on success, or {accepted:false, reason} - a rejected transaction is never relayed. Availability: disabled by default on this deployment; the operator enables it with RB_ENABLE_BROADCAST=1."
+  },
+  {
+   "name": "robotbase_services",
+   "description": "Live availability of every service behind the RobotBase gateway: the chain nodes, Web3 Agent Hub, AITOKENS and MCP itself. When to use: an overall platform health check, or finding which service is down. Do not use: for a single chain's node state (chain_status) or its capability boundary (robotbase_capabilities). Returns: services[] {name, ok, detail} plus an overall ok flag."
+  },
+  {
+   "name": "tron_check_address_risk",
+   "description": "TRON address risk intelligence: judicial and black-market labels, account profile and a 0-100 safety score. When to use: before accepting USDT from a counterparty - OTC settlement, merchant payout, or any agent that must not receive tainted funds; also to sanity-check an address you are about to pay. Do not use: to confirm that a specific transfer arrived (that is tron_verify_usdt_transfer). Returns: risk_level (low|medium|high|unknown), safety_score, hit_flags (sanctioned / money_laundering / mixer / cybercrime / phishing / blacklist_doubt ...), malicious_contracts_created, account {activated, age_days, balance_trx, is_contract, trc20_holdings}, not_covered[] and a disclaimer. Metered: 5 free calls per day per IP, unlimited with an API key."
+  },
+  {
+   "name": "tron_verify_usdt_transfer",
+   "description": "TRC-20 USDT settlement check by transaction id: did it land, is it irreversible, how much, from and to whom. When to use: an agent or a merchant must confirm a USDT payment before releasing value - this is the settlement check that closes an automated trade loop. Do not use: to assess the counterparty (that is tron_check_address_risk). Returns: found, status (SUCCESS|FAILED), finalized (present on the solidity/irreversible chain), confirmations, blocks_until_finality, block_number, block_time_utc, amount_usdt, from, to, fee_trx, checks {}, verified and a plain-language verdict. Pass expected_to / expected_amount_usdt to have the recipient and amount matched for you. Metered: 5 free calls per day per IP, unlimited with an API key."
+  },
+  {
+   "name": "sol_check_token_safety",
+   "description": "Solana token rug-pull screen: mint and freeze authority, liquidity lock, holder concentration. When to use: before an agent buys or quotes a Solana token, or when a mint address shows up in a trade signal and you need the safety facts first. Do not use: for price or liquidity depth in USD (no DEX aggregator is queried here); for TRON addresses use tron_check_address_risk. Returns: risk_level (low|medium|high), safety_score, mint_authority_revoked, freeze_authority_revoked, lp_locked_pct, lp_holder_pct, top10_holder_pct, holder_count, transfer_fee / transfer_hook presence, warnings[], not_covered[] and a disclaimer. Metered: 5 free calls per day per IP, unlimited with an API key."
   }
  ]
 }

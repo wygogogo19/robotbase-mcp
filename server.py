@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
-"""RobotBase MCP Server — read-only multi-chain data tools (BTC / ETH / XMR / ZEC)."""
+"""RobotBase MCP Server — one read-only surface for an eight-chain roster.
+
+2026-10-13：对外只保留这一个 MCP，不再提供任何 RPC 端点。名册分三层：
+live（BTC/ETH/XMR/ZEC 今天可查）、syncing（Base/Solana/Tron 在建）、
+planned（LTC/DOGE/KAS/RVN 已定规格）。修剪与保留窗口是节点的属性，
+能力矩阵工具（robotbase_capabilities）如实对外说明边界。
+"""
 import base64, hashlib, html, json, os, re, socket, sqlite3, threading, time, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("RB_PORT", "8090"))
+BIND = os.environ.get("RB_BIND", "127.0.0.1")
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "robotbase-mcp", "version": "0.6.0", "title": "RobotBase on-chain data MCP (BTC / ETH / XMR / ZEC)"}
-# Optional env file holding BTC_RPC_URL / BTC_RPC_USER / BTC_RPC_PASS
+SERVER_INFO = {"name": "robotbase-mcp", "version": "0.9.0", "title": "RobotBase MCP — on-chain verification & risk intelligence for Web3 agents"}
 BTC_ENV = os.environ.get("RB_BTC_ENV", "")
+BTC_DASHBOARD = os.environ.get("RB_BTC_DASHBOARD", "http://127.0.0.1:8600")
 ZEC_BASE = os.environ.get("RB_ZEC_BASE", "http://127.0.0.1:8080")
 DOGE_BASE = os.environ.get("RB_DOGE_BASE", "http://127.0.0.1:8080")
 LTC_BASE = os.environ.get("RB_LTC_BASE", "http://127.0.0.1:8080")
-# Gateway aggregating the six nodes: /api/nodes, /api/pools, /api/services, /api/node/kas
 HOME_BASE = os.environ.get("RB_HOME_BASE", "http://127.0.0.1:8081")
 
 _cache, _cache_lock = {}, threading.Lock()
@@ -95,83 +101,189 @@ def truncate(obj, limit=3800):
     return s if len(s) <= limit else s[:limit] + '…(truncated)'
 
 
+# 2026-10-14：名册收敛为七条链，成熟度只用 live / provisioning / planned 三态
+# （不再使用 Tier 1/2/3 那种分级）。tier=live 的节点今天就能回答查询；
+# provisioning 的链正在接入聚合与清洗逻辑，planned 的链按需储备，两者都绝不冒充可查询。
+# LTC/DOGE/KAS/RVN 与 TON 均已从名册下线（用户 2026-10-14 决定砍掉 TON）。
 CHAINS = ("btc", "eth", "xmr", "zec")
+ROSTER_CHAINS = ("btc", "eth", "xmr", "zec", "sol", "base", "tron")
+
+
+def _roster():
+    return (cached("nodes", 15, lambda: _http_json(HOME_BASE + "/api/nodes")).get("roster") or [])
 
 
 def t_list_chains():
-    """The four chains this service covers (BTC / ETH / XMR / ZEC), with live node state and height."""
+    """Every chain on the RobotBase roster with its tier and live availability."""
     d = cached("nodes", 15, lambda: _http_json(HOME_BASE + "/api/nodes"))
     nodes = d.get("nodes") or {}
-    out = [{"chain": c, "ok": bool((nodes.get(c) or {}).get("ok")),
-            "synced": bool((nodes.get(c) or {}).get("synced")),
-            "height": (nodes.get(c) or {}).get("height"),
-            "state": (nodes.get(c) or {}).get("state")}
-           for c in CHAINS]
-    return {"chains": out, "updated_utc": d.get("updated_utc")}
+    out = []
+    for c in (d.get("roster") or []):
+        cid = c.get("id")
+        n = nodes.get(cid) or {}
+        out.append({"chain": cid, "tier": c.get("tier"),
+                    "ok": bool(n.get("ok")), "synced": bool(n.get("synced")),
+                    "height": n.get("height"),
+                    "state": n.get("state") or c.get("state")})
+    if not out:                                  # 网关不可达时退回静态名册
+        out = [{"chain": c, "tier": "live" if c in CHAINS else "provisioning"} for c in ROSTER_CHAINS]
+    return {"chains": out, "updated_utc": d.get("updated_utc"),
+            "note": "tier=live answers queries today; provisioning chains are still being wired into the "
+                    "aggregation layer, and planned chains have no node at all. Neither is served yet."}
+
+
+def t_capabilities():
+    """What every node can and cannot answer, including pruning and retention limits."""
+    d = cached("nodes", 20, lambda: _http_json(HOME_BASE + "/api/nodes"))
+    rows = []
+    for c in (d.get("roster") or []):
+        rows.append({"chain": c.get("id"), "tier": c.get("tier"), "name": c.get("name"),
+                     "client": c.get("client"), "state": c.get("state"),
+                     "capability": c.get("spec")})
+    return {
+        "surface": "single read-only MCP endpoint — RobotBase publishes no RPC endpoint of any kind",
+        "endpoint": "https://robotbase.cc/mcp",
+        "chains": rows,
+        "honesty_note": "Retention is a property of each node. Pruned or window-limited nodes state "
+                        "their boundary here; queries outside it are refused rather than approximated.",
+        "updated_utc": d.get("updated_utc"),
+    }
 
 
 def t_chain_status(chain):
     chain = (chain or "").lower()
     if chain == "btc":
-        d = cached("btc_node", 10, lambda: _http_json("http://127.0.0.1:8600/api/node"))
+        d = cached("btc_node", 10, lambda: _http_json(BTC_DASHBOARD + "/api/node"))
         return {k: d.get(k) for k in ("chain", "blocks", "headers", "verification_progress_pct", "initial_block_download",
                                       "connections", "connections_out", "mempool_txs", "mempool_usage_mb",
                                       "size_on_disk_gb", "version", "rpc_ok")}
-    if chain == "eth":
-        n = (cached("nodes", 10, lambda: _http_json(HOME_BASE + "/api/nodes")).get("nodes") or {}).get("eth") or {}
-        return {k: n.get(k) for k in ("ok", "synced", "state", "height", "progress", "peers",
-                                      "exec", "cons", "slot", "client")}
     if chain == "xmr":
         n = (cached("nodes", 10, lambda: _http_json(HOME_BASE + "/api/nodes")).get("nodes") or {}).get("xmr") or {}
         return {k: n.get(k) for k in ("ok", "synced", "height", "txpool", "difficulty", "db",
                                       "txc", "sync", "state")}
     if chain == "zec":
         return svc_status(chain)
-    raise ValueError("chain must be one of: btc, eth, xmr, zec")
+    if chain == "eth":
+        n = (cached("nodes", 10, lambda: _http_json(HOME_BASE + "/api/nodes")).get("nodes") or {}).get("eth") or {}
+        return {k: n.get(k) for k in ("ok", "synced", "height", "peers", "exec", "cons", "slot",
+                                      "progress", "state")}
+    if chain in ROSTER_CHAINS:                   # 名册里有，但今天还不提供服务（provisioning / planned）
+        spec = next((c for c in _roster() if c.get("id") == chain), None) or {}
+        return {"chain": chain, "served": False, "tier": spec.get("tier", "unknown"),
+                "state": spec.get("state"), "client": spec.get("client"),
+                "capability": spec.get("spec"),
+                "reason": "this chain is on the RobotBase roster but is not serving queries yet"}
+    raise ValueError("chain must be one of: " + ", ".join(ROSTER_CHAINS))
 
 
-def t_zec_chain_info():
-    d = cached("zec_ci", 15, lambda: _http_json(ZEC_BASE + "/api/chaininfo"))
-    r = d.get("result") or {}
-    pools = {p.get("id"): {"chainValue": p.get("chainValue"), "monitored": p.get("monitored")}
-             for p in (r.get("valuePools") or [])}
-    return {"blocks": r.get("blocks"), "headers": r.get("headers"), "estimated_height": r.get("estimatedheight"),
-            "chainSupply": r.get("chainSupply"), "valuePools": pools, "bestblockhash": r.get("bestblockhash"),
-            "difficulty": r.get("difficulty"), "size_on_disk_gb": round((r.get("size_on_disk") or 0) / 1e9, 2)}
+def t_zec_get_pool_status():
+    """ZEC 价值池分布 + 链状态。
+
+    2026-10-14 合并：原 zec_chain_info 与 zec_shielded_pools_metrics 是近重复工具，
+    合并为一个「一次调用给出全部 ZEC 状态」的工具，减少 LLM 的选择歧义。
+    两个数据源任一不可用时降级返回，绝不编数字。
+    """
+    out = {"chain": "ZEC", "source": "our Zebra (zebrad) node + our own value-pool factor index"}
+    try:
+        r = (cached("zec_ci", 15, lambda: _http_json(ZEC_BASE + "/api/chaininfo")).get("result") or {})
+        out.update({
+            "blocks": r.get("blocks"), "headers": r.get("headers"),
+            "estimated_height": r.get("estimatedheight"), "bestblockhash": r.get("bestblockhash"),
+            "chain_supply": r.get("chainSupply"), "difficulty": r.get("difficulty"),
+            "size_on_disk_gb": round((r.get("size_on_disk") or 0) / 1e9, 2),
+            "node_value_pools": {p.get("id"): {"chainValue": p.get("chainValue"),
+                                               "monitored": p.get("monitored")}
+                                 for p in (r.get("valuePools") or [])},
+        })
+    except Exception as exc:  # noqa: BLE001
+        out["node_error"] = type(exc).__name__
+
+    try:
+        d = cached("factors", 60, lambda: _http_json(HOME + "/api/factors"))
+        g = ((d.get("groups") or {}).get("zec") or {})
+        meta = ((d.get("groups") or {}).get("meta") or {})
+        if not g:
+            out["factor_error"] = "ZEC factor sampler unavailable"
+        else:
+            has24 = str(meta.get("has_24h", "")).lower() not in ("", "no", "false")
+
+            def _num(v):
+                try:
+                    return float(str(v).replace(",", "").split()[0])
+                except (ValueError, AttributeError):
+                    return None
+
+            supply = _num(g.get("supply"))
+            pools = []
+            for pid in ("transparent", "sprout", "sapling", "orchard", "ironwood", "lockbox"):
+                bal = g.get(pid)
+                if not bal or bal == "—":
+                    continue
+                n = _num(bal)
+                pools.append({"pool": pid, "balance": bal,
+                              "share_of_supply_pct": round(n / supply * 100, 2) if (n and supply) else None,
+                              "delta_24h": g.get(pid + "_delta") if has24 else None,
+                              "delta_1h": g.get(pid + "_delta_1h")})
+            out.update({"pools": pools, "shielded_total": g.get("shielded"),
+                        "shielded_pct": g.get("shielded_pct"),
+                        "shielded_delta_24h": g.get("shielded_delta_24h") if has24 else None,
+                        "window": "24h" if has24 else "1h"})
+    except Exception as exc:  # noqa: BLE001
+        out["factor_error"] = type(exc).__name__
+    return out
 
 
-def t_zec_recent_blocks(n=5):
+def t_zec_get_recent_blocks(n=5):
     d = cached(f"zec_blocks_{n}", 15, lambda: _http_json(ZEC_BASE + f"/api/blocks?n={int(n)}"))
     return d
 
 
-def t_btc_fee_estimates():
-    out = {}
+def t_btc_get_fee_rates():
+    """BTC 费率建议（2026-10-14 合并原 btc_fee_estimates 与 get_recommended_fee_rate）。"""
+    estimates, errors = {}, []
     for target in (1, 2, 3, 6, 12, 24):
         try:
-            r = btc_rpc("estimatesmartfee", [target])
-            out[f"{target}_blocks"] = {"btc_per_kvb": r.get("feerate"), "blocks": r.get("blocks")}
+            r = btc_rpc("estimatesmartfee", [target]) or {}
+            estimates[f"{target}_blocks"] = {"btc_per_kvb": r.get("feerate"), "blocks": r.get("blocks")}
         except Exception as e:  # noqa: BLE001
-            out[f"{target}_blocks"] = {"error": str(e)[:80]}
-    mp = btc_rpc("getmempoolinfo")
-    return {"estimates": out, "mempool_min_fee_btc_kvb": mp.get("mempoolminfee"),
-            "mempool_txs": mp.get("size"), "mempool_mb": round((mp.get("bytes") or 0) / 1e6, 1)}
+            estimates[f"{target}_blocks"] = {"error": str(e)[:80]}
+            errors.append(target)
+    try:
+        mi = btc_rpc("getmempoolinfo") or {}
+    except Exception:  # noqa: BLE001
+        mi = {}
+
+    def to_sat(btc_per_kvb):
+        return round(float(btc_per_kvb) * 1e8 / 1000, 2) if btc_per_kvb else None
+
+    pick = lambda t: to_sat((estimates.get(f"{t}_blocks") or {}).get("btc_per_kvb"))
+    return {"chain": "BTC", "unit": "sat/vB",
+            "estimates": estimates,
+            "recommended": {"fast_1_block_sat_vb": pick(1),
+                            "medium_3_block_sat_vb": pick(3),
+                            "slow_12_block_sat_vb": pick(12)},
+            "mempool_min_sat_vb": to_sat(mi.get("mempoolminfee")),
+            "mempool_min_btc_kvb": mi.get("mempoolminfee"),
+            "source": "our own bitcoind estimatesmartfee + getmempoolinfo",
+            "note": "Zcash does not work this way: its fee is a protocol-fixed ZIP-317 conventional "
+                    "amount, not a market estimate — see robotbase_capabilities."}
 
 
-def t_btc_mempool_summary():
+def t_btc_get_mempool_state():
+    """BTC 内存池深度与拥堵判定（2026-10-14 合并原 btc_mempool_summary 与 mempool_congestion_status）。"""
     def build():
-        mp = btc_rpc("getmempoolinfo")
-        try:
-            fees = btc_rpc("getmempoolancestors", []) if False else None
-        except Exception:  # noqa: BLE001
-            fees = None
-        try:
-            hist = btc_rpc("getmempoolentry", []) if False else None
-        except Exception:  # noqa: BLE001
-            hist = None
-        return {"txs": mp.get("size"), "bytes": mp.get("bytes"), "usage_mb": round((mp.get("usage") or 0) / 1e6, 1),
-                "min_fee_btc_kvb": mp.get("mempoolminfee"), "max_mempool_mb": round((mp.get("maxmempool") or 0) / 1e6, 1),
-                "total_fee_btc": mp.get("total_fee")}
+        mp = btc_rpc("getmempoolinfo") or {}
+        usage = mp.get("usage") or 0
+        cap = mp.get("maxmempool") or 1
+        return {"chain": "BTC",
+                "txs": mp.get("size"), "bytes": mp.get("bytes"),
+                "usage_mb": round(usage / 1e6, 1),
+                "max_mempool_mb": round(cap / 1e6, 1),
+                "load_pct": round(100 * usage / cap, 1),
+                "min_fee_btc_kvb": mp.get("mempoolminfee"),
+                "total_fees_btc": mp.get("total_fee"),
+                "verdict": "busy" if usage > 0.5 * cap else "normal",
+                "source": "our own bitcoind getmempoolinfo"}
     return cached("btc_mp", 10, build)
 
 
@@ -538,9 +650,6 @@ def verify_key(key):
 # no source are reported as unavailable rather than filled with a guess.
 
 KAS_BLOCK_DB = os.environ.get("RB_KAS_BLOCK_DB", "")
-# KAS stratum bridges (one HTTP stats endpoint per tier). The host comes from a single
-# constant so the public build can swap it for RB_KAS_BRIDGE_BASE.
-KAS_BRIDGE_BASE = os.environ.get("RB_KAS_BRIDGE_BASE", "http://127.0.0.1")
 HOME = HOME_BASE
 
 # Halving schedules (public consensus rules) + the live height comes from our nodes.
@@ -584,16 +693,7 @@ def t_pow_halving_oracle():
                 "reward_after": spec["next_reward"] + " " + spec["unit"],
                 "schedule": spec["note"]}
         out.append(item)
-    # Kaspa: epoch-based reduction, read from our own node
-    try:
-        k = (_http_json(HOME + "/api/node/kas").get("node") or {})
-        out.append({"chain": "KAS", "height": k.get("network_height"),
-                    "next_halving_utc": k.get("next_halving_utc"),
-                    "reward_now": f"{k.get('block_reward_kas')} KAS" if k.get("block_reward_kas") else None,
-                    "reward_after": f"{k.get('next_halving_reward_kas')} KAS" if k.get("next_halving_reward_kas") else None,
-                    "schedule": "deflationary epoch reduction (monthly, 2^(1/12) per epoch)", "source": "our kaspad"})
-    except Exception:  # noqa: BLE001
-        out.append({"chain": "KAS", "next_halving_utc": None, "reason": "kas node unreachable"})
+    # Kaspa / Ravencoin retired from the roster on 2026-10-13 — nothing appended here.
     return {"chains": out, "source": "our own full nodes + published consensus schedules",
             "note": "heights are read live; schedules are protocol constants, not estimates"}
 
@@ -607,15 +707,18 @@ def t_pow_network_mining_intel():
                       "source": "our bitcoind getnetworkhashps"}
     except Exception as exc:  # noqa: BLE001
         out["BTC"] = {"error": type(exc).__name__}
-    try:                                                        # XMR: p2pool reports Monero network state
-        p = cached("xmr_pool", 15, lambda: _http_json(XMR_P2POOL_API, timeout=10))
-        mn = p.get("monero") or {}
-        out["XMR"] = {"difficulty": mn.get("difficulty"), "network_hashrate_hs": mn.get("network_hashrate"),
-                      "height": mn.get("height"), "source": "p2pool pool.json"}
+    try:                                                        # XMR: our own monerod
+        d = cached("xmr_info", 10, lambda: _http_json(
+            XMR_HELPER, {"jsonrpc": "2.0", "id": 1, "method": "get_info"}, timeout=10))
+        r = (d or {}).get("result") or {}
+        diff = r.get("difficulty")
+        out["XMR"] = {"difficulty": diff,
+                      "network_hashrate_hs": (float(diff) / 120) if diff else None,
+                      "height": r.get("height"),
+                      "hashrate_method": "difficulty / 120s target block time",
+                      "source": "our monerod get_info"}
     except Exception as exc:  # noqa: BLE001
         out["XMR"] = {"error": type(exc).__name__}
-    out["ETH"] = {"difficulty": None, "network_hashrate_hs": None, "source": "n/a",
-                  "note": "Ethereum is proof-of-stake (post-Merge): no PoW difficulty or hashrate"}
     for cid, key, base, factor, block_s in (("ZEC", "zec", ZEC_BASE, 8192, 75),):
         try:
             d = _http_json(base + "/api/status")
@@ -627,97 +730,19 @@ def t_pow_network_mining_intel():
         except Exception as exc:  # noqa: BLE001
             out[cid] = {"error": type(exc).__name__}
     return {"chains": out,
-            "note": "BTC/XMR are node-reported (bitcoind / p2pool); ZEC hashrate is derived from the node's "
-                    "difficulty with the factor printed next to it; ETH is proof-of-stake. "
+            "note": "BTC/XMR are node-reported (bitcoind / monerod); ZEC hashrate is derived from the node's "
+                    "difficulty with the factor printed next to it. "
                     "No third-party API is involved."}
 
 
-def t_get_recommended_fee_rate(chain=None):
-    cid = (chain or "btc").lower()
-    if cid == "btc":
-        try:
-            fast = btc_rpc("estimatesmartfee", [1]) or {}
-            med = btc_rpc("estimatesmartfee", [3]) or {}
-            slow = btc_rpc("estimatesmartfee", [10]) or {}
-            mi = btc_rpc("getmempoolinfo") or {}
-            to_sat = lambda f: round(float(f) * 1e8 / 1000, 2) if f else None
-            return {"chain": "BTC", "unit": "sat/vB",
-                    "fast": {"target_blocks": 1, "sat_vb": to_sat(fast.get("feerate"))},
-                    "medium": {"target_blocks": 3, "sat_vb": to_sat(med.get("feerate"))},
-                    "slow": {"target_blocks": 10, "sat_vb": to_sat(slow.get("feerate"))},
-                    "mempool_min_sat_vb": to_sat(mi.get("mempoolminfee")),
-                    "source": "our bitcoind estimatesmartfee + getmempoolinfo",
-                    "note": "agent can pick a tier and broadcast with broadcast_raw_transaction"}
-        except Exception as exc:  # noqa: BLE001
-            return {"chain": "BTC", "error": type(exc).__name__}
-    if cid == "zec":
-        return {"chain": "ZEC", "unit": "ZEC per logical action",
-                "conventional_fee": ZIP317_FEE,
-                "source": "ZIP-317 conventional fee (protocol rule)",
-                "note": "Zcash has no mempool fee auction like Bitcoin — ZIP-317 defines a fixed "
-                        "conventional fee; we report the protocol value, not a market estimate."}
-    return {"chain": cid.upper(), "available": False,
-            "reason": "we do not run a fee estimator for this chain yet (no node RPC exposed to the gateway)",
-            "what_we_do_have": ["chain_status", "mempool_congestion_status", "btc_fee_estimates"]}
-
-
-def t_mempool_congestion_status(chain=None):
-    cid = (chain or "btc").lower()
-    if cid == "btc":
-        try:
-            mi = btc_rpc("getmempoolinfo") or {}
-            return {"chain": "BTC", "txs": mi.get("size"), "bytes": mi.get("bytes"),
-                    "usage_bytes": mi.get("usage"), "max_mempool_bytes": mi.get("maxmempool"),
-                    "min_fee_btc_per_kvb": mi.get("mempoolminfee"),
-                    "total_fees_btc": mi.get("total_fee"),
-                    "load_pct": round(100 * (mi.get("usage") or 0) / (mi.get("maxmempool") or 1), 1),
-                    "verdict": "busy" if (mi.get("usage") or 0) > 0.5 * (mi.get("maxmempool") or 1) else "normal",
-                    "source": "our bitcoind getmempoolinfo"}
-        except Exception as exc:  # noqa: BLE001
-            return {"chain": "BTC", "error": type(exc).__name__}
-    if cid in ("ltc", "doge"):
-        try:
-            d = svc_status(cid)
-            return {"chain": cid.upper(), "txs": d.get("mempool_txs"),
-                    "bytes": None, "min_fee": None,
-                    "source": "our %s node status API" % cid,
-                    "note": "tx count is live; byte size and min-fee are not exposed by that node API yet"}
-        except Exception as exc:  # noqa: BLE001
-            return {"chain": cid.upper(), "error": type(exc).__name__}
-    return {"chain": cid.upper(), "available": False,
-            "reason": "no mempool endpoint exposed for this chain on our nodes yet"}
-
-
-def t_zec_shielded_pools_metrics():
-    """Six Zcash value pools with share-of-supply and 1h/24h deltas."""
-    d = cached("factors", 60, lambda: _http_json(HOME + "/api/factors"))
-    g = ((d.get("groups") or {}).get("zec") or {})
-    meta = ((d.get("groups") or {}).get("meta") or {})
-    if not g:
-        return {"available": False, "reason": "ZEC factor sampler unavailable"}
-    has24 = str(meta.get("has_24h", "")).lower() not in ("", "no", "false")
-    pools = []
-    for pid in ("transparent", "sprout", "sapling", "orchard", "ironwood", "lockbox"):
-        bal = g.get(pid)
-        if not bal or bal == "—":
-            continue
-        try:
-            num = float(str(bal).replace(",", "").split()[0])
-        except ValueError:
-            num = None
-        entry = {"pool": pid, "balance": bal,
-                 "share_of_supply_pct": (round(num / float(str(g.get("supply", "0")).replace(",", "").split()[0]) * 100, 2)
-                                         if num and g.get("supply") else None),
-                 "delta_24h": g.get(pid + "_delta") if has24 else None,
-                 "delta_1h": g.get(pid + "_delta_1h")}
-        pools.append(entry)
-    return {"pools": pools, "shielded_total": g.get("shielded"), "supply": g.get("supply"),
-            "shielded_pct": g.get("shielded_pct"),
-            "shielded_delta_24h": g.get("shielded_delta_24h") if has24 else None,
-            "window": "24h" if has24 else "1h",
-            "source": "our Zebra node value-pool RPC, sampled by our own factor index",
-            "why_it_matters": "pool-by-pool capital allocation across privacy pools is not exposed by "
-                              "ordinary block explorers or by any other MCP server we know of"}
+# 2026-10-14 P0 工具治理：
+#   get_recommended_fee_rate  → 并入 t_btc_get_fee_rates
+#   mempool_congestion_status → 并入 t_btc_get_mempool_state
+#   zec_shielded_pools_metrics→ 并入 t_zec_get_pool_status
+# 三个函数体已删除，避免同一份数据出现两个入口让 LLM 选错。
+ZIP317_NOTE = ("Zcash fees are protocol-fixed: the ZIP-317 conventional fee ({:.8f} ZEC per logical "
+               "action) is a consensus rule, not a market auction. There is no ZEC fee estimator tool."
+               ).format(ZIP317_FEE)
 
 
 def t_kas_pool_attribution_intel(hours=24):
@@ -746,44 +771,6 @@ def t_kas_pool_attribution_intel(hours=24):
             "source": "our own Kaspa block index (every block we sample from our kaspad is attributed to the "
                       "pool that found it)",
             "note": "this is chain-wide pool attribution computed locally — not a third-party API"}
-
-
-def t_robotbase_pool_worker_query(chain=None, wallet=None, worker=None):
-    """Per-worker stats for a miner, straight from our pool engines."""
-    cid = (chain or "").lower()
-    if not cid or not (wallet or worker):
-        return {"error": "pass chain (kas|zec|rvn) plus wallet or worker"}
-    wallet = (wallet or "").strip()
-    worker = (worker or "").strip()
-    if cid == "kas":
-        found = []
-        for spec in ((KAS_BRIDGE_BASE + ":2114", 5555), (KAS_BRIDGE_BASE + ":2115", 5558),
-                     (KAS_BRIDGE_BASE + ":2116", 5559)):
-            try:
-                d = _http_json(spec[0] + "/api/stats", timeout=8)
-            except Exception:  # noqa: BLE001
-                continue
-            for w in d.get("workers") or []:
-                if (wallet and str(w.get("wallet")) == wallet) or (worker and str(w.get("worker")) == worker):
-                    found.append({"port": spec[1], "worker": w.get("worker"),
-                                  "wallet": _mask(w.get("wallet")),
-                                  "status": w.get("status"), "hashrate_ghs": w.get("hashrate"),
-                                  "shares": w.get("shares"), "stale": w.get("stale"),
-                                  "invalid": w.get("invalid"), "blocks": w.get("blocks"),
-                                  "current_difficulty": w.get("currentDifficulty"),
-                                  "last_seen": w.get("lastSeen")})
-        if not found:
-            return {"chain": "KAS", "found": False,
-                    "reason": "no worker on our KAS hashport matches that wallet/worker right now "
-                              "(miners are only listed while connected)"}
-        return {"chain": "KAS", "found": True, "workers": found,
-                "source": "our Kaspa stratum bridges (ports 5555/5558/5559)"}
-    if cid in ("zec", "rvn"):
-        return {"chain": cid.upper(), "found": False, "available": False,
-                "reason": "our %s pool engine does not expose a per-worker query endpoint to the gateway yet "
-                          "(pool-level telemetry is available via %s_pool_status)"
-                          % (cid.upper(), cid)}
-    return {"error": "chain must be kas, zec or rvn"}
 
 
 def t_broadcast_raw_transaction(chain=None, signed_raw_tx_hex=None):
@@ -896,177 +883,580 @@ def t_rvn_asset_lookup(asset=None, limit=20):
 
 
 
-TOOLS = [
-    ("list_chains",
-     "Every chain this service supports (BTC / ETH / XMR / ZEC) with live availability and block height. "
-     "When to use: the user asks which chains you support, which nodes are online, or how high each chain is. "
-     "Do not use: for detail on one chain, use chain_status.",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_list_chains()),
-    ("chain_status",
-     "Run-time status of one chain's node: block height, sync progress, connected peers, mempool tx count, client version. "
-     "When to use: whether a given chain's node is synced, healthy or lagging. "
-     "Do not use: fees → btc_fee_estimates; address balance → btc_address_summary; Monero pool detail → xmr_pool_status.",
+# ============== 2026-10-14 P1：风险情报工具（计量计费，轻量聚合）==================
+# 用户指令：P1 主打「高价值风控工具 + 轻量聚合」，不做通用 RPC 转发。
+# 数据源一律是公开聚合接口（GoPlus Labs + TronGrid），只读、不接触私钥、不托管资金。
+# 计费：每个 IP 每天 5 次免费；带 X-API-Key 的用户不受此限（Key 由网关的 billing 服务发放）。
+RISK_TOOLS = ("tron_check_address_risk", "tron_verify_usdt_transfer", "sol_check_token_safety")
+RISK_FREE_PER_DAY = 5
+RISK_DB = os.environ.get("RB_RISK_DB", "risk_quota.db")
+GOPLUS_BASE = os.environ.get("RB_GOPLUS_BASE", "https://api.gopluslabs.io/api/v1")
+TRONGRID_BASE = os.environ.get("RB_TRONGRID_BASE", "https://api.trongrid.io")
+USDT_TRC20_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+USDT_DECIMALS = 6
+TRON_FINALITY_BLOCKS = 19          # 波场 SR 共识的不可逆深度（约 57 秒）
+TOPUP_URL = "https://robotbase.cc/billing/pricing"
+
+_REQ = threading.local()
+
+
+def _client_ip():
+    return getattr(_REQ, "ip", "") or "unknown"
+
+
+def _client_plan():
+    return getattr(_REQ, "plan", "anon")
+
+
+class PaymentRequired(Exception):
+    """免费额度用尽——这不是「错误」，是要求充值。"""
+
+
+def _bj_day():
+    """配额按北京时间自然日切分，服务器时区不参与。"""
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
+
+
+def init_risk_db():
+    con = _db(RISK_DB)
+    con.execute("""CREATE TABLE IF NOT EXISTS risk_quota(
+        day TEXT NOT NULL, ip_hash TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(day, ip_hash))""")
+    con.commit()
+    con.close()
+
+
+def _risk_quota(consume=True):
+    """返回 (allowed, used, limit)。API-key 用户 limit=-1 表示不限量。"""
+    if _client_plan() == "key":
+        return True, 0, -1
+    h = hashlib.sha256(_client_ip().encode()).hexdigest()[:16]
+    d = _bj_day()
+    con = _db(RISK_DB)
+    try:
+        row = con.execute("SELECT used FROM risk_quota WHERE day=? AND ip_hash=?", (d, h)).fetchone()
+        used = row["used"] if row else 0
+        if not consume:
+            return used < RISK_FREE_PER_DAY, used, RISK_FREE_PER_DAY
+        if used >= RISK_FREE_PER_DAY:
+            return False, used, RISK_FREE_PER_DAY
+        con.execute("INSERT INTO risk_quota(day, ip_hash, used) VALUES(?,?,1) "
+                    "ON CONFLICT(day, ip_hash) DO UPDATE SET used=used+1", (d, h))
+        con.commit()
+        return True, used + 1, RISK_FREE_PER_DAY
+    finally:
+        con.close()
+
+
+def _risk_gate():
+    """风险工具的统一门禁（只查不扣）：额度用尽就抛 PaymentRequired。
+
+    真正的扣减放在 _risk_commit()，只有确实向上游查过、返回了结论的调用才计费；
+    地址格式错误这类本地校验失败不占用户额度。
+    """
+    allowed, used, limit = _risk_quota(False)
+    if not allowed:
+        raise PaymentRequired(
+            "Payment Required: Upgrade or Top-up with USDT to get an API Key. "
+            "The free allowance for RobotBase risk tools is %d calls/day per IP and is used up for "
+            "today (Beijing time, resets 00:00 Asia/Shanghai). Top up at %s and send the key back as "
+            "the X-API-Key header on this same endpoint." % (limit, TOPUP_URL))
+    return _meter_payload(used, limit, pending=True)
+
+
+def _meter_payload(used, limit, pending=False):
+    if limit < 0:
+        return {"free_tier": {"unlimited_with_api_key": True}}
+    payload = {"free_tier": {"used_today": used, "limit_per_day": limit,
+                             "resets": "00:00 Asia/Shanghai", "unlimited_with_api_key": True}}
+    if pending:
+        payload["free_tier"]["remaining_today"] = max(0, limit - used)
+    return payload
+
+
+def _risk_commit(used_before, limit):
+    """结算一次真实查询：扣掉今天的 1 次免费额度并返回最终计量信息。"""
+    if limit < 0:
+        return _meter_payload(0, -1)
+    allowed, used, _l = _risk_quota(True)
+    return _meter_payload(used if allowed else used_before + 1, limit)
+
+
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def _b58encode(raw):
+    n = int.from_bytes(raw, "big")
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = _B58_ALPHABET[r] + out
+    for byte in raw:                       # 保留前导零字节
+        if byte == 0:
+            out = "1" + out
+        else:
+            break
+    return out
+
+
+def _tron_hex_to_address(h):
+    """TronGrid 返回的 0x/41 前缀 hex 转 base58check 地址。"""
+    h = h[2:] if h.startswith("0x") else h
+    raw = bytes.fromhex(h)
+    if len(raw) == 20:
+        raw = b"\x41" + raw
+    return _b58encode(raw + hashlib.sha256(hashlib.sha256(raw).digest()).digest()[:4])
+
+
+def _goplus_tron(address):
+    d = _http_json("%s/address_security/%s?chain_id=tron" % (GOPLUS_BASE, address), timeout=12)
+    return d.get("result") or {}
+
+
+_TRON_HIGH_FLAGS = ("sanctioned", "money_laundering", "mixer", "cybercrime", "darkweb_transactions",
+                    "phishing_activities", "stealing_attack", "blacklist_doubt", "financial_crime",
+                    "honeypot_related_address")
+_TRON_MED_FLAGS = ("gas_abuse", "fake_kyc", "fake_token", "malicious_mining_activities",
+                   "fake_standard_interface", "reinit", "blackmail_activities")
+
+
+def t_tron_check_address_risk(address):
+    """TRON 地址风控：司法/黑灰产标签 + 账户画像，给出安全评分。"""
+    addr = (address or "").strip()
+    if not re.fullmatch(r"T[1-9A-HJ-NP-Za-km-z]{33}", addr):
+        return {"address": addr, "chain": "TRON", "error": "not a TRON base58 address (expected T + 33 chars)",
+                "checked": False, "_no_charge": True}
+    out = {"address": addr, "chain": "TRON", "asset_scope": "TRX / TRC-20",
+           "sources": ["GoPlus Labs address_security (tron)", "TronGrid /v1/accounts"]}
+    account, flags = {}, {}
+    try:
+        d = _http_json("%s/v1/accounts/%s" % (TRONGRID_BASE, addr), timeout=12)
+        rows = d.get("data") or []
+        if rows:
+            a = rows[0]
+            account = {"activated": True, "is_contract": bool(a.get("code")),
+                       "created_at_ms": a.get("create_time"),
+                       "balance_trx": round((a.get("balance") or 0) / 1e6, 6),
+                       "trc20_holdings": len(a.get("trc20") or [])}
+            if a.get("create_time"):
+                age_days = max(0, int((time.time() * 1000 - a["create_time"]) / 86400000))
+                account["age_days"] = age_days
+        else:
+            account = {"activated": False}
+    except Exception as exc:  # noqa: BLE001
+        out["tron_account_error"] = "%s: %s" % (type(exc).__name__, str(exc)[:100])
+    try:
+        flags = _goplus_tron(addr)
+    except Exception as exc:  # noqa: BLE001
+        out["goplus_error"] = "%s: %s" % (type(exc).__name__, str(exc)[:100])
+
+    high = [f for f in _TRON_HIGH_FLAGS if str(flags.get(f, "0")) == "1"]
+    med = [f for f in _TRON_MED_FLAGS if str(flags.get(f, "0")) == "1"]
+    bad_contracts = int(flags.get("number_of_malicious_contracts_created") or 0)
+
+    if not flags and not account:
+        out.update({"checked": False, "risk_level": "unknown",
+                    "reason": "both upstream sources were unavailable; no score is invented",
+                    "_no_charge": True})
+        return out
+    if account.get("activated") is False:
+        out.update({"checked": True, "account": account, "flags_raw": flags or None,
+                    "risk_level": "unknown", "safety_score": None,
+                    "hit_flags": high + med,
+                    "note": "The address is not activated on TRON, so there is no transaction history "
+                            "to judge. Not activated is not the same as clean."})
+        out["disclaimer"] = ("Labels come from the public GoPlus Labs dataset as fetched at call time; "
+                             "RobotBase relays them verbatim and forms no legal opinion.")
+        return out
+
+    score = 100
+    score -= 50 * len(high)
+    score -= 12 * len(med)
+    if bad_contracts:
+        score -= 20
+    if account.get("age_days") is not None and account["age_days"] < 7:
+        score -= 8
+    if account.get("is_contract"):
+        score -= 5
+    score = max(0, min(100, score))
+    level = "high" if high else ("medium" if (med or bad_contracts) else "low")
+    out.update({"checked": True, "risk_level": level, "safety_score": score,
+                "hit_flags": high + med,
+                "malicious_contracts_created": bad_contracts,
+                "account": account,
+                "flags_raw": {k: v for k, v in flags.items() if str(v) not in ("0", "", "None")},
+                "scoring": "100 minus 50 per judicial/black-market hit, 12 per medium flag, "
+                           "20 for created malicious contracts, 8 if the account is under 7 days old, "
+                           "5 if it is a contract address",
+                "not_covered": ["TRON 'judicial freeze' status is not in this dataset - TronScan's "
+                                "security endpoint now requires an API key and is not queried here",
+                                "counterparty graph depth (who paid whom) is not scored in this call"],
+                "disclaimer": "Labels come from the public GoPlus Labs dataset as fetched at call time; "
+                              "RobotBase relays them verbatim, forms no legal opinion, and this is not "
+                              "compliance advice."})
+    return out
+
+
+def t_tron_verify_usdt_transfer(txid, expected_to=None, expected_amount_usdt=None):
+    """TRC-20 USDT 到账核验：终局性、金额、收付款方，一次给全。"""
+    tx = (txid or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", tx):
+        return {"txid": txid, "chain": "TRON", "verified": False,
+                "error": "not a TRON transaction id (expected 64 hex chars)", "_no_charge": True}
+    out = {"txid": tx, "chain": "TRON", "network": "mainnet",
+           "source": "TronGrid full node + solidity (finalized) node"}
+    try:
+        raw = _http_json("%s/wallet/gettransactionbyid" % TRONGRID_BASE, {"value": tx}, timeout=15)
+    except Exception as exc:  # noqa: BLE001
+        return {"txid": tx, "chain": "TRON", "verified": False,
+                "error": "%s: %s" % (type(exc).__name__, str(exc)[:120])}
+    if not raw or not raw.get("txID"):
+        return {"txid": tx, "chain": "TRON", "found": False, "verified": False,
+                "reason": "the full node does not know this transaction id"}
+
+    contract = ((raw.get("raw_data") or {}).get("contract") or [{}])[0]
+    ctype = contract.get("type")
+    value = (contract.get("parameter") or {}).get("value") or {}
+    ret = (raw.get("ret") or [{}])[0]
+    status = ret.get("contractRet") or "UNKNOWN"
+    out.update({"found": True, "contract_type": ctype, "status": status})
+
+    amount_raw, to_addr, from_addr, is_usdt = None, None, None, False
+    try:
+        from_addr = _tron_hex_to_address(value.get("owner_address", ""))
+    except Exception:  # noqa: BLE001
+        pass
+    if ctype == "TriggerSmartContract":
+        token = value.get("contract_address") or ""
+        data = value.get("data") or ""
+        try:
+            is_usdt = _tron_hex_to_address(token) == USDT_TRC20_CONTRACT
+        except Exception:  # noqa: BLE001
+            is_usdt = False
+        method = data[:8]
+        if method == "a9059cbb" and len(data) >= 136:      # transfer(address,uint256)
+            try:
+                to_addr = _tron_hex_to_address(data[32:72])
+                amount_raw = int(data[72:136], 16)
+            except Exception:  # noqa: BLE001
+                pass
+        elif method == "23b872dd" and len(data) >= 200:     # transferFrom(address,address,uint256)
+            try:
+                to_addr = _tron_hex_to_address(data[96:136])
+                amount_raw = int(data[136:200], 16)
+            except Exception:  # noqa: BLE001
+                pass
+        out["token_contract"] = USDT_TRC20_CONTRACT if is_usdt else (token and _safe_b58(token))
+        out["method"] = method
+    elif ctype == "TransferContract":
+        out["note"] = "this is a native TRX transfer, not a TRC-20 USDT transfer"
+        try:
+            to_addr = _tron_hex_to_address(value.get("to_address", ""))
+            amount_raw = value.get("amount")
+        except Exception:  # noqa: BLE001
+            pass
+
+    info = {}
+    try:
+        info = _http_json("%s/wallet/gettransactioninfobyid" % TRONGRID_BASE, {"value": tx}, timeout=15) or {}
+    except Exception:  # noqa: BLE001
+        pass
+    block = info.get("blockNumber")
+    if block:
+        out["block_number"] = block
+        out["block_time_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime((info.get("blockTimeStamp") or 0) / 1000))
+    out["fee_trx"] = round((info.get("fee") or 0) / 1e6, 6) if info.get("fee") else None
+    receipt = (info.get("receipt") or {}).get("result")
+    if receipt:
+        out["receipt_result"] = receipt
+
+    finalized = False
+    try:
+        solidified = _http_json("%s/walletsolidity/gettransactionbyid" % TRONGRID_BASE, {"value": tx}, timeout=15)
+        finalized = bool(solidified and solidified.get("txID"))
+    except Exception:  # noqa: BLE001
+        finalized = False
+    out["finalized"] = finalized
+    if not finalized and block:
+        try:
+            nb = _http_json("%s/wallet/getnowblock" % TRONGRID_BASE, {}, timeout=12) or {}
+            height = ((nb.get("block_header") or {}).get("raw_data") or {}).get("number")
+            if height:
+                conf = int(height) - int(block) + 1
+                out["confirmations"] = conf
+                out["blocks_until_finality"] = max(0, TRON_FINALITY_BLOCKS - conf)
+        except Exception:  # noqa: BLE001
+            pass
+
+    if amount_raw is not None and is_usdt:
+        out["amount_usdt"] = round(amount_raw / (10 ** USDT_DECIMALS), 6)
+    if from_addr:
+        out["from"] = from_addr
+    if to_addr:
+        out["to"] = to_addr
+
+    checks = {"status_success": status == "SUCCESS", "is_usdt_trc20": is_usdt, "finalized": finalized}
+    if expected_to:
+        checks["recipient_matches"] = (expected_to.strip() == (to_addr or ""))
+    if expected_amount_usdt is not None:
+        try:
+            checks["amount_matches"] = abs(float(expected_amount_usdt) - (out.get("amount_usdt") or 0)) < 1e-6
+        except (TypeError, ValueError):
+            checks["amount_matches"] = False
+    out["checks"] = checks
+    out["verified"] = all(checks.values())
+    out["verdict"] = ("USDT arrived and is irreversible" if out["verified"] and finalized else
+                      "confirmed but not yet finalized (wait for 19 blocks)" if out["verified"] else
+                      "not verified - see checks")
+    return out
+
+
+def _safe_b58(h):
+    try:
+        return _tron_hex_to_address(h)
+    except Exception:  # noqa: BLE001
+        return h
+
+
+def t_sol_check_token_safety(mint):
+    """Solana 代币防割检测：铸造权/冻结权、LP 锁定、筹码集中度。"""
+    m = (mint or "").strip()
+    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", m):
+        return {"mint": m, "chain": "SOL", "checked": False,
+                "error": "not a Solana mint address (base58, 32-44 chars)", "_no_charge": True}
+    out = {"mint": m, "chain": "SOL", "sources": ["GoPlus Labs solana/token_security"]}
+    try:
+        d = _http_json("%s/solana/token_security?contract_addresses=%s" % (GOPLUS_BASE, m), timeout=15)
+        res = (d.get("result") or {}).get(m)
+    except Exception as exc:  # noqa: BLE001
+        return {"mint": m, "chain": "SOL", "checked": False,
+                "error": "%s: %s" % (type(exc).__name__, str(exc)[:120]), "_no_charge": True}
+    if not res:
+        return {"mint": m, "chain": "SOL", "checked": False,
+                "reason": "no token-security record for this mint (unknown token, not a token mint, "
+                          "or the upstream dataset has not seen it yet)"}
+
+    def status(field):
+        return str((res.get(field) or {}).get("status", "0"))
+
+    mintable, freezable = status("mintable"), status("freezable")
+    holders = res.get("holders") or []
+    try:
+        top10 = round(sum(float(h.get("percent") or 0) for h in holders[:10]), 2)
+    except (TypeError, ValueError):
+        top10 = None
+    lp = res.get("lp_holders") or []
+    try:
+        lp_total = round(sum(float(x.get("percent") or 0) for x in lp), 2)
+        lp_locked = round(sum(float(x.get("percent") or 0) for x in lp if x.get("is_locked")), 2)
+    except (TypeError, ValueError):
+        lp_total, lp_locked = None, None
+
+    warnings = []
+    if mintable != "0":
+        warnings.append("mint authority is still live - the supply can be inflated at will")
+    if freezable != "0":
+        warnings.append("freeze authority is still live - your tokens can be frozen")
+    if status("closable") != "0":
+        warnings.append("token account is closable")
+    if str(res.get("non_transferable") or "0") == "1":
+        warnings.append("token is non-transferable")
+    if res.get("transfer_fee"):
+        warnings.append("a transfer fee is configured")
+    if res.get("transfer_hook"):
+        warnings.append("a transfer hook is installed")
+    if top10 is not None and top10 >= 50:
+        warnings.append("top-10 holders control %.1f%% of supply" % top10)
+    if lp_total is not None and lp_total > 0 and (lp_locked or 0) <= 0:
+        warnings.append("liquidity is not locked")
+
+    # 受监管的发行方代币（USDC/USDT 这类）本来就长期持有增发权与冻结权，
+    # 这是合规特征而不是拉盘信号；不区分就会把主流稳定币误判成高危。
+    trusted = str(res.get("trusted_token") or "0") == "1"
+    try:
+        holders_n = int(str(res.get("holder_count") or "0"))
+    except ValueError:
+        holders_n = 0
+    issuer_backed = bool(trusted and holders_n >= 100000 and (top10 or 0) < 20)
+
+    score = 100
+    authority_penalty = (35 if mintable != "0" else 0) + (25 if freezable != "0" else 0)
+    if issuer_backed:
+        authority_penalty = min(authority_penalty, 15)
+    score -= authority_penalty
+    if top10 is not None:
+        score -= min(25, int(max(0, top10 - 30) / 2))
+    if lp_total and not lp_locked:
+        score -= 15
+    if res.get("transfer_fee") or res.get("transfer_hook"):
+        score -= 10
+    score = max(0, min(100, score))
+    hard = ("not locked", "non-transferable", "closable", "transfer hook")
+    if issuer_backed:
+        level = "medium" if any(any(k in w for k in hard) for w in warnings) else "low"
+    else:
+        level = ("high" if any(("mint authority" in w or "freeze authority" in w or "not locked" in w)
+                               for w in warnings)
+                 else "medium" if warnings else "low")
+    out.update({"checked": True, "risk_level": level, "safety_score": score,
+                "name": (res.get("metadata") or {}).get("name"),
+                "symbol": (res.get("metadata") or {}).get("symbol"),
+                "mint_authority_revoked": mintable == "0",
+                "freeze_authority_revoked": freezable == "0",
+                "holder_count": res.get("holder_count"),
+                "top10_holder_pct": top10,
+                "lp_holder_pct": lp_total,
+                "lp_locked_pct": lp_locked,
+                "trusted_by_goplus": trusted,
+                "issuer_backed": issuer_backed,
+                "authority_note": ("this mint is on GoPlus's trusted list with a wide holder base, so live "
+                                   "mint/freeze authority is read as issuer control (how regulated "
+                                   "stablecoins work) rather than as a rug signal"
+                                   if issuer_backed else None),
+                "creators": [c.get("address") for c in (res.get("creators") or [])][:3],
+                "warnings": warnings or ["no red flag in the checked dimensions"],
+                "scoring": "100 minus 35 if mint authority is live, 25 if freeze authority is live "
+                           "(capped at 15 combined for issuer-backed tokens), "
+                           "up to 25 for top-10 concentration, 15 if liquidity is unlocked, "
+                           "10 for transfer fee or hook",
+                "not_covered": ["holder wallet history and wash-trading patterns",
+                                "creator's other deployments",
+                                "on-chain liquidity depth in USD (no DEX aggregator is queried here)"],
+                "disclaimer": "Judgement is derived from the public GoPlus Labs dataset as fetched at "
+                              "call time. It is a risk signal, not investment advice."})
+    return out
+
+
+TOOLS = [    ("list_chains",
+     "List every chain on the RobotBase roster with its state. "
+     "When to use: the user asks which chains are supported, which nodes are online, or where to start. "
+     "Do not use: for one chain's live health call chain_status; for what a node can and cannot answer call robotbase_capabilities. "
+     "Returns: chains[], each {chain, tier (live|provisioning|planned), ok, synced, height, state}.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_list_chains()),    ("chain_status",
+     "Live run-time state of one chain's node. "
+     "When to use: is this chain's node synced, healthy or lagging; what is its height, peer count, mempool depth or client version. "
+     "Do not use: fees (that is btc_get_fee_rates); a specific payment (that is btc_get_transaction); ZEC pool distribution (that is zec_get_pool_status). "
+     "Returns: chain, ok, synced, height, peers, mempool, client, state; a chain that is not live yet returns served=false plus its tier instead of an error.",
      {"type": "object", "properties": {"chain": {"type": "string",
-                                                 "enum": ["btc", "eth", "xmr", "zec"],
-                                                 "description": "Chain id: btc / eth / xmr / zec"}},
-      "required": ["chain"], "additionalProperties": False}, lambda a: t_chain_status(a.get("chain"))),
-    ("zec_chain_info",
-     "Zcash mainnet info including the supply of all six value pools (transparent/sprout/sapling/orchard/lockbox/ironwood) — i.e. shielded-pool state. "
-     "When to use: how much ZEC sits in the shielded/sapling/orchard pools, or privacy-pool size. "
-     "Do not use: whether the ZEC node is synced → chain_status(zec).",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_zec_chain_info()),
-    ("zec_recent_blocks",
-     "Height, hash, block time and difficulty of the most recent N Zcash blocks (N ≤ 20). "
-     "When to use: check whether ZEC is producing blocks normally, and at what interval.",
+                                                 "enum": ["btc", "eth", "xmr", "zec", "base", "sol", "tron"],
+                                                 "description": "Chain id: btc / eth / xmr / zec / base / sol / tron"}},
+      "required": ["chain"], "additionalProperties": False}, lambda a: t_chain_status(a.get("chain"))),    ("robotbase_capabilities",
+     "Per-chain capability, retention boundary and fee model. "
+     "When to use: before promising that some query is possible, or when a tool refused a query as out of range. "
+     "Do not use: for live numbers (that is chain_status). "
+     "Returns: one row per chain {chain, tier, name, client, state, capability}, plus the fee models we support and an honesty note. "
+     "Key fact: RobotBase publishes no RPC endpoint - every read path is this MCP surface.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_capabilities()),    ("zec_get_pool_status",
+     "Zcash chain state plus the distribution of all six value pools, in one call. "
+     "When to use: how much ZEC sits in each shielded pool, the shielded share of supply, and whether the ZEC node is caught up. "
+     "Do not use: we do not index Zcash transactions or wallets; for node peers and disk usage call chain_status. "
+     "Returns: blocks/headers/estimated_height/chain_supply/difficulty/size_on_disk_gb, node_value_pools, "
+     "pools[] with {pool, balance, share_of_supply_pct, delta_1h, delta_24h}, shielded_total, shielded_pct.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_zec_get_pool_status()),    ("zec_get_recent_blocks",
+     "The most recent Zcash blocks. "
+     "When to use: checking whether ZEC is producing blocks normally and at what interval. "
+     "Do not use: for shielded-pool supply (that is zec_get_pool_status). "
+     "Returns: for the last N blocks (default 5, max 20): height, hash, time, difficulty.",
      {"type": "object", "properties": {"n": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5,
                                              "description": "How many recent blocks to return; default 5"}},
-      "additionalProperties": False}, lambda a: t_zec_recent_blocks(a.get("n", 5))),
-    ("btc_fee_estimates",
-     "Recommended Bitcoin fees: rates (BTC/kvB) for 1/2/3/6/12/24-block confirmation targets, plus the mempool minimum fee. "
-     "When to use: how much fee to pay, or what gets a fast confirmation. "
-     "Do not use: overall congestion level → btc_mempool_summary.",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_btc_fee_estimates()),
-    ("btc_mempool_summary",
-     "Bitcoin mempool overview: pending tx count, bytes used, minimum fee, total fees, capacity limit. "
-     "When to use: is the network congested right now, or how big the backlog is.",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_btc_mempool_summary()),
-    ("btc_tx_lookup",
-     "Look up a Bitcoin transaction by txid: confirmed or not, block height, confirmations, size, input/output summary. "
-     "When to use: the user gives a 64-hex BTC txid and asks whether it confirmed or which block it is in. "
-     "Do not use: other chains → chain_status.",
+      "additionalProperties": False}, lambda a: t_zec_get_recent_blocks(a.get("n", 5))),    ("btc_get_fee_rates",
+     "Bitcoin fee rates for confirmation targets, plus the mempool floor. "
+     "When to use: pricing a Bitcoin transaction, or deciding when a sweep will confirm cheaply. "
+     "Do not use: to measure backlog depth (that is btc_get_mempool_state). There is no equivalent for Zcash: ZEC fees are protocol-fixed, see robotbase_capabilities. "
+     "Returns: estimates for 1/2/3/6/12/24-block targets in BTC/kvB, recommended.fast_1_block_sat_vb / medium_3_block_sat_vb / slow_12_block_sat_vb, mempool_min_sat_vb.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_btc_get_fee_rates()),    ("btc_get_mempool_state",
+     "Bitcoin mempool depth, capacity load and a busy/normal verdict. "
+     "When to use: deciding whether now is a good moment to settle on-chain, or how large the backlog is. "
+     "Do not use: to choose a fee (that is btc_get_fee_rates). "
+     "Returns: txs, bytes, usage_mb, max_mempool_mb, load_pct, min_fee_btc_kvb, total_fees_btc, verdict.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_btc_get_mempool_state()),    ("btc_get_transaction",
+     "Look up one Bitcoin transaction by txid - the core settlement check. "
+     "When to use: has this payment arrived, which block is it in, how many confirmations does it have. "
+     "Do not use: for a whole block (that is btc_get_block); for an address balance (that is btc_get_address). "
+     "Returns: txid, blockhash, confirmations, time, size/vsize, vin_count, up to 12 outputs with address and value, value_out_btc.",
      {"type": "object", "properties": {"txid": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$",
                                                 "description": "Bitcoin transaction hash (64 hex chars)"}},
-      "required": ["txid"], "additionalProperties": False}, lambda a: t_btc_tx_lookup(a.get("txid"))),
-    ("btc_block_summary",
-     "Bitcoin block summary: tx count, size, weight, block time, confirmations; omit parameters for the current chain tip. "
-     "When to use: how many transactions the latest block holds, or an overview of a given height or block hash.",
+      "required": ["txid"], "additionalProperties": False}, lambda a: t_btc_tx_lookup(a.get("txid"))),    ("btc_get_block",
+     "Bitcoin block summary by height or hash; omit both for the chain tip. "
+     "When to use: an overview of a block, or confirming which block a payment landed in. "
+     "Do not use: to fetch a single payment (that is btc_get_transaction). "
+     "Returns: hash, height, time, txs, size, weight, confirmations, previousblockhash.",
      {"type": "object", "properties": {"height": {"type": "integer", "description": "Block height (optional)"},
                                        "blockhash": {"type": "string", "description": "Block hash (optional; use instead of height)"}},
-      "additionalProperties": False}, lambda a: t_btc_block_summary(a.get("height"), a.get("blockhash"))),
-    ("btc_address_summary",
-     "Balance and activity of a Bitcoin address: confirmed/unconfirmed balance, UTXO count and total, tx count, last 10 transactions. "
-     "Supports P2PKH (1…), P2SH (3…), bech32 (bc1q…), bech32m (bc1p…). "
-     "When to use: how much BTC this address holds, whether it received funds, how active it is. "
-     "Note: ultra-active addresses such as exchange cold wallets may return a degraded response under index load.",
+      "additionalProperties": False}, lambda a: t_btc_block_summary(a.get("height"), a.get("blockhash"))),    ("btc_get_address",
+     "Balance and activity of a Bitcoin address, with no key involved. "
+     "When to use: reconciling a merchant wallet, or checking whether an address received funds and how active it is. "
+     "Do not use: we do not label or risk-score addresses; for a single payment use btc_get_transaction. "
+     "Returns: address, confirmed/unconfirmed balance, utxo count and total, tx count, last 10 transactions. "
+     "Supports P2PKH (1..), P2SH (3..), bech32 (bc1q..), bech32m (bc1p..). "
+     "Ultra-active addresses may return a degraded=true response under index load rather than hanging.",
      {"type": "object", "properties": {"address": {"type": "string", "description": "Bitcoin mainnet address"}},
-      "required": ["address"], "additionalProperties": False}, lambda a: t_btc_address_summary(a.get("address"))),
-    ("kas_node_status",
-     "Kaspa node status: network height, DAA score, difficulty, network hashrate, DAG tips, block reward, 10 BPS cadence, next halving and the hashport ports this node serves. "
-     "When to use: how high and how healthy the Kaspa node is, or the halving schedule. "
-     "Do not use: our own pool's miners/blocks → kas_pool_status.",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_kas_node_status()),
-    ("kas_pool_status",
-     "RobotBase Kaspa solo hashport: tier state, pool hashrate, connected miners, accepted shares, blocks found, uptime, share difficulty, the last block found (hash, blue score, age) and stale/invalid counts. "
-     "When to use: is the KAS hashport live, who is mining on it, did it ever find a real mainnet block. "
-     "Do not use: chain-level hashrate → kas_node_status.",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_kas_pool_status()),
-    ("rvn_node_status",
-     "Ravencoin node status: height, sync state, network hashrate, difficulty and client version. "
-     "When to use: whether the RVN node is synced and how big the network is right now.",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_rvn_node_status()),
-    ("rvn_pool_status",
-     "RobotBase Ravencoin solo hashport: engine state, pool hashrate, connected miners, shares, share difficulty, the Stratum endpoint, fee and the per-miner independent coinbase payout mode. "
-     "When to use: is the RVN hashport open, is anyone mining, what endpoint do I point a GPU rig at. "
-     "Do not use: node-level data → rvn_node_status.",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_rvn_pool_status()),
-    ("pow_halving_oracle",
-     "Halving countdown for every chain we run: height, next halving height, blocks remaining, ETA in days, and the reward before/after. "
-     "When to use: an agent needs a precise schedule anchor (emissions, mining economics, long-horizon planning). "
-     "Note: heights are read live from our own nodes, schedules are protocol constants. DOGE has no further halvings (flat subsidy).",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_pow_halving_oracle()),
-    ("pow_network_mining_intel",
-     "Network hashrate and difficulty for BTC / XMR / ZEC (node-reported or difficulty-derived, stated per chain), plus an explicit proof-of-stake note for ETH. "
-     "When to use: mining economics, security budget, or comparing chain weight. "
-     "Do not use: pool-level stats → xmr_pool_status or robotbase_pool_worker_query.",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_pow_network_mining_intel()),
-    ("get_recommended_fee_rate",
-     "Fee recommendation tiers for a chain: fast / medium / slow plus the mempool minimum. "
-     "BTC is computed from our own node's fee estimator; ZEC returns the ZIP-317 conventional fee (protocol rule, not a market estimate); "
-     "chains without an estimator say so instead of guessing. "
-     "When to use: an autonomous agent is about to send a transaction and must pick a fee.",
-     {"type": "object", "properties": {"chain": {"type": "string", "enum": ["btc", "zec", "ltc", "doge", "rvn"],
-                                                 "description": "btc / zec / ltc / doge / rvn"}},
-      "required": ["chain"], "additionalProperties": False}, lambda a: t_get_recommended_fee_rate(a.get("chain"))),
-    ("mempool_congestion_status",
-     "Mempool congestion for BTC (txs, bytes, usage vs capacity, min fee, total fees, busy/normal verdict). "
-     "When to use: decide whether now is a good moment for an on-chain settlement.",
-     {"type": "object", "properties": {"chain": {"type": "string", "enum": ["btc", "ltc", "doge"],
-                                                 "description": "btc / ltc / doge"}},
-      "required": ["chain"], "additionalProperties": False}, lambda a: t_mempool_congestion_status(a.get("chain"))),
-    ("zec_shielded_pools_metrics",
-     "All six Zcash value pools (transparent, sprout, sapling, orchard, ironwood, lockbox) with balances, share of supply and 1h/24h deltas. "
-     "When to use: privacy-pool capital allocation, shielded-supply trends, ZEC macro flows. "
-     "Do not use: node health → chain_status(zec).",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_zec_shielded_pools_metrics()),
-    ("kas_pool_attribution_intel",
-     "Kaspa chain-wide pool attribution computed locally: which pool found how many blocks, with percentage share, over a window of 1-720 hours, plus the newest attributed blocks. "
-     "When to use: Kaspa mining decentralisation, competitor share, or checking how a pool performs. "
-     "Powered by our own block index (hundreds of thousands of blocks attributed), not a third-party API.",
-     {"type": "object", "properties": {"hours": {"type": "integer", "minimum": 1, "maximum": 720, "default": 24,
-                                                 "description": "Look-back window in hours (default 24)"}},
-      "additionalProperties": False}, lambda a: t_kas_pool_attribution_intel(a.get("hours", 24))),
-    ("robotbase_pool_worker_query",
-     "Look up one miner on our own hashports: hashrate, shares, stale/invalid, current difficulty and last-seen, by wallet address or worker name. "
-     "When to use: a miner asks their agent \"how is my rig doing on robotbase?\". "
-     "Privacy: the address is masked in the reply, and only an exact wallet/worker match returns data (no listings).",
-     {"type": "object", "properties": {"chain": {"type": "string", "enum": ["kas", "zec", "rvn"]},
-                                       "wallet": {"type": "string", "description": "Miner payout address (optional)"},
-                                       "worker": {"type": "string", "description": "Worker name (optional)"}},
-      "required": ["chain"], "additionalProperties": False},
-     lambda a: t_robotbase_pool_worker_query(a.get("chain"), a.get("wallet"), a.get("worker"))),
+     "required": ["address"], "additionalProperties": False}, lambda a: t_btc_address_summary(a.get("address"))),
+    ("xmr_get_node_status",
+     "Monero node state: height vs target, sync flag, difficulty, txpool size, database size, monerod version and peer counts. "
+     "When to use: whether the XMR node is synced and healthy, or how big its chain and txpool are. "
+     "Do not use: RobotBase does not index Monero transactions, wallets or ring signatures - a Monero payment cannot be verified or risk-scored from here. "
+     "Returns: height, target_height, synced, status, network, difficulty, txpool_txs, database_size_gb, "
+     "block_size_limit, version, incoming_connections / outgoing_connections.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_xmr_node_status()),
     ("broadcast_raw_transaction",
      "Relay an already-signed raw transaction to the network through our own full node (non-custodial: we never see a private key). "
-     "The transaction is first validated with testmempoolaccept; rejected transactions are never relayed. "
-     "Disabled by default on this deployment and enabled per-operator with RB_ENABLE_BROADCAST=1. "
-     "When to use: an agent signed locally and wants a high-availability broadcast path.",
+     "When to use: an agent signed a transaction locally and wants a high-availability broadcast path into the Bitcoin network. "
+     "Do not use: to build or sign a transaction (we never hold keys), or to look up a payment (that is btc_get_transaction). "
+     "Returns: {accepted, txid, chain, relayed} on success, or {accepted:false, reason} - a rejected transaction is never relayed. "
+     "Availability: disabled by default on this deployment; the operator enables it with RB_ENABLE_BROADCAST=1.",
      {"type": "object", "properties": {"chain": {"type": "string", "enum": ["btc"]},
                                        "signed_raw_tx_hex": {"type": "string", "description": "Raw signed transaction hex"}},
       "required": ["chain", "signed_raw_tx_hex"], "additionalProperties": False},
      lambda a: t_broadcast_raw_transaction(a.get("chain"), a.get("signed_raw_tx_hex"))),
-    ("zec_block_attribution_intel",
-     "Zcash coinbase attribution over the last 10-500 blocks: the shielded-pool share of block rewards (privacy mining), coinbase outputs split into consensus funding streams (lockbox) vs real miner payout addresses, and the pool tags miners printed into their own coinbase text plus our own /RobotBase/ tag. "
-     "When to use: privacy-pool mining trends, shielded adoption, or checking whether our own pool found blocks. "
-     "Scope: chain facts only — no third-party pool label list is applied.",
-     {"type": "object", "properties": {"blocks": {"type": "integer", "minimum": 10, "maximum": 500, "default": 200,
-                                                  "description": "How many recent blocks to classify (default 200)"}},
-      "additionalProperties": False}, lambda a: t_zec_block_attribution_intel(a.get("blocks", 200))),
-    ("rvn_asset_lookup",
-     "Ravencoin native assets straight from our ravend: pass an asset name or id for amount, units, reissuable flag and IPFS metadata, or omit it to list recent assets. "
-     "When to use: token/asset checks on Ravencoin, where assets are UTXO-native rather than smart contracts.",
-     {"type": "object", "properties": {"asset": {"type": "string", "description": "Asset name or id (optional)"},
-                                       "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20,
-                                                 "description": "How many assets to list when no name is given"}},
-      "additionalProperties": False}, lambda a: t_rvn_asset_lookup(a.get("asset"), a.get("limit", 20))),
-    ("utxo_chain_status",
-     "Node status for DOGE or LTC (height, sync progress, peers, mempool tx count). "
-     "When to use: Dogecoin or Litecoin node progress. For BTC/KAS/ZEC/RVN use chain_status (any chain in one call).",
-     {"type": "object", "properties": {"chain": {"type": "string", "enum": ["doge", "ltc"],
-                                                 "description": "doge or ltc"}},
-      "required": ["chain"], "additionalProperties": False}, lambda a: t_utxo_chain_status(a.get("chain"))),
     ("robotbase_services",
-     "Live availability of every service behind the RobotBase gateway: the chain nodes, hashport engines, Web3 Agent Hub, AITOKENS and MCP itself. "
-     "When to use: an overall health check, or which services are down.",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_robotbase_services()),    ("xmr_node_status",
-     "Monero node state: height vs target, sync flag, difficulty, txpool size, database size, monerod version and peer counts. "
-     "When to use: whether the XMR node is synced and healthy, or how big its chain/txpool is. "
-     "Do not use: p2pool/mining side → xmr_pool_status.",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_xmr_node_status()),    ("xmr_pool_status",
-     "Monero p2pool (mini + nano sidechains) plus Monero network state: per-sidechain hashrate, miners, sidechain height/difficulty, blocks found, last block age, this node's workers, fee and the non-custodial flag. "
-     "When to use: solo/p2pool mining economics on Monero, sidechain health, or which stratum endpoint to point a rig at. "
-     "Do not use: plain node RPC state → xmr_node_status.",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_xmr_pool_status()),    ("eth_node_status",
-     "Ethereum node state from a Reth execution client + Lighthouse consensus client: sync state, height/head slot, peers, clients, and — while the node is still being provisioned — an explicit provisioning status. "
-     "When to use: whether the ETH node is up/synced, or what stage its provisioning/sync is at. "
-     "Do not use: for PoW hashrate questions — Ethereum is proof-of-stake (see pow_network_mining_intel).",
-     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_eth_node_status()),
+     "Live availability of every service behind the RobotBase gateway: the chain nodes, Web3 Agent Hub, AITOKENS and MCP itself. "
+     "When to use: an overall platform health check, or finding which service is down. "
+     "Do not use: for a single chain's node state (chain_status) or its capability boundary (robotbase_capabilities). "
+     "Returns: services[] {name, ok, detail} plus an overall ok flag.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_robotbase_services()),
+    ("tron_check_address_risk",
+     "TRON address risk intelligence: judicial and black-market labels, account profile and a 0-100 safety score. "
+     "When to use: before accepting USDT from a counterparty - OTC settlement, merchant payout, or any "
+     "agent that must not receive tainted funds; also to sanity-check an address you are about to pay. "
+     "Do not use: to confirm that a specific transfer arrived (that is tron_verify_usdt_transfer). "
+     "Returns: risk_level (low|medium|high|unknown), safety_score, hit_flags (sanctioned / money_laundering / "
+     "mixer / cybercrime / phishing / blacklist_doubt ...), malicious_contracts_created, account {activated, "
+     "age_days, balance_trx, is_contract, trc20_holdings}, not_covered[] and a disclaimer. "
+     "Metered: 5 free calls per day per IP, unlimited with an API key.",
+     {"type": "object", "properties": {"address": {"type": "string",
+                                                   "description": "TRON base58 address (T...)"}},
+      "required": ["address"], "additionalProperties": False},
+     lambda a: t_tron_check_address_risk(a.get("address"))),
+    ("tron_verify_usdt_transfer",
+     "TRC-20 USDT settlement check by transaction id: did it land, is it irreversible, how much, from and to whom. "
+     "When to use: an agent or a merchant must confirm a USDT payment before releasing value - this is the "
+     "settlement check that closes an automated trade loop. "
+     "Do not use: to assess the counterparty (that is tron_check_address_risk). "
+     "Returns: found, status (SUCCESS|FAILED), finalized (present on the solidity/irreversible chain), "
+     "confirmations, blocks_until_finality, block_number, block_time_utc, amount_usdt, from, to, fee_trx, "
+     "checks {}, verified and a plain-language verdict. Pass expected_to / expected_amount_usdt to have the "
+     "recipient and amount matched for you. "
+     "Metered: 5 free calls per day per IP, unlimited with an API key.",
+     {"type": "object", "properties": {"txid": {"type": "string", "description": "TRON transaction id (64 hex chars)"},
+                                       "expected_to": {"type": "string", "description": "Optional: the recipient you expect"},
+                                       "expected_amount_usdt": {"type": "number", "description": "Optional: the USDT amount you expect"}},
+      "required": ["txid"], "additionalProperties": False},
+     lambda a: t_tron_verify_usdt_transfer(a.get("txid"), a.get("expected_to"), a.get("expected_amount_usdt"))),
+    ("sol_check_token_safety",
+     "Solana token rug-pull screen: mint and freeze authority, liquidity lock, holder concentration. "
+     "When to use: before an agent buys or quotes a Solana token, or when a mint address shows up in a "
+     "trade signal and you need the safety facts first. "
+     "Do not use: for price or liquidity depth in USD (no DEX aggregator is queried here); for TRON "
+     "addresses use tron_check_address_risk. "
+     "Returns: risk_level (low|medium|high), safety_score, mint_authority_revoked, freeze_authority_revoked, "
+     "lp_locked_pct, lp_holder_pct, top10_holder_pct, holder_count, transfer_fee / transfer_hook presence, "
+     "warnings[], not_covered[] and a disclaimer. "
+     "Metered: 5 free calls per day per IP, unlimited with an API key.",
+     {"type": "object", "properties": {"mint": {"type": "string", "description": "Solana token mint address (base58)"}},
+      "required": ["mint"], "additionalProperties": False},
+     lambda a: t_sol_check_token_safety(a.get("mint"))),
 ]
-
-# ---------------------------------------------------------------- 2026-09-27 四链收敛
-# 平台已按 BTC / ETH / XMR / ZEC 四条链运营；以下工具对应的链已下线，注册表里统一摘除
-# （实现函数保留在文件里，便于将来重新启用，但不再对外暴露）。
-RETIRED_TOOLS = {"kas_node_status", "kas_pool_status", "kas_pool_attribution_intel",
-                 "rvn_node_status", "rvn_pool_status", "rvn_asset_lookup", "utxo_chain_status"}
-TOOLS = [t for t in TOOLS if t[0] not in RETIRED_TOOLS]
 
 
 def tools_list():
@@ -1076,7 +1466,21 @@ def tools_list():
 def call_tool(name, args):
     for n, _d, _s, fn in TOOLS:
         if n == name:
-            return fn(args or {})
+            if n not in RISK_TOOLS:
+                return fn(args or {})
+            gate = _risk_gate()                      # 额度用尽则抛 PaymentRequired，不消耗上游
+            tier = gate.get("free_tier") or {}
+            used_before, limit = tier.get("used_today", 0), tier.get("limit_per_day", -1)
+            out = fn(args or {})
+            if isinstance(out, dict) and out.pop("_no_charge", False):
+                meter = _meter_payload(used_before, limit, pending=True) if limit >= 0 else _meter_payload(0, -1)
+            else:
+                meter = _risk_commit(used_before, limit)
+            if isinstance(out, dict):
+                out["_metering"] = meter
+            else:
+                out = {"result": out, "_metering": meter}
+            return out
     raise ValueError(f"unknown tool: {name}")
 
 
@@ -1088,8 +1492,15 @@ def handle(msg):
         return {"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": PROTOCOL_VERSION, "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": SERVER_INFO,
-            "instructions": ("RobotBase read-only on-chain data service: BTC/ETH/XMR/ZEC. "
-                             "Every tool is a read-only query; none of them execute trades or touch funds.")}}
+            "instructions": ("RobotBase is the semantic verification and risk-intelligence surface for "
+                             "Web3 agents. Call list_chains or robotbase_capabilities first to see which "
+                             "chains are live today (BTC/ETH/XMR/ZEC) and what each node can and cannot "
+                             "answer. Every tool is a read-only query: none of them sign, trade, move "
+                             "funds or hold keys, and RobotBase operates no mining pool. For payment "
+                             "safety use tron_check_address_risk before accepting USDT and "
+                             "tron_verify_usdt_transfer before releasing value; sol_check_token_safety "
+                             "screens a Solana mint before a trade. Those three risk tools are metered "
+                             "(free daily allowance per IP, then an API key).")}}
     if method == "notifications/initialized" or mid is None:
         return None
     if method == "ping":
@@ -1106,6 +1517,13 @@ def handle(msg):
             out = call_tool(name, params.get("arguments") or {})
             return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": truncate(out)}],
                                                             "isError": False}}
+        except PaymentRequired as pay:
+            return {"jsonrpc": "2.0", "id": mid, "result": {
+                "content": [{"type": "text", "text": json.dumps(
+                    {"error": "payment_required", "tool": name, "message": str(pay),
+                     "free_per_day": RISK_FREE_PER_DAY, "top_up": TOPUP_URL},
+                    ensure_ascii=False)}],
+                "isError": True}}
         except Exception as exc:  # noqa: BLE001
             return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": f"error: {exc}"[:300]}],
                                                             "isError": True}}
@@ -1114,8 +1532,8 @@ def handle(msg):
 
 DOC_TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>RobotBase MCP · read-only data API for AI agents on BTC / ETH / XMR / ZEC</title>
-<meta name="description" content="Read-only MCP server covering the classic non-EVM PoW chains (BTC/KAS/ZEC/RVN/DOGE/LTC). No API key, no tracking.">
+<title>RobotBase MCP · the semantic risk &amp; verification layer for Web3 agents</title>
+<meta name="description" content="One read-only MCP endpoint where an autonomous agent verifies that an on-chain payment settled and prices the next one. Bitcoin, Ethereum, Monero and Zcash are live; Solana, Base and Tron are provisioning. No public RPC, no custody, no tracking.">
 <style>
 :root{--bg:#070a0f;--panel:#0f141c;--line:#1f2733;--text:#e8eef6;--muted:#8b98a9;--brand:#ff7a2f;--brand2:#ffc46b}
 *{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif;
@@ -1141,12 +1559,13 @@ a{color:var(--brand2)}.muted{color:var(--muted);font-size:12.5px}.ok{color:#2ee6
 border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;pointer-events:none}.toast.on{opacity:1}
 </style></head><body><div class="wrap">
 <h1>RobotBase MCP Server</h1>
-<div class="tag">Read-only MCP server for four production chains — BTC / ETH / XMR / ZEC · no API key · no tracking</div>
-<div class="sub">Let Claude, Cursor, Codex, VS Code or any MCP-capable agent query Bitcoin mempool fees, Ethereum node and sync state, Monero node + p2pool telemetry, and Zcash shielded-pool supply — straight from our own nodes. Every tool is read-only; none touch trading or funds.</div>
+<div class="tag">Read-only MCP · BTC / ETH / XMR / ZEC live · Solana / Base / Tron provisioning · no RPC endpoint · no custody</div>
+<div class="sub">RobotBase is the semantic risk and verification layer for Web3 agents: one endpoint where an autonomous agent checks whether a payment actually settled on Bitcoin, prices the next transaction, reads the Zcash shielded-pool distribution, and confirms that a node really is synced - straight from bare-metal nodes we operate ourselves. Solana, Base and Tron are being wired into the aggregation layer and join the live set once they are. RobotBase publishes no RPC endpoint of any kind: this MCP surface is the only read path. Every tool is read-only, none touch trading or funds, and RobotBase operates no mining pool.</div>
 
 <div class="card">
   <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
     <a class="btn" href="#connect">Get connected</a>
+    <a class="btn ghost" href="#pricing">Pricing</a>
     <a class="btn ghost" href="/mcp/stats?hours=24">Live usage stats</a>
     <a class="btn ghost" href="/mcp/tools">Tool list (JSON)</a>
     <a class="btn ghost" href="/mcp/server.json">Server Card</a>
@@ -1168,7 +1587,7 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
   <p class="muted">Verify from the command line:</p>
 <pre>curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
-       "params":{"name":"zec_chain_info","arguments":{}}}'</pre>
+       "params":{"name":"zec_get_pool_status","arguments":{}}}'</pre>
 </div>
 
 <h2>All __TOOL_COUNT__ read-only tools</h2>
@@ -1183,25 +1602,55 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
                       gateway (/mcp reverse proxy) ──► MCP tool service
                         ├── BTC  full node RPC + electrs (address/tx index)
                         ├── ETH  Reth execution + Lighthouse consensus
-                        ├── XMR  monerod + p2pool (mini / nano sidechains)
+                        ├── XMR  monerod full node
                         ├── ZEC  Zebra full node (incl. value-pool / shielded supply)
+                        ├── SOL / BASE / TRON   provisioning - light API aggregation, no heavy node on this host
                         └── gateway service aggregation (status pages / dashboards)</pre></div>
 
 <h2>Rate limits and privacy</h2>
 <div class="card"><div class="grid">
+<div><div class="muted">Verification tools</div><div><b>Free</b> - no key, no signup</div></div>
+<div><div class="muted">Risk tools</div><div><b>5 free/day per IP</b>, then a prepaid API key</div></div>
+<div><div class="muted">Pricing</div><div><b>Free</b> during the pioneer beta - a prepaid API-key tier follows</div></div>
 <div><div class="muted">Anonymous</div><div><b>120 req/min/IP</b></div></div>
 <div><div class="muted">With API key</div><div><b>600 req/min/IP</b> (<code>X-API-Key</code>)</div></div>
 <div><div class="muted">Privacy</div><div>Audit keeps only the first 16 chars of the IP SHA256 — <b>query arguments are never logged</b></div></div>
 <div><div class="muted">Data</div><div>Read-only on-chain data; no trading, signing or custody</div></div>
 </div></div>
 
+<h2>Risk intelligence (metered)</h2>
+<div class="card">
+  <p class="muted" style="margin-top:0">Three tools answer questions a free block explorer cannot:
+  is this counterparty tainted, did the USDT really arrive irreversibly, and is this Solana token a
+  rug. They are aggregations over public datasets (GoPlus Labs + TronGrid), read-only, no keys, no custody.</p>
+<ul style="margin:0;padding-left:20px">
+<li><code>tron_check_address_risk</code> - judicial / black-market labels, account age, 0-100 safety score</li>
+<li><code>tron_verify_usdt_transfer</code> - finalized?, amount, sender, recipient, matched against what you expect</li>
+<li><code>sol_check_token_safety</code> - mint &amp; freeze authority, liquidity lock, top-10 concentration</li>
+</ul>
+  <p class="muted" style="margin-bottom:0">Free allowance: <b>__RISK_FREE__ calls per day per IP</b>. After that the
+  tool answers <code>Payment Required</code> and points at the top-up page. An API key lifts the cap.</p>
+</div>
+
+<h2 id="pricing">Pricing</h2>
+<div class="card"><div class="grid">
+<div><div class="muted">Verification tools (13)</div><div><b>$0</b> — free forever, no key, no signup</div></div>
+<div><div class="muted">Risk intelligence (3 tools)</div><div><b>__RISK_FREE__ calls/day per IP free</b>, then a prepaid API key</div></div>
+<div><div class="muted">Pioneer beta</div><div><b>Free key for the first 100 developers</b> — 600 req/min, unlimited risk calls</div></div>
+<div><div class="muted">After the beta</div><div>prepaid API key, topped up in <b>USDT (TRC-20)</b> or <b>BTC</b> on-chain</div></div>
+</div>
+<p class="muted" style="margin-bottom:0">Keys are issued from the billing gateway at
+<a href="/billing/pricing">/billing/pricing</a>; send yours back as <code>X-API-Key</code> on this same
+endpoint. Nothing is metered by surprise: every risk-tool answer carries its own <code>_metering</code>
+block with the allowance and the reset time (00:00 Asia/Shanghai).</p>
+</div>
+
 <h2>Example prompts</h2>
 <div class="card"><ul style="margin:0;padding-left:20px">
-<li>"What is the cheapest BTC fee right now?" → <code>btc_fee_estimates</code></li>
-<li>"How much ZEC is in the Zcash shielded pools?" → <code>zec_chain_info</code></li>
-<li>"How much hashrate is on the Monero mini sidechain right now?" → <code>xmr_pool_status</code></li>
-<li>"What is the balance of this Bitcoin address?" → <code>btc_address_summary</code></li>
-<li>"Is our Ethereum node synced yet, and what stage is it at?" → <code>eth_node_status</code></li>
+<li>"What is the cheapest BTC fee right now?" → <code>btc_get_fee_rates</code></li>
+<li>"Did this txid actually confirm, and in which block?" → <code>btc_get_transaction</code></li>
+<li>"How much ZEC is in the Zcash shielded pools?" → <code>zec_get_pool_status</code></li>
+<li>"Is the Monero node synced, and how deep is its txpool?" → <code>xmr_get_node_status</code></li>
 </ul></div>
 
 <p class="muted" style="margin-top:26px">RobotBase · read-only on-chain data infrastructure · <a href="https://robotbase.cc/">robotbase.cc</a> ·
@@ -1217,16 +1666,14 @@ function toast(){var el=document.getElementById("t")||Object.assign(document.bod
 
 def docs_html():
     groups = [
-        ("① Chain overview", ["list_chains", "chain_status", "robotbase_services"]),
-        ("② Bitcoin (BTC)", ["btc_fee_estimates", "btc_mempool_summary", "btc_tx_lookup", "btc_block_summary", "btc_address_summary"]),
-        ("③ Ethereum (ETH)", ["eth_node_status"]),
-        ("④ Monero (XMR)", ["xmr_node_status", "xmr_pool_status"]),
-        ("⑤ Zcash (ZEC)", ["zec_chain_info", "zec_recent_blocks"]),
-        ("⑥ Mining & fee intelligence", ["pow_halving_oracle", "pow_network_mining_intel",
-                                         "get_recommended_fee_rate", "mempool_congestion_status",
-                                         "robotbase_pool_worker_query"]),
-        ("⑦ Exclusive local indexes", ["zec_shielded_pools_metrics", "zec_block_attribution_intel",
-                                       "broadcast_raw_transaction"]),
+        ("① Chain overview", ["list_chains", "chain_status", "robotbase_capabilities", "robotbase_services"]),
+        ("② Bitcoin (BTC) — settlement verification & fees", ["btc_get_fee_rates", "btc_get_mempool_state",
+                                                              "btc_get_transaction", "btc_get_block",
+                                                              "btc_get_address", "broadcast_raw_transaction"]),
+        ("③ Zcash (ZEC) — shielded-pool intelligence", ["zec_get_pool_status", "zec_get_recent_blocks"]),
+        ("④ Monero (XMR) — node telemetry", ["xmr_get_node_status"]),
+        ("⑤ Risk intelligence — metered", ["tron_check_address_risk", "tron_verify_usdt_transfer",
+                                           "sol_check_token_safety"]),
     ]
     desc = {n: d for n, d, _s, _f in TOOLS}
     rows = ""
@@ -1243,54 +1690,51 @@ def docs_html():
             rows += ('<tr><td><code>' + n + '</code></td><td>' + short +
                      ('<div class="when">When to use: ' + when + '</div>' if when else '') + '</td></tr>')
     return (DOC_TEMPLATE.replace("__TOOLS_ROWS__", rows)
-                .replace("__TOOL_COUNT__", str(len(TOOLS))))
+                .replace("__TOOL_COUNT__", str(len(TOOLS)))
+                .replace("__RISK_FREE__", str(RISK_FREE_PER_DAY)))
 
 
 def server_card():
     desc = {n: d.split("【")[0].strip() for n, d, _s, _f in TOOLS}
     return {
         "name": "robotbase-mcp",
-        "title": "RobotBase MCP Server",
-        "version": "0.6.0",
-        "description": "Read-only on-chain data for AI agents across four production chains: Bitcoin "
-                       "(mempool, fees, tx/address/block lookup), Ethereum (execution + consensus node state), "
-                       "Monero (node state, p2pool sidechains) and Zcash (chain info, shielded value pools, "
-                       "recent blocks, pool attribution). No auth required, no tracking.",
+        "title": "RobotBase MCP Server - on-chain verification & risk intelligence for Web3 agents",
+        "version": "0.9.0",
+        "description": "The semantic verification and risk-intelligence layer for Web3 agents, as one "
+                       "read-only MCP endpoint. Live: Bitcoin (fees, mempool state, tx/block/address "
+                       "verification, optional raw-tx relay), Ethereum (Reth execution + Lighthouse "
+                       "consensus state), Monero (node telemetry - no tx or wallet indexing) and Zcash "
+                       "(node state + all six shielded value pools + recent blocks). Risk intelligence "
+                       "as light aggregation over public datasets: TRON address risk, TRC-20 USDT "
+                       "settlement verification and Solana rug-pull screening. RobotBase publishes no "
+                       "RPC endpoint of any kind. Verification tools are free; risk tools include a "
+                       "daily free allowance with a prepaid API key above it.",
         "homepage": "https://robotbase.cc/mcp",
         "transport": {"type": "streamable-http", "url": "https://robotbase.cc/mcp"},
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {"tools": {"listChanged": False}},
         "auth": {"type": "none", "optional": "X-API-Key header or ?key= raises rate limit to 600/min per IP"},
         "rateLimits": {"anonymous": "120/min per IP", "withApiKey": "600/min per IP"},
-        "tags": ["bitcoin", "ethereum", "monero", "zcash", "blockchain-data", "onchain",
-                 "mempool", "fees", "privacy-coins", "read-only", "mcp-server"],
+        "tags": ["bitcoin", "ethereum", "monero", "zcash", "solana", "base", "tron", "blockchain-data",
+                 "onchain", "verification", "risk-intelligence", "aml", "rug-pull", "usdt", "mempool",
+                 "fees", "privacy-coins", "read-only", "mcp-server", "web3-agents"],
+        "pricing": {"verification_tools": "free", "risk_tools": "%d free calls/day per IP, then a prepaid API key" % RISK_FREE_PER_DAY,
+                    "top_up": TOPUP_URL},
         "tools": [{"name": n, "description": desc[n]} for n, _d, _s, _f in TOOLS],
     }
 
 
-# ============================================================ 2026-09-27 四链扩展（BTC/ETH/XMR/ZEC）
-# 全部上游都可用环境变量覆盖，默认指向本机（参考实现按自己的部署改这些变量即可）
-XMR_HELPER = os.environ.get("RB_XMR_HELPER", "http://127.0.0.1:18085/rpc")
-XMR_P2POOL_API = os.environ.get("RB_XMR_P2POOL_API", "")
-ETH_EXEC_RPC = os.environ.get("RB_ETH_EXEC_RPC", "http://127.0.0.1:8545")
-ETH_CONS_RPC = os.environ.get("RB_ETH_CONS_RPC", "http://127.0.0.1:5052")
-
-
-def eth_rpc(method, params=None):
-    """Minimal JSON-RPC call against an Ethereum execution endpoint."""
-    d = _http_json(ETH_EXEC_RPC, {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}, timeout=8)
-    if d.get("error"):
-        raise RuntimeError(d["error"].get("message") if isinstance(d["error"], dict) else str(d["error"]))
-    return d.get("result")
+# ============================================================ 2026-09-27 三链扩展（BTC/XMR/ZEC）
+XMR_HELPER = os.environ.get("XMR_HELPER", os.environ.get("RB_XMR_HELPER", "http://127.0.0.1:18085/rpc"))
 
 
 def t_xmr_node_status():
-    """Monero node state from a monerod JSON-RPC endpoint (get_info)."""
+    """Monero node state straight from our monerod helper RPC."""
     d = cached("xmr_info", 10, lambda: _http_json(
         XMR_HELPER, {"jsonrpc": "2.0", "id": 1, "method": "get_info"}, timeout=10))
     r = (d or {}).get("result") or {}
     if not r:
-        return {"available": False, "reason": "monerod JSON-RPC unreachable"}
+        return {"available": False, "reason": "monerod helper RPC unreachable"}
     return {
         "height": r.get("height"), "target_height": r.get("target_height"),
         "synced": bool(r.get("synchronized")) and not bool(r.get("busy_syncing")),
@@ -1299,82 +1743,13 @@ def t_xmr_node_status():
         "difficulty": r.get("difficulty"),
         "txpool_txs": r.get("tx_pool_size"),
         "database_size_gb": round((r.get("database_size") or 0) / 1e9, 2),
-        "version": r.get("version"),
+        "version": r.get("version"), "uptime_s": r.get("uptime"),
         "incoming_connections": r.get("incoming_connections_count"),
         "outgoing_connections": r.get("outgoing_connections_count"),
         "block_size_limit": r.get("block_size_limit"),
-        "source": "monerod get_info",
+        "source": "our monerod get_info (helper RPC)",
     }
 
-
-def t_xmr_pool_status():
-    """Monero p2pool sidechains (mini/nano) plus Monero network state."""
-    p = cached("xmr_pool", 15, lambda: _http_json(XMR_P2POOL_API, timeout=10))
-    if not p:
-        return {"available": False, "reason": "p2pool pool.json unreachable"}
-    mn = p.get("monero") or {}
-    sides = p.get("p2pool") or {}
-
-    def side(name, stratum_port):
-        s = sides.get(name) or {}
-        node = s.get("this_node") or {}
-        last = s.get("last_block_found_time")
-        return {
-            "sidechain": name,
-            "endpoint": s.get("stratum") or ("127.0.0.1:%d" % stratum_port),
-            "pool_hashrate_hs": s.get("pool_hashrate"),
-            "miners": s.get("pool_miners"),
-            "sidechain_height": s.get("sidechain_height"),
-            "difficulty": s.get("sidechain_difficulty"),
-            "blocks_found": s.get("blocks_found"),
-            "last_block_found_ago_s": (int(time.time()) - int(last)) if last else None,
-            "pplns_window": s.get("pplns_window"),
-            "this_node_workers": node.get("active_workers"),
-            "this_node_hashrate_hs": node.get("hashrate"),
-        }
-
-    return {
-        "host": p.get("host"), "sidechains": p.get("sidechains"),
-        "fee_percent": p.get("fee_percent"), "custody": p.get("custody"),
-        "monero": {"height": mn.get("height"), "difficulty": mn.get("difficulty"),
-                   "network_hashrate_hs": mn.get("network_hashrate"),
-                   "block_reward_xmr": mn.get("block_reward_xmr")},
-        "mini": side("mini", 3333), "nano": side("nano", 3334),
-        "hosted_instances": p.get("hosted_instances"),
-        "worker_count": p.get("worker_count"),
-        "generated_at": p.get("generated_at"),
-        "source": "p2pool pool.json",
-    }
-
-
-def t_eth_node_status():
-    """Ethereum node state: gateway collector first, then direct execution/consensus probes."""
-    out = {"chain": "ETH", "clients": {"execution": "Reth", "consensus": "Lighthouse"}}
-    try:
-        nodes = cached("nodes", 15, lambda: _http_json(HOME_BASE + "/api/nodes")).get("nodes") or {}
-        n = nodes.get("eth") or {}
-        out.update({k: n.get(k) for k in ("ok", "synced", "state", "height", "progress",
-                                          "peers", "exec", "cons", "slot", "client")})
-    except Exception as exc:  # noqa: BLE001
-        out["gateway_error"] = type(exc).__name__
-    try:
-        out["block_number"] = int(eth_rpc("eth_blockNumber"), 16)
-        out["execution_syncing"] = eth_rpc("eth_syncing")
-        out["execution_peers"] = int(eth_rpc("net_peerCount"), 16)
-        out["execution_client"] = eth_rpc("web3_clientVersion")
-    except Exception as exc:  # noqa: BLE001
-        out["execution_probe_error"] = type(exc).__name__
-    try:
-        s = (_http_json(ETH_CONS_RPC + "/eth/v1/node/syncing", timeout=6) or {}).get("data") or {}
-        out["consensus_head_slot"] = s.get("head_slot")
-        out["consensus_syncing"] = s.get("is_syncing")
-        out["consensus_sync_distance"] = s.get("sync_distance")
-    except Exception as exc:  # noqa: BLE001
-        out["consensus_probe_error"] = type(exc).__name__
-    if out.get("execution_probe_error") and out.get("consensus_probe_error") and not out.get("ok"):
-        out["note"] = ("the execution/consensus endpoints are not answering yet; this tool reports "
-                       "the provisioning/sync state instead of masking it")
-    return out
 
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -1485,6 +1860,9 @@ other windows: <a href="/mcp/stats?hours=1">1h</a> · <a href="/mcp/stats?hours=
         n = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(n) if n else b"{}"
         plan = self._plan()
+        _REQ.ip = (self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For")
+                   or self.client_address[0])
+        _REQ.plan = plan
         limit = 600 if plan == "key" else RATE_LIMIT_PER_MIN
         if not self._rate_ok(limit):
             return self._send(429, json.dumps({"jsonrpc": "2.0", "id": None,
@@ -1520,4 +1898,5 @@ other windows: <a href="/mcp/stats?hours=1">1h</a> · <a href="/mcp/stats?hours=
 
 if __name__ == "__main__":
     init_usage()
-    ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+    init_risk_db()
+    ThreadingHTTPServer((BIND, PORT), H).serve_forever()

@@ -6,7 +6,7 @@
 
 Live today: **Bitcoin · Ethereum · Monero · Zcash**. Provisioning: **Solana · Base · Tron**.
 
-[![Tools](https://img.shields.io/badge/tools-13-brightgreen)](https://robotbase.cc/mcp/tools)
+[![Tools](https://img.shields.io/badge/tools-16-brightgreen)](https://robotbase.cc/mcp/tools)
 [![Protocol](https://img.shields.io/badge/MCP-2025--06--18-blue)](https://modelcontextprotocol.io)
 [![Transport](https://img.shields.io/badge/transport-streamable--http-orange)](https://robotbase.cc/mcp)
 [![Glama](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp/badges/score.svg)](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp)
@@ -22,13 +22,19 @@ Listed in the **official MCP Registry** as `io.github.wygogogo19/robotbase-mcp` 
 
 An autonomous agent handling crypto has exactly two blocking questions: **did this payment actually settle**, and **what will the next one cost**. Ask an LLM those today and it has nowhere reliable to look — the MCP ecosystem is rich in wrappers around hosted indexers and thin on self-run infrastructure.
 
-This server answers both with **13 strictly read-only tools** backed by our own full nodes and local indexes: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, and node telemetry for the rest of the roster.
+This server answers both with **16 strictly read-only tools** (13 free verification tools + 3 metered risk tools) backed by our own full nodes and local indexes: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, and node telemetry for the rest of the roster.
 
 ## Pricing
 
-The hosted endpoint is **free during launch**: anonymous access, 120 req/min per IP, no key, no signup, no card.
+| Tier | What it covers | Limit |
+|---|---|---|
+| **Verification (13 tools)** | Fee, mempool, tx/block/address verification, node and shielded-pool telemetry, optional raw-tx relay | **Free forever**, no key, no signup |
+| **Risk intelligence (3 tools)** | `tron_check_address_risk`, `tron_verify_usdt_transfer`, `sol_check_token_safety` | **5 calls/day per IP** free, resets 00:00 Asia/Shanghai |
+| **Prepaid API key** | Lifts the risk-tool cap and raises the rate limit | USDT (TRC-20) or BTC on-chain, top up at <https://robotbase.cc/billing/pricing> |
 
-When billing opens it will be a **prepaid API key topped up in USDT**, metered per call — the only model every mainstream MCP client can actually use today. Machine-to-machine X402 settlement stays a lab track until mainstream clients can answer a `402 Payment Required` challenge.
+Every metered answer carries its own `_metering` block (allowance, reset time, calls left), and a call that fails local validation — a malformed address or txid — does **not** consume the allowance. Past the free allowance the tool returns `Payment Required` and names the top-up page instead of a partial result.
+
+The API key is the primary billing model because it is the only one every mainstream MCP client can actually use today. Machine-to-machine X402 settlement stays a lab track until mainstream clients can answer a `402 Payment Required` challenge.
 
 ## Connect (3 lines)
 
@@ -48,7 +54,7 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
        "params":{"name":"btc_get_fee_rates","arguments":{}}}'
 ```
 
-## Tools (13)
+## Tools (16)
 
 | Tool | What it does | Typical question |
 |---|---|---|
@@ -65,6 +71,18 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
 | `zec_get_recent_blocks(n)` | Recent Zcash blocks | "Are ZEC blocks healthy?" |
 | `xmr_get_node_status` | Monero node: height vs target, sync flag, difficulty, txpool, database size, monerod version, peers | "Is the Monero node synced?" |
 | `broadcast_raw_transaction` | Relay an already-signed BTC transaction through our own node (testmempoolaccept first; operator-gated) | "Broadcast this signed tx for me" |
+
+### Risk intelligence (metered)
+
+Three tools answer what a free block explorer cannot. They are aggregation over public datasets refined in our own middle layer — deliberately **no** heavy local Solana or Tron node.
+
+| Tool | What it does | Typical question |
+|---|---|---|
+| `tron_check_address_risk(address)` | TRC-20 counterparty screening: judicial / black-market / mixer / phishing labels, account activation and age, 0-100 safety score, plus an explicit `not_covered` list | "Is it safe to accept USDT from this address?" |
+| `tron_verify_usdt_transfer(txid, expected_to?, expected_amount_usdt?)` | USDT settlement check: finalized on the solidity chain, confirmations, amount, sender, recipient, matched against what you expect | "Did this USDT payment land, irreversibly, for the right amount?" |
+| `sol_check_token_safety(mint)` | Solana rug screen: mint authority, freeze authority, liquidity-lock percentage, top-10 concentration, transfer fee / hook | "Is this token a rug before my agent buys it?" |
+
+Each one returns `risk_level`, a 0-100 `safety_score`, the verbatim upstream flags it was derived from, a `not_covered` list and a disclaimer — it relays public labels and **forms no legal opinion**. Issuer-backed tokens (regulated stablecoins) are read as issuer control rather than as a rug signal, and that decision is stated in the response.
 
 Boundary worth stating plainly: RobotBase does **not** index Monero transactions, wallets or ring signatures, and does **not** label or risk-score Bitcoin addresses. Where a node cannot answer, the tool says so instead of guessing.
 
@@ -113,16 +131,15 @@ export RB_PORT=8090               # listen port
 export RB_BTC_RPC_URL=http://127.0.0.1:8332
 export RB_BTC_RPC_USER=rpcuser
 export RB_BTC_RPC_PASS=...
-export RB_BTC_DASHBOARD=http://127.0.0.1:8600/api/node   # optional
+export RB_BTC_DASHBOARD=http://127.0.0.1:8600            # optional: /api/node used by chain_status(btc)
 export RB_ELECTRS_HOST=127.0.0.1  # electrs for btc_get_address
 export RB_ELECTRS_PORT=50001
 export RB_ZEC_BASE=http://127.0.0.1:8080                  # status API with /api/chaininfo
-export RB_ETH_EXEC_RPC=http://127.0.0.1:8545              # Reth execution RPC (chain_status: eth)
-export RB_ETH_CONS_RPC=http://127.0.0.1:5052              # Lighthouse beacon API (chain_status: eth)
 export RB_XMR_HELPER=http://127.0.0.1:18085/rpc           # monerod JSON-RPC (xmr_get_node_status)
-export RB_HOME_BASE=http://127.0.0.1:8081                 # gateway: /api/nodes /api/pools /api/services
+export RB_HOME_BASE=http://127.0.0.1:8081                 # gateway aggregation: /api/nodes (eth + xmr telemetry) /api/services
 export RB_USAGE_DB=./usage.db                      # optional usage audit
 export RB_BILLING_DB=./billing.db              # optional: API-key verification
+export RB_RISK_DB=./risk_quota.db                  # optional: daily risk-tool allowance bookkeeping
 python3 server.py
 ```
 
