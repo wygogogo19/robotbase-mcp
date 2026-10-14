@@ -1,8 +1,8 @@
 {
  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
  "name": "io.github.wygogogo19/robotbase-mcp",
- "description": "Read-only MCP for BTC, ETH, XMR and ZEC: fees, nodes, p2pool, shielded pools.",
- "version": "0.6.0",
+ "description": "On-chain verification and risk intelligence MCP for Web3 agents. BTC/ETH/XMR/ZEC live.",
+ "version": "0.8.0",
  "repository": {
   "url": "https://github.com/wygogogo19/robotbase-mcp",
   "source": "github",

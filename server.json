@@ -1,8 +1,8 @@
 {
  "name": "robotbase-mcp",
- "title": "RobotBase MCP Server",
- "version": "0.6.0",
- "description": "Read-only on-chain data for AI agents across four production chains: Bitcoin (mempool, fees, tx/address/block lookup), Ethereum (execution + consensus node state), Monero (node state, p2pool sidechains) and Zcash (chain info, shielded value pools, recent blocks, pool attribution). No auth required, no tracking.",
+ "title": "RobotBase MCP Server — on-chain verification & risk intelligence for Web3 agents",
+ "version": "0.8.0",
+ "description": "The semantic verification and risk-intelligence layer for Web3 agents, as one read-only MCP endpoint. Live: Bitcoin (fees, mempool state, tx/block/address verification, optional raw-tx relay), Ethereum (Reth execution + Lighthouse consensus state), Monero (node telemetry) and Zcash (node state + all six shielded value pools + recent blocks). Provisioning: Solana, Base and Tron, wired through light API aggregation rather than heavy local nodes. No public RPC endpoint is published, no tracking, no custody.",
  "homepage": "https://robotbase.cc/mcp",
  "transport": {
   "type": "streamable-http",
@@ -16,109 +16,91 @@
  },
  "auth": {
   "type": "none",
-  "optional": "X-API-Key header or ?key= raises rate limit to 600/min per IP"
+  "optional": "X-API-Key header or ?key= raises the rate limit to 600/min per IP"
  },
  "rateLimits": {
   "anonymous": "120/min per IP",
   "withApiKey": "600/min per IP"
+ },
+ "pricing": {
+  "current": "free during launch, no key required",
+  "planned": [
+   "prepaid API key (USDT top-up), metered per call",
+   "miner & merchant subscription"
+  ],
+  "experimental": "X402 M2M settlement — lab track, not the billing system"
  },
  "tags": [
   "bitcoin",
   "ethereum",
   "monero",
   "zcash",
+  "solana",
+  "base",
+  "tron",
   "blockchain-data",
   "onchain",
+  "verification",
+  "risk-intelligence",
   "mempool",
   "fees",
   "privacy-coins",
   "read-only",
-  "mcp-server"
+  "mcp-server",
+  "web3-agents"
  ],
  "tools": [
   {
    "name": "list_chains",
-   "description": "Every chain this service supports (BTC / ETH / XMR / ZEC) with live availability and block height. When to use: the user asks which chains you support, which nodes are online, or how high each chain is. Do not use: for detail on one chain, use chain_status."
+   "description": "Every chain on the RobotBase roster with its state (live / provisioning / planned), live availability and block height. When to use: the user asks which chains are supported, which nodes are online, or where to start. Do not use: for one chain's live health use chain_status; for what a node can and cannot answer use robotbase_capabilities."
   },
   {
    "name": "chain_status",
-   "description": "Run-time status of one chain's node: block height, sync progress, connected peers, mempool tx count, client version. When to use: whether a given chain's node is synced, healthy or lagging. Do not use: fees → btc_fee_estimates; address balance → btc_address_summary; Monero pool detail → xmr_pool_status."
+   "description": "Run-time state of one chain's node: block height, sync progress, connected peers, mempool depth, client version. When to use: whether a given chain's node is synced, healthy or lagging. Do not use: fees -> btc_get_fee_rates; a specific payment -> btc_get_transaction; ZEC pool distribution -> zec_get_pool_status."
   },
   {
-   "name": "zec_chain_info",
-   "description": "Zcash mainnet info including the supply of all six value pools (transparent/sprout/sapling/orchard/lockbox/ironwood) — i.e. shielded-pool state. When to use: how much ZEC sits in the shielded/sapling/orchard pools, or privacy-pool size. Do not use: whether the ZEC node is synced → chain_status(zec)."
-  },
-  {
-   "name": "zec_recent_blocks",
-   "description": "Height, hash, block time and difficulty of the most recent N Zcash blocks (N ≤ 20). When to use: check whether ZEC is producing blocks normally, and at what interval."
-  },
-  {
-   "name": "btc_fee_estimates",
-   "description": "Recommended Bitcoin fees: rates (BTC/kvB) for 1/2/3/6/12/24-block confirmation targets, plus the mempool minimum fee. When to use: how much fee to pay, or what gets a fast confirmation. Do not use: overall congestion level → btc_mempool_summary."
-  },
-  {
-   "name": "btc_mempool_summary",
-   "description": "Bitcoin mempool overview: pending tx count, bytes used, minimum fee, total fees, capacity limit. When to use: is the network congested right now, or how big the backlog is."
-  },
-  {
-   "name": "btc_tx_lookup",
-   "description": "Look up a Bitcoin transaction by txid: confirmed or not, block height, confirmations, size, input/output summary. When to use: the user gives a 64-hex BTC txid and asks whether it confirmed or which block it is in. Do not use: other chains → chain_status."
-  },
-  {
-   "name": "btc_block_summary",
-   "description": "Bitcoin block summary: tx count, size, weight, block time, confirmations; omit parameters for the current chain tip. When to use: how many transactions the latest block holds, or an overview of a given height or block hash."
-  },
-  {
-   "name": "btc_address_summary",
-   "description": "Balance and activity of a Bitcoin address: confirmed/unconfirmed balance, UTXO count and total, tx count, last 10 transactions. Supports P2PKH (1…), P2SH (3…), bech32 (bc1q…), bech32m (bc1p…). When to use: how much BTC this address holds, whether it received funds, how active it is. Note: ultra-active addresses such as exchange cold wallets may return a degraded response under index load."
-  },
-  {
-   "name": "pow_halving_oracle",
-   "description": "Halving countdown for every chain we run: height, next halving height, blocks remaining, ETA in days, and the reward before/after. When to use: an agent needs a precise schedule anchor (emissions, mining economics, long-horizon planning). Note: heights are read live from our own nodes, schedules are protocol constants. DOGE has no further halvings (flat subsidy)."
-  },
-  {
-   "name": "pow_network_mining_intel",
-   "description": "Network hashrate and difficulty for BTC / XMR / ZEC (node-reported or difficulty-derived, stated per chain), plus an explicit proof-of-stake note for ETH. When to use: mining economics, security budget, or comparing chain weight. Do not use: pool-level stats → xmr_pool_status or robotbase_pool_worker_query."
-  },
-  {
-   "name": "get_recommended_fee_rate",
-   "description": "Fee recommendation tiers for a chain: fast / medium / slow plus the mempool minimum. BTC is computed from our own node's fee estimator; ZEC returns the ZIP-317 conventional fee (protocol rule, not a market estimate); chains without an estimator say so instead of guessing. When to use: an autonomous agent is about to send a transaction and must pick a fee."
-  },
-  {
-   "name": "mempool_congestion_status",
-   "description": "Mempool congestion for BTC (txs, bytes, usage vs capacity, min fee, total fees, busy/normal verdict) and tx counts for LTC/DOGE where our node API exposes them. When to use: decide whether now is a good moment for an on-chain settlement."
-  },
-  {
-   "name": "zec_shielded_pools_metrics",
-   "description": "All six Zcash value pools (transparent, sprout, sapling, orchard, ironwood, lockbox) with balances, share of supply and 1h/24h deltas. When to use: privacy-pool capital allocation, shielded-supply trends, ZEC macro flows. Do not use: node health → chain_status(zec)."
-  },
-  {
-   "name": "robotbase_pool_worker_query",
-   "description": "Look up one miner on our own hashports: hashrate, shares, stale/invalid, current difficulty and last-seen, by wallet address or worker name. When to use: a miner asks their agent \"how is my rig doing on robotbase?\". Privacy: the address is masked in the reply, and only an exact wallet/worker match returns data (no listings)."
-  },
-  {
-   "name": "broadcast_raw_transaction",
-   "description": "Relay an already-signed raw transaction to the network through our own full node (non-custodial: we never see a private key). The transaction is first validated with testmempoolaccept; rejected transactions are never relayed. Disabled by default on this deployment and enabled per-operator with RB_ENABLE_BROADCAST=1. When to use: an agent signed locally and wants a high-availability broadcast path."
-  },
-  {
-   "name": "zec_block_attribution_intel",
-   "description": "Zcash coinbase attribution over the last 10-500 blocks: the shielded-pool share of block rewards (privacy mining), coinbase outputs split into consensus funding streams (lockbox) vs real miner payout addresses, and the pool tags miners printed into their own coinbase text plus our own /RobotBase/ tag. When to use: privacy-pool mining trends, shielded adoption, or checking whether our own pool found blocks. Scope: chain facts only — no third-party pool label list is applied."
+   "name": "robotbase_capabilities",
+   "description": "What every node can and cannot answer, including pruning and retention limits, plus the fee models we support. When to use: before promising that a query is possible, or after a tool refused one as out of range. RobotBase publishes no RPC endpoint - every read path is this MCP surface."
   },
   {
    "name": "robotbase_services",
-   "description": "Live availability of every service behind the RobotBase gateway: the chain nodes, hashport engines, Web3 Agent Hub, AITOKENS and MCP itself. When to use: an overall health check, or which services are down."
+   "description": "Live availability of every service behind the RobotBase gateway: the chain nodes, Web3 Agent Hub and MCP itself. When to use: an overall platform health check, or finding which service is down. Do not use: for a single chain's node state (chain_status)."
   },
   {
-   "name": "xmr_node_status",
-   "description": "Monero node state: height vs target, sync flag, difficulty, txpool size, database size, monerod version and peer counts. When to use: whether the XMR node is synced and healthy, or how big its chain/txpool is. Do not use: p2pool/mining side → xmr_pool_status."
+   "name": "zec_get_pool_status",
+   "description": "Zcash chain state plus the distribution of all six value pools (transparent / sprout / sapling / orchard / ironwood / lockbox) with balances, share of supply and 1h/24h deltas, in one call. When to use: how much ZEC sits in each shielded pool and what share of supply is shielded. Do not use: we do not index Zcash transactions or wallets; node peers and disk usage -> chain_status."
   },
   {
-   "name": "xmr_pool_status",
-   "description": "Our Monero p2pool (mini + nano sidechains) plus Monero network state: per-sidechain hashrate, miners, sidechain height/difficulty, blocks found, last block age, this node's workers, fee and the non-custodial flag. When to use: solo/p2pool mining economics on Monero, sidechain health, or which stratum endpoint to point a rig at. Do not use: plain node RPC state → xmr_node_status."
+   "name": "zec_get_recent_blocks",
+   "description": "Height, hash, block time and difficulty of the most recent N Zcash blocks (default 5, max 20). When to use: checking whether ZEC is producing blocks normally and at what interval. Do not use: for shielded-pool supply -> zec_get_pool_status."
   },
   {
-   "name": "eth_node_status",
-   "description": "Ethereum node state from our own Reth (execution) + Lighthouse (consensus): sync state, height/head slot, peers, clients, and — while the node is still being provisioned — an explicit provisioning status. When to use: whether the ETH node is up/synced, or what stage its provisioning/sync is at. Do not use: for PoW hashrate questions — Ethereum is proof-of-stake (see pow_network_mining_intel)."
+   "name": "btc_get_fee_rates",
+   "description": "Bitcoin fee rates for 1/2/3/6/12/24-block confirmation targets plus the mempool floor, reported in sat/vB and BTC/kvB. When to use: pricing a Bitcoin transaction, or deciding when a sweep will confirm cheaply. Do not use: to measure backlog depth -> btc_get_mempool_state. There is no equivalent for Zcash: ZEC fees are protocol-fixed."
+  },
+  {
+   "name": "btc_get_mempool_state",
+   "description": "Bitcoin mempool depth, capacity load, minimum fee, total fees and a busy/normal verdict. When to use: deciding whether now is a good moment to settle on-chain, or how large the backlog is. Do not use: to choose a fee -> btc_get_fee_rates."
+  },
+  {
+   "name": "btc_get_transaction",
+   "description": "Look up one Bitcoin transaction by txid: confirmations, block, time, size/vsize, inputs and up to 12 outputs. When to use: the core settlement check - has this payment arrived, which block is it in, how deep is it. Do not use: a whole block -> btc_get_block; an address balance -> btc_get_address."
+  },
+  {
+   "name": "btc_get_block",
+   "description": "Bitcoin block summary by height or block hash; omit both for the chain tip. Returns hash, height, time, tx count, size, weight, confirmations, previous block hash. When to use: an overview of a block, or confirming which block a payment landed in. Do not use: to fetch a single payment -> btc_get_transaction."
+  },
+  {
+   "name": "btc_get_address",
+   "description": "Balance and activity of a Bitcoin address with no key involved: confirmed/unconfirmed balance, UTXO count and total, tx count, last 10 transactions. Supports P2PKH, P2SH, bech32 and bech32m. When to use: reconciling a merchant wallet. Do not use: we do not label or risk-score addresses; for a single payment -> btc_get_transaction."
+  },
+  {
+   "name": "xmr_get_node_status",
+   "description": "Monero node state: height, sync flag, difficulty, txpool size, database size, monerod version and peer counts. When to use: whether the XMR node is synced and healthy, or how big its chain and txpool are. Boundary: RobotBase does not index Monero transactions, wallets or ring signatures - this tool is node telemetry only."
+  },
+  {
+   "name": "broadcast_raw_transaction",
+   "description": "Relay an already-signed raw Bitcoin transaction to the network through our own full node (non-custodial: we never see a private key). When to use: an agent signed a transaction locally and wants a high-availability broadcast path. Disabled by default; the operator enables it with RB_ENABLE_BROADCAST=1."
   }
  ]
 }
