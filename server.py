@@ -13,6 +13,7 @@ PORT = int(os.environ.get("RB_PORT", "8090"))
 BIND = os.environ.get("RB_BIND", "127.0.0.1")
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_INFO = {"name": "robotbase-mcp", "version": "0.10.0", "title": "RobotBase MCP — on-chain verification & risk intelligence for Web3 agents"}
+# 部署路径与端口一律由环境变量给出：仓库里不写我们自己那套内部布局。
 BTC_ENV = os.environ.get("RB_BTC_ENV", "")
 BTC_DASHBOARD = os.environ.get("RB_BTC_DASHBOARD", "http://127.0.0.1:8600")
 ZEC_BASE = os.environ.get("RB_ZEC_BASE", "http://127.0.0.1:8080")
@@ -749,6 +750,8 @@ def t_kas_pool_attribution_intel(hours=24):
     """Local Kaspa block->pool attribution index (we index every block ourselves)."""
     hours = max(1, min(24 * 30, int(hours or 24)))
     since = int(time.time()) - hours * 3600
+    if not KAS_BLOCK_DB:
+        return {"available": False, "reason": "no block index configured on this deployment (set RB_KAS_BLOCK_DB)"}
     try:
         con = sqlite3.connect("file:" + KAS_BLOCK_DB + "?mode=ro", uri=True)
         con.row_factory = sqlite3.Row
