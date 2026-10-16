@@ -1,8 +1,8 @@
 {
  "name": "robotbase-mcp",
  "title": "RobotBase MCP Server - on-chain verification & risk intelligence for Web3 agents",
- "version": "0.10.0",
- "description": "The semantic verification and risk-intelligence layer for Web3 agents, as one read-only MCP endpoint. Live: Bitcoin (fees, mempool state, tx/block/address verification, optional raw-tx relay), Ethereum (Reth execution + Lighthouse consensus state), Monero (node telemetry - no tx or wallet indexing) and Zcash (node state + all six shielded value pools + recent blocks). Risk intelligence as light aggregation over public datasets: TRON address risk, TRC-20 USDT settlement verification, Solana rug-pull screening and Base (EVM) contract honeypot/tax/backdoor screening. RobotBase publishes no RPC endpoint of any kind. Verification tools are free; risk tools include a daily free allowance with a prepaid API key above it.",
+ "version": "0.11.0",
+ "description": "The verification and risk-intelligence layer for Web3 agents, as one read-only MCP endpoint. Five chains are live, each read from mainnet nodes we run ourselves: Bitcoin (fees, mempool state with a fee-rate histogram and RBF/CPFP feasibility, tx/block/address verification, optional raw-tx relay); Ethereum (Reth execution + Lighthouse consensus, settlement checks with ERC-20 log decoding, fee market, blocks, event logs, account and contract reads); Monero (node telemetry, dynamic fees, mempool, blocks, transaction lookup, ring-size output distribution, and cryptographic tx-proof payment verification); Zcash (all six shielded pools, shielded commitment-tree anchors, transaction checks, network and funding-stream stats); and Tron (node status, blocks and history, transactions with TRC-20 decoding, account permissions, contract reads, chain economics, super representatives and governance proposals). Risk intelligence is light aggregation over public datasets: TRON address risk, TRC-20 USDT settlement verification, Solana rug-pull screening and Base (EVM) contract screening. RobotBase publishes no RPC endpoint of any kind. Verification tools are free; risk tools include a daily free allowance with a prepaid API key above it.",
  "homepage": "https://robotbase.cc/mcp",
  "transport": {
   "type": "streamable-http",
@@ -16,16 +16,11 @@
  },
  "auth": {
   "type": "none",
-  "optional": "X-API-Key header or ?key= raises the rate limit to 600/min per IP"
+  "optional": "X-API-Key header or ?key= raises rate limit to 600/min per IP"
  },
  "rateLimits": {
   "anonymous": "120/min per IP",
   "withApiKey": "600/min per IP"
- },
- "pricing": {
-  "verification_tools": "free",
-  "risk_tools": "5 free calls/day per IP, then a prepaid API key",
-  "top_up": "https://robotbase.cc/billing/pricing"
  },
  "tags": [
   "bitcoin",
@@ -51,6 +46,11 @@
   "mcp-server",
   "web3-agents"
  ],
+ "pricing": {
+  "verification_tools": "free",
+  "risk_tools": "5 free calls/day per IP, then a prepaid API key",
+  "top_up": "https://robotbase.cc/billing/pricing"
+ },
  "tools": [
   {
    "name": "list_chains",
@@ -94,7 +94,119 @@
   },
   {
    "name": "xmr_get_node_status",
-   "description": "Monero node state: height vs target, sync flag, difficulty, txpool size, database size, monerod version and peer counts. When to use: whether the XMR node is synced and healthy, or how big its chain and txpool are. Do not use: RobotBase does not index Monero transactions, wallets or ring signatures - a Monero payment cannot be verified or risk-scored from here. Returns: height, target_height, synced, status, network, difficulty, txpool_txs, database_size_gb, block_size_limit, version, incoming_connections / outgoing_connections."
+   "description": "Monero node state: height vs target, sync flag, difficulty, txpool size, database size, monerod version and peer counts. When to use: whether the XMR node is synced and healthy, or how big its chain and txpool are. Do not use: for fees call xmr_get_fee_rates; for one transaction call xmr_get_transaction; for network-wide numbers call xmr_get_network_stats. RobotBase does not index Monero wallets or ring signatures. Returns: height, target_height, synced, status, network, difficulty, txpool_txs, database_size_gb, block_size_limit, version, incoming_connections / outgoing_connections."
+  },
+  {
+   "name": "xmr_get_fee_rates",
+   "description": "Monero fee estimate per kB, split into ascending priority tiers, read from our own monerod. When to use: pricing an XMR transaction, or deciding whether to pay the baseline fee to land in the next block. Do not use: for Bitcoin fees (btc_get_fee_rates) or for mempool depth (xmr_get_mempool_state). Returns: baseline_fee_per_kb_xmr plus priority_tiers[] each with {priority, fee_per_kb_atomic, fee_per_kb_xmr}. Monero has no EIP-1559 style fee market: blocks are never full, so the baseline tier normally confirms next block."
+  },
+  {
+   "name": "xmr_get_mempool_state",
+   "description": "Monero mempool: pending transaction count, total bytes and fees, age of the oldest pending tx, double-spend/failing counts. When to use: is the network quiet or piling up, and roughly how long a new transaction waits. Do not use: for fees (xmr_get_fee_rates) or for a specific payment (xmr_get_transaction). Returns: pending_txs, bytes_total, fee_total_xmr, oldest_pending_age_s, double_spends, failing, tx_size_median_bytes, congestion verdict."
+  },
+  {
+   "name": "xmr_get_block",
+   "description": "One Monero block header, by height or by block hash. When to use: confirming which block a transaction landed in, or inspecting reward, difficulty and weight of a block. Do not use: to list recent blocks (xmr_get_recent_blocks) or to look up a transaction (xmr_get_transaction). Returns: height, hash, prev_hash, timestamp, age_s, tx_count, reward_xmr, difficulty, block_weight, block_size_bytes, major_version / minor_version, orphan."
+  },
+  {
+   "name": "xmr_get_recent_blocks",
+   "description": "The most recent Monero blocks with the observed block interval. When to use: checking that XMR is producing blocks normally and at roughly the 120s target. Do not use: for one specific block (xmr_get_block). Returns: tip_height, avg_block_interval_s, target_interval_s, blocks[] {height, hash, timestamp, tx_count, reward_xmr, difficulty, weight}."
+  },
+  {
+   "name": "xmr_get_transaction",
+   "description": "Look up one Monero transaction by txid: is it mined, in which block, how many confirmations, its size, output count and ring size. When to use: did this XMR transfer get into a block, and how deep is it now. Do not use: to learn the amount or the sender/recipient - Monero hides those by design and no third party can recover them; only the recipient (or a holder of the tx key) can prove a payment. Returns: found, confirmed, in_mempool, block_height, block_timestamp, confirmations, double_spend_seen, size_bytes, inputs, outputs, ring_size_per_input, tx_version, unlock_time, and explicitly the list of fields not disclosed by the protocol."
+  },
+  {
+   "name": "xmr_get_network_stats",
+   "description": "Monero network-wide state: network hashrate, difficulty, emission and fees over the last 720 blocks, protocol version and the next hard fork. When to use: macro questions about the Monero network - how much hashrate secures it, what is being issued, and which protocol version is active. Do not use: for our node's own health (xmr_get_node_status). Returns: height, network_hashrate_hs, difficulty, block_size/weight median and limit, emission_last_720_blocks_xmr, fees_last_720_blocks_xmr, hard_fork_version, next_fork_earliest_height, client_version."
+  },
+  {
+   "name": "xmr_verify_payment",
+   "description": "Verify one Monero payment cryptographically, using proof material only the recipient can provide. Give it a txid plus either the transaction key (from your own wallet: get_tx_key <txid>) or a transaction proof signature (get_tx_proof), and it returns whether that transaction really pays the given address, for how much, and how many confirmations. When to use: a merchant or agent needs to confirm an XMR payment arrived before releasing value, without trusting a block explorer - and for Monero there is no other way, because amounts and both counterparties are hidden by the protocol. Do not use: to discover payments you cannot already prove (RobotBase does not index Monero wallets, and no third party can enumerate your incoming payments), or for TRC-20 USDT settlement (that is tron_verify_usdt_transfer). Returns: verified, confirmations, received_xmr, received_atomic, in_pool. Neither the tx key nor the proof can be used to spend funds or to scan other payments."
+  },
+  {
+   "name": "btc_get_network_stats",
+   "description": "Bitcoin network and node state: difficulty, network hashrate, total transactions processed and the current tx/s rate, protocol version, peer connections, relay fee, mempool size, uptime and which indexes (txindex) are synced on our node. When to use: macro questions about Bitcoin - how much hashrate secures it, how fast the chain is moving, or whether our node's indexes are complete. Do not use: for fees (btc_get_fee_rates) or mempool depth (btc_get_mempool_state). Returns: difficulty, network_hashrate_hs, chain_tx_count_total, tx_rate_per_s, client, connections, relay_fee_btc_kvb, uptime_s, indexes{}."
+  },
+  {
+   "name": "eth_get_block",
+   "description": "One Ethereum block by number, tag (latest/finalized/safe) or hash: timestamp, transaction count, gas used against the limit, base fee, block builder and size. When to use: block-level context - how full is Ethereum right now, when a block was produced, what the base fee was, or which builder produced it. Do not use: for a transaction (eth_get_transaction) or for fees across blocks (eth_get_fee_rates). Returns: found, number, hash, parent_hash, timestamp, age_s, tx_count, gas_used, gas_limit, gas_used_pct, base_fee_gwei, miner, size_bytes."
+  },
+  {
+   "name": "eth_get_logs",
+   "description": "Ethereum event logs over a block range, optionally filtered by contract address and event signature, with ERC-20 Transfer logs decoded (token, from, to, amount). When to use: find transfers or contract events in a window - 'who moved this token in the last N blocks', or watch a contract's activity without an indexer. Do not use: for a single transaction (eth_get_transaction) or to scan huge ranges (max 1000 blocks per call, results truncated with a flag). Returns: filter, matched, returned, truncated, logs[] with block_number, tx_hash, address, topics, data and a decoded block for ERC-20 Transfers."
+  },
+  {
+   "name": "xmr_get_output_distribution",
+   "description": "Monero output distribution: how many spendable outputs fall into each ring-size bucket, read from our own monerod. This is the anonymity-set side of Monero that free explorers rarely expose. When to use: reasoning about Monero privacy - how large the spendable-output set is at a given height. Do not use: to guess a 'privacy score' (we return raw counts only). Boundary: monerod's distribution data lags the chain tip by roughly 5,000 blocks, so the default range is 5,010 to 5,000 blocks back and the response states the real height and the lag. Returns: tip_height, queried_range, data_lags_tip_by_blocks, start_height, outputs_before_start, distribution[] with the raw per-bucket counts."
+  },
+  {
+   "name": "zec_get_treestate",
+   "description": "Zcash shielded commitment-tree state: the Sapling, Orchard and Ironwood anchor roots at a given block. When to use: shielded-pool depth - how the shielded sets advance over time, or the anchor a wallet or prover needs to recognise. Do not use: for pool supplies (zec_get_pool_status) or a transaction (zec_get_transaction). Returns: block_hash, height, time, pools{sapling, orchard, ironwood}{final_root, final_state}."
+  },
+  {
+   "name": "zec_get_network_stats",
+   "description": "Zcash network and node state: mempool size and bytes, node version, difficulty, network hashrate, chain progress and disk, block subsidy, and the funding streams (including Zcash Community Grants). When to use: macro questions about Zcash - how much hashrate secures it, whether our node is caught up, what the block subsidy and funding allocations currently are. Do not use: for shielded-pool supplies (zec_get_pool_status) or our node's own sync state (zec_get_pool_status / chain_status). Returns: mempool, network, difficulty, network_hashrate_hs, blockchain, height, verification_progress, size_on_disk_gb, block_reward_zec, funding_streams[], lockbox_streams[]."
+  },
+  {
+   "name": "tron_list_proposals",
+   "description": "Tron governance proposals: id, proposer, state, approvals, expiry and the parameters they would change. When to use: governance or staking questions, or checking whether a chain-parameter change is pending. Do not use: for the current parameter values (tron_get_chain_economics) or the witness list (tron_list_witnesses). Returns: total_proposals, by_state{}, top_by_approvals[] with proposal_id, proposer, approvals, state, parameters{}."
+  },
+  {
+   "name": "eth_get_transaction",
+   "description": "Ethereum transaction check by hash: success or reverted, gas used, fee paid, confirmations, whether the block is finalized, and any ERC-20 transfers decoded from the receipt logs (token, from, to, amount). When to use: did this ETH or ERC-20 payment actually settle, is it irreversible, who paid whom and how much. Do not use: for fee estimation (eth_get_fee_rates) or for Tron (tron_get_transaction). Returns: found, status, block_number, from, to, value_eth, gas_used, fee_eth, confirmations, finalized, erc20_transfers[]. A miss is reported as absent from *our* node only - never as proof of non-existence."
+  },
+  {
+   "name": "eth_get_fee_rates",
+   "description": "Ethereum fee market from our own Reth node: current and next base fee, priority-fee percentiles over the last blocks, and the estimated ETH cost of a plain transfer and of an ERC-20 transfer. When to use: pricing an Ethereum transaction, or deciding what tip gets included quickly. Do not use: for Bitcoin (btc_get_fee_rates), Monero (xmr_get_fee_rates) or Tron (tron_get_chain_economics). Returns: base_fee_gwei, next_base_fee_gwei, base_fee_last_blocks_gwei, priority_percentiles_gwei, estimated_cost{simple_eth_transfer_21000_gas_eth, erc20_transfer_65000_gas_eth}."
+  },
+  {
+   "name": "eth_get_account",
+   "description": "Ethereum account state from our own node: ETH balance, nonce, and whether the address is a contract. When to use: balance and account type before sizing a transfer, or telling an EOA from a contract. Do not use: for ERC-20 token balances (eth_read_contract with balanceOf) or address risk scoring. Returns: address, balance_eth, nonce, is_contract, code_size_bytes."
+  },
+  {
+   "name": "eth_read_contract",
+   "description": "Read-only (eth_call) against any Ethereum contract, executed by our own Reth node. ERC-20 helpers balanceOf / allowance / decimals / symbol / name / totalSupply are built in; any other function can be called by passing its 4-byte `selector` plus ABI-encoded `parameter`. Nothing is signed or written. When to use: an agent needs an on-chain value without trusting a third-party API - a USDT/USDC balance, token decimals, an allowance, or any view function. Do not use: to send a transaction (this never writes), or for a historical balance. Returns: ok, contract, function, selector, output_type, value, value_human for known-decimals tokens."
+  },
+  {
+   "name": "zec_get_transaction",
+   "description": "Zcash transaction check by txid from our own Zebra node: confirmations, block height and time, whether it is in the active chain, size, and how much of it is transparent versus shielded. When to use: did this ZEC payment land, how deep is it, and does it involve shielded inputs/outputs. Do not use: to learn shielded amounts or parties - shielded values are hidden by the protocol and only a viewing key held by a party to the transaction can read them; this tool reports the shielded *shape* (spend/output/action counts) and says so explicitly rather than guessing. Returns: found, confirmations, block_height, block_hash, block_time, in_active_chain, size_bytes, transparent{inputs, outputs, total_output_zec}, shielded{sapling_spends, sapling_outputs, orchard_actions}, has_shielded_component, not_disclosed_by_protocol[]."
+  },
+  {
+   "name": "tron_get_node_status",
+   "description": "TRON node state from our own java-tron full node: tip height, finalized (solidity) height and how far solidity lags, peers, client version, transactions in the tip block. When to use: is the TRON node we operate synced and healthy, and how far behind is the finalized state. Do not use: for historical blocks or transactions - this is a lite full node and those APIs are closed. Returns: height, solidity_height, solidity_lag_blocks, age_s, tx_in_tip_block, peer_count, client_version."
+  },
+  {
+   "name": "tron_get_block",
+   "description": "One Tron block by height or block id, read from our own node: producer, timestamp, transaction count split by contract type, and the tx ids in it. When to use: inspect a specific block, or confirm which block a transaction landed in. Do not use: for the tip only (tron_get_current_block) or for a transaction itself (tron_get_transaction). Boundary: our Tron node is a lite full node that keeps only a recent window (~6 days). An empty result means 'outside our window', NOT 'the block does not exist'. Returns: found, number, block_id, parent_hash, timestamp_ms, tx_count, tx_by_type, producer_address, tx_ids, retention_window."
+  },
+  {
+   "name": "tron_get_transaction",
+   "description": "One Tron transaction by txid: success or reverted, energy used, the call it made, and - this is the important part - any TRC-20 transfers decoded from the receipt logs (token, from, to, amount). When to use: did this USDT payment really land, for how much, from whom, and is it finalized. Do not use: for address risk scoring (tron_check_address_risk) or for blocks (tron_get_block). Boundary: our node is a lite full node with a recent window (~6 days); an empty result means 'outside our window', NOT 'the payment did not arrive' - fall back to an indexer before saying a payment is missing. Returns: found, block_number, status, contract_type, owner/to/contract_address, amount_trx, trc20_transfers[], energy_used, confirmations, finalized, retention_window."
+  },
+  {
+   "name": "tron_get_current_block",
+   "description": "The current (tip) TRON block: number, id, parent, timestamp, transaction count and a breakdown by contract type, plus the producing witness. When to use: how busy TRON is right now, what is in the block being produced, who produced it. Do not use: to fetch an older block - a lite full node serves the tip only, historical blocks are closed. Returns: number, block_id, parent_hash, timestamp_ms, age_s, tx_count, tx_by_type, producer_address."
+  },
+  {
+   "name": "tron_get_account",
+   "description": "TRON account state read straight off our own node: TRX balance, whether the account is activated, energy and bandwidth (used / limit), whether it is a witness, and account age. When to use: TRX balance and resource state before sizing a transfer, or checking whether an address exists on chain. Do not use: for USDT/TRC-20 token balances (use tron_read_contract with balanceOf) or for address risk scoring (that is tron_check_address_risk). Returns: found, address, trx_balance, name, created_ms, last_operation_ms, is_witness, has_code, energy, bandwidth."
+  },
+  {
+   "name": "tron_get_contract",
+   "description": "TRON contract metadata: name, creator, whether its ABI is published on chain, the function list, code hash and whether it looks like a TRC-20. When to use: before calling a contract, or to tell an unverified contract from a published one. Do not use: for risk/backdoor analysis (that is tron_check_address_risk and, on EVM, base_check_contract_risk). Returns: found, address, name, creator, has_abi, abi_entry_count, is_trc20, functions, code_hash."
+  },
+  {
+   "name": "tron_read_contract",
+   "description": "Read-only (constant) call against any TRON contract, executed by our own node. TRC-20 helpers balanceOf / allowance / decimals / symbol / name / totalSupply are built in; any other function can be called with a raw selector plus ABI-encoded parameter. No state is changed and no key is involved. When to use: an agent needs an on-chain value without trusting a third-party API - USDT balance of an address, token decimals, an allowance, or any view function. Do not use: to send a transaction (this never writes), or to look up a historical balance. Returns: ok, contract, function, output_type, value (decoded), value_human for 6-decimal tokens, raw, energy_used."
+  },
+  {
+   "name": "tron_get_chain_economics",
+   "description": "TRON chain economics straight off our node: energy price (sun per energy unit), transaction fee, account creation fee, witness pay per block, total energy and bandwidth limits, maintenance interval and the next maintenance time, unfreeze delay. When to use: working out what a transaction will actually cost in TRX, or how TRON's resource market is currently priced. Do not use: for Bitcoin fees (btc_get_fee_rates) or Monero fees (xmr_get_fee_rates). Returns: energy_fee_sun_per_unit, transaction_fee_sun, create_account_fee_trx, witness_pay_per_block_trx, maintenance_interval_s, next_maintenance_ms, unfreeze_delay_days, latest_energy_price."
+  },
+  {
+   "name": "tron_list_witnesses",
+   "description": "TRON super representatives and candidates: who is producing blocks, how many they produced, how many they missed, votes and websites - read from our own node. When to use: governance or staking questions about TRON, or checking the health of block production. Do not use: for account balances (tron_get_account). Returns: registered_witnesses, active_block_producers, top_by_blocks_produced[] with address, url, blocks_produced, blocks_missed, votes, in_active_set."
   },
   {
    "name": "broadcast_raw_transaction",
@@ -110,7 +222,7 @@
   },
   {
    "name": "tron_verify_usdt_transfer",
-   "description": "TRC-20 USDT settlement check by transaction id: did it land, is it irreversible, how much, from and to whom. When to use: an agent or a merchant must confirm a USDT payment before releasing value - this is the settlement check that closes an automated trade loop. Do not use: to assess the counterparty (that is tron_check_address_risk). Returns: found, status (SUCCESS|FAILED), finalized (present on the solidity/irreversible chain), confirmations, blocks_until_finality, block_number, block_time_utc, amount_usdt, from, to, fee_trx, checks {}, verified and a plain-language verdict. Pass expected_to / expected_amount_usdt to have the recipient and amount matched for you. Metered: 5 free calls per day per IP, unlimited with an API key."
+   "description": "TRC-20 USDT settlement check by transaction id: did it land, is it irreversible, how much, from and to whom. When to use: an agent or a merchant must confirm a USDT payment before releasing value - this is the settlement check that closes an automated trade loop. Do not use: to assess the counterparty (that is tron_check_address_risk). Data source: our own java-tron full node when the transaction is inside its ~6 day retention window (sub-second, no third party); it falls back to TronGrid automatically for older transactions, and says which one answered in `source`. A local miss is never reported as 'not found' by itself. Returns: found, status (SUCCESS|FAILED), finalized (present on the solidity/irreversible chain), confirmations, blocks_until_finality, block_number, block_time_utc, amount_usdt, from, to, fee_trx, checks {}, verified and a plain-language verdict. Pass expected_to / expected_amount_usdt to have the recipient and amount matched for you. Metered: 5 free calls per day per IP, unlimited with an API key."
   },
   {
    "name": "sol_check_token_safety",
