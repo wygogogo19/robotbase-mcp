@@ -6,7 +6,7 @@
 
 Live today: **Bitcoin · Ethereum · Monero · Zcash**. Provisioning: **Solana · Base · Tron**.
 
-[![Tools](https://img.shields.io/badge/tools-33-brightgreen)](https://robotbase.cc/mcp/tools)
+[![Tools](https://img.shields.io/badge/tools-38-brightgreen)](https://robotbase.cc/mcp/tools)
 [![Protocol](https://img.shields.io/badge/MCP-2025--06--18-blue)](https://modelcontextprotocol.io)
 [![Transport](https://img.shields.io/badge/transport-streamable--http-orange)](https://robotbase.cc/mcp)
 [![Glama](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp/badges/score.svg)](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp)
@@ -22,7 +22,7 @@ Listed in the **official MCP Registry** as `io.github.wygogogo19/robotbase-mcp` 
 
 An autonomous agent handling crypto has exactly two blocking questions: **did this payment actually settle**, and **what will the next one cost**. Ask an LLM those today and it has nowhere reliable to look — the MCP ecosystem is rich in wrappers around hosted indexers and thin on self-run infrastructure.
 
-This server answers both with **33 strictly read-only tools** (29 free verification tools + 4 metered risk tools) backed by our own full nodes and local indexes: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, a full Monero surface (`xmr_get_fee_rates`, `xmr_get_transaction`, `xmr_verify_payment`, …) read straight off our own monerod, and a Tron surface (`tron_read_contract`, `tron_get_transaction`) executed by our own java-tron node.
+This server answers both with **38 strictly read-only tools** (34 free verification tools + 4 metered risk tools) backed by our own full nodes and local indexes: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, a full Monero surface (`xmr_get_fee_rates`, `xmr_get_transaction`, `xmr_verify_payment`, …) read straight off our own monerod, an Ethereum surface (`eth_get_transaction`, `eth_get_fee_rates`, `eth_read_contract`) on our own Reth node, and a Tron surface (`tron_read_contract`, `tron_get_transaction`) on our own java-tron node.
 
 ## Pricing
 
@@ -54,7 +54,7 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
        "params":{"name":"btc_get_fee_rates","arguments":{}}}'
 ```
 
-## Tools (33)
+## Tools (38)
 
 | Tool | What it does | Typical question |
 |---|---|---|
@@ -69,6 +69,11 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
 | `btc_get_address(address)` | Balance, UTXOs, tx count, recent txs (P2PKH/P2SH/bech32/bech32m) | "How much BTC is in this address?" |
 | `zec_get_pool_status` | Zcash node state **plus all six value pools** (transparent/sprout/sapling/orchard/ironwood/lockbox) with 1h/24h deltas | "How much ZEC is shielded, and is it growing?" |
 | `zec_get_recent_blocks(n)` | Recent Zcash blocks | "Are ZEC blocks healthy?" |
+| `zec_get_transaction(txid)` | ZEC transaction: confirmations, block, active-chain, and how much is transparent vs shielded. Shielded amounts/parties are reported as **not disclosed by the protocol** | "Did this ZEC payment land?" |
+| `eth_get_transaction(txid)` | ETH transaction: status, gas, fee, confirmations, finalized, and **ERC-20 transfers decoded from the receipt logs** with the token's own decimals resolved | "Did this ETH or USDT/USDC payment settle?" |
+| `eth_get_fee_rates` | Base fee (now and next), priority-fee percentiles, and cost estimates for a plain and an ERC-20 transfer | "What will my Ethereum transaction cost?" |
+| `eth_get_account(address)` | ETH balance, nonce, and whether the address is a contract | "Is this an EOA or a contract?" |
+| `eth_read_contract(contract, function, argument?)` | Read-only `eth_call` on our own Reth node: `balanceOf`, `allowance`, `decimals`, `symbol`, `name`, `totalSupply`, or any raw selector | "What is this address's USDT balance?" |
 | `xmr_get_node_status` | Monero node: true last-block height, sync flag, difficulty, txpool, database size, monerod version, peers | "Is the Monero node synced?" |
 | `xmr_get_fee_rates` | Fee estimate per kB across ascending priority tiers, read from our own node | "What fee will my XMR transaction need?" |
 | `xmr_get_mempool_state` | Pending tx count, total bytes and fees, age of the oldest pending tx, double-spend/failing counts | "Is Monero congested right now?" |
