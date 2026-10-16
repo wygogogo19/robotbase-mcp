@@ -95,7 +95,7 @@ Four tools answer what a free block explorer cannot. They are aggregation over p
 | Tool | What it does | Typical question |
 |---|---|---|
 | `tron_check_address_risk(address)` | TRC-20 counterparty screening: judicial / black-market / mixer / phishing labels, account activation and age, 0-100 safety score, plus an explicit `not_covered` list | "Is it safe to accept USDT from this address?" |
-| `tron_verify_usdt_transfer(txid, expected_to?, expected_amount_usdt?)` | USDT settlement check: finalized on the solidity chain, confirmations, amount, sender, recipient, matched against what you expect | "Did this USDT payment land, irreversibly, for the right amount?" |
+| `tron_verify_usdt_transfer(txid, expected_to?, expected_amount_usdt?)` | USDT settlement check: finalized on the solidity chain, confirmations, amount, sender, recipient, matched against what you expect. Reads **our own Tron node** inside its ~6 day window (sub-second, no third party) and falls back to TronGrid for older transactions — `source` says which answered, and a local miss is never reported as "not found" | "Did this USDT payment land, irreversibly, for the right amount?" |
 | `sol_check_token_safety(mint)` | Solana rug screen: mint authority, freeze authority, liquidity-lock percentage, top-10 concentration, transfer fee / hook | "Is this token a rug before my agent buys it?" |
 | `base_check_contract_risk(contract)` | Base (EVM) screen: honeypot / cannot-sell, buy & sell tax, verified source, upgradeable proxy, hidden owner, balance-rewrite, pausable transfers, mintable supply, selfdestruct, blacklist, LP lock, top-10 concentration | "Can this Base token be sold, and what does the exit cost?" |
 
