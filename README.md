@@ -6,7 +6,7 @@
 
 Live today: **Bitcoin · Ethereum · Monero · Zcash**. Provisioning: **Solana · Base · Tron**.
 
-[![Tools](https://img.shields.io/badge/tools-30-brightgreen)](https://robotbase.cc/mcp/tools)
+[![Tools](https://img.shields.io/badge/tools-31-brightgreen)](https://robotbase.cc/mcp/tools)
 [![Protocol](https://img.shields.io/badge/MCP-2025--06--18-blue)](https://modelcontextprotocol.io)
 [![Transport](https://img.shields.io/badge/transport-streamable--http-orange)](https://robotbase.cc/mcp)
 [![Glama](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp/badges/score.svg)](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp)
@@ -22,7 +22,7 @@ Listed in the **official MCP Registry** as `io.github.wygogogo19/robotbase-mcp` 
 
 An autonomous agent handling crypto has exactly two blocking questions: **did this payment actually settle**, and **what will the next one cost**. Ask an LLM those today and it has nowhere reliable to look — the MCP ecosystem is rich in wrappers around hosted indexers and thin on self-run infrastructure.
 
-This server answers both with **30 strictly read-only tools** (26 free verification tools + 4 metered risk tools) backed by our own full nodes and local indexes: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, a full Monero surface (`xmr_get_fee_rates`, `xmr_get_transaction`, `xmr_get_recent_blocks`, …) read straight off our own monerod, and read-only contract calls on Tron (`tron_read_contract`) executed by our own java-tron node.
+This server answers both with **31 strictly read-only tools** (27 free verification tools + 4 metered risk tools) backed by our own full nodes and local indexes: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, a full Monero surface (`xmr_get_fee_rates`, `xmr_get_transaction`, `xmr_verify_payment`, …) read straight off our own monerod, and read-only contract calls on Tron (`tron_read_contract`) executed by our own java-tron node.
 
 ## Pricing
 
@@ -54,7 +54,7 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
        "params":{"name":"btc_get_fee_rates","arguments":{}}}'
 ```
 
-## Tools (30)
+## Tools (31)
 
 | Tool | What it does | Typical question |
 |---|---|---|
@@ -76,6 +76,7 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
 | `xmr_get_recent_blocks(n)` | Recent blocks plus the observed block interval vs the 120s target | "Are XMR blocks healthy?" |
 | `xmr_get_transaction(txid)` | Is this txid mined, which block, confirmations, size, outputs, ring size. Amount/sender/recipient are reported as **not disclosed by the protocol** — Monero hides them by design and no third party can recover them | "Did my XMR transfer get mined?" |
 | `xmr_get_network_stats` | Network hashrate, difficulty, emission and fees over the last 720 blocks, protocol version, next hard fork | "How much hashrate secures Monero?" |
+| `xmr_verify_payment(txid, address, tx_key\|signature)` | **Cryptographic Monero payment verification**: give it a txid plus the transaction key (`get_tx_key`) or a tx proof (`get_tx_proof`) from your own wallet and it verifies the transaction really pays that address, for how much, with how many confirmations. Runs on RobotBase's own monero-wallet-rpc instance (separate service, separate credentials, empty wallet — no funds, no receiving keys) | "Did this XMR payment actually arrive?" |
 | `broadcast_raw_transaction` | Relay an already-signed BTC transaction through our own node (testmempoolaccept first; operator-gated) | "Broadcast this signed tx for me" |
 | `tron_get_node_status` | Tron node: tip height, finalized (solidity) height and lag, peers, client version, txs in the tip block | "Is the Tron node synced?" |
 | `tron_get_current_block` | The block being produced: number, id, timestamp, tx count by contract type, producing witness | "How busy is Tron right now?" |
