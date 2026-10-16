@@ -630,6 +630,10 @@ def usage_hourly(hours=24):
 
 
 def verify_key(key):
+    """**已停用**（2026-10-16）：robotbase.cc 不再发放任何 API key，付费只走 x402。
+
+    保留本函数与 `billing.db` 的读取仅为兼容历史部署；自托管时可整段删除。
+    """
     if not key or not _has_billing():
         return "anon"
     try:
@@ -889,7 +893,8 @@ def t_rvn_asset_lookup(asset=None, limit=20):
 # ============== 2026-10-14 P1：风险情报工具（计量计费，轻量聚合）==================
 # 用户指令：P1 主打「高价值风控工具 + 轻量聚合」，不做通用 RPC 转发。
 # 数据源一律是公开聚合接口（GoPlus Labs + TronGrid），只读、不接触私钥、不托管资金。
-# 计费：每个 IP 每天 5 次免费；带 X-API-Key 的用户不受此限（Key 由网关的 billing 服务发放）。
+# 计费：每个 IP 每天 5 次免费；2026-10-16 起不再有 API key 档，付费只走 x402（见 x402_pay。
+# 本仓库是自托管参考实现，不含结算层：超出免费额度就回 Payment Required）。
 RISK_TOOLS = ("tron_check_address_risk", "tron_verify_usdt_transfer", "sol_check_token_safety",
               "base_check_contract_risk")
 RISK_FREE_PER_DAY = 5
@@ -899,7 +904,7 @@ TRONGRID_BASE = os.environ.get("RB_TRONGRID_BASE", "https://api.trongrid.io")
 USDT_TRC20_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 USDT_DECIMALS = 6
 TRON_FINALITY_BLOCKS = 19          # 波场 SR 共识的不可逆深度（约 57 秒）
-TOPUP_URL = "https://robotbase.cc/billing/pricing"
+TOPUP_URL = "https://robotbase.cc/#pricing"
 
 _REQ = threading.local()
 
@@ -926,7 +931,7 @@ def init_risk_db():
     con.execute("""CREATE TABLE IF NOT EXISTS risk_quota(
         day TEXT NOT NULL, ip_hash TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(day, ip_hash))""")
-    # P2: 按 Key 计数（/billing/v1/usage 的用量看板数据源），只存 key 的 SHA256，不存明文。
+    # 历史遗留：P2 时代按 API key 计数。2026-10-16 起不再发放任何 API key，这张表只读不写。
     con.execute("""CREATE TABLE IF NOT EXISTS key_usage(
         day TEXT NOT NULL, key_hash TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(day, key_hash))""")
@@ -934,40 +939,11 @@ def init_risk_db():
     con.close()
 
 
-def _key_hash():
-    k = getattr(_REQ, "key", "") or ""
-    return hashlib.sha256(k.encode()).hexdigest() if k else ""
-
-
-def _count_key_call():
-    """带 Key 的调用计一次数，返回今天该 Key 的累计次数。"""
-    kh = _key_hash()
-    if not kh:
-        return None
-    d = _bj_day()
-    con = _db(RISK_DB)
-    try:
-        con.execute("INSERT INTO key_usage(day,key_hash,used) VALUES(?,?,1) "
-                    "ON CONFLICT(day,key_hash) DO UPDATE SET used=used+1", (d, kh))
-        con.commit()
-        row = con.execute("SELECT used FROM key_usage WHERE day=? AND key_hash=?", (d, kh)).fetchone()
-        return row["used"] if row else None
-    finally:
-        con.close()
-
-
-def _key_meter():
-    used = _count_key_call()
-    return {"api_key": {"recognized": True, "unlimited": True,
-                        "calls_today": used,
-                        "resets": "00:00 Asia/Shanghai",
-                        "usage_endpoint": "https://robotbase.cc/billing/v1/usage (pass your key)"}}
-
-
 def _risk_quota(consume=True):
-    """返回 (allowed, used, limit)。API-key 用户 limit=-1 表示不限量。"""
-    if _client_plan() == "key":
-        return True, 0, -1
+    """返回 (allowed, used, limit)：按 IP 的每日免费额度。
+
+    2026-10-16：不再有 API key 档，额度只按 IP 记；付费只走 x402（托管版由信用余额接管）。
+    """
     h = hashlib.sha256(_client_ip().encode()).hexdigest()[:16]
     d = _bj_day()
     con = _db(RISK_DB)
@@ -995,18 +971,19 @@ def _risk_gate():
     allowed, used, limit = _risk_quota(False)
     if not allowed:
         raise PaymentRequired(
-            "Payment Required: Upgrade or Top-up with USDT to get an API Key. "
-            "The free allowance for RobotBase risk tools is %d calls/day per IP and is used up for "
-            "today (Beijing time, resets 00:00 Asia/Shanghai). Top up at %s and send the key back as "
-            "the X-API-Key header on this same endpoint." % (limit, TOPUP_URL))
+            "Payment Required. The free allowance for RobotBase risk tools is %d calls/day per IP and "
+            "is used up for today (Beijing time, resets 00:00 Asia/Shanghai). There is no API key: the "
+            "hosted paid tier is x402 machine payment in USDC (%s). Self-hosting instead? Raise "
+            "RISK_FREE_PER_DAY." % (limit, TOPUP_URL))
     return _meter_payload(used, limit, pending=True)
 
 
 def _meter_payload(used, limit, pending=False):
     if limit < 0:
-        return {"free_tier": {"unlimited_with_api_key": True}}
+        return {"x402": {"paid": True, "metered_by": "x402 credit balance"}}
     payload = {"free_tier": {"used_today": used, "limit_per_day": limit,
-                             "resets": "00:00 Asia/Shanghai", "unlimited_with_api_key": True}}
+                             "resets": "00:00 Asia/Shanghai",
+                             "more_calls_via": "x402 USDC payment - there is no API key"}}
     if pending:
         payload["free_tier"]["remaining_today"] = max(0, limit - used)
     return payload
@@ -1669,7 +1646,8 @@ TOOLS = [    ("list_chains",
      "Returns: risk_level (low|medium|high|unknown), safety_score, hit_flags (sanctioned / money_laundering / "
      "mixer / cybercrime / phishing / blacklist_doubt ...), malicious_contracts_created, account {activated, "
      "age_days, balance_trx, is_contract, trc20_holdings}, not_covered[] and a disclaimer. "
-     "Metered: 5 free calls per day per IP, unlimited with an API key.",
+     "Metered: 5 free calls per day per IP, then 0.01 USDC per call over x402. There is no API key: "
+     "the 402 answer carries the machine-readable terms in structuredContent.accepts[].",
      {"type": "object", "properties": {"address": {"type": "string",
                                                    "description": "TRON base58 address (T...)"}},
       "required": ["address"], "additionalProperties": False},
@@ -1683,7 +1661,8 @@ TOOLS = [    ("list_chains",
      "confirmations, blocks_until_finality, block_number, block_time_utc, amount_usdt, from, to, fee_trx, "
      "checks {}, verified and a plain-language verdict. Pass expected_to / expected_amount_usdt to have the "
      "recipient and amount matched for you. "
-     "Metered: 5 free calls per day per IP, unlimited with an API key.",
+     "Metered: 5 free calls per day per IP, then 0.01 USDC per call over x402. There is no API key: "
+     "the 402 answer carries the machine-readable terms in structuredContent.accepts[].",
      {"type": "object", "properties": {"txid": {"type": "string", "description": "TRON transaction id (64 hex chars)"},
                                        "expected_to": {"type": "string", "description": "Optional: the recipient you expect"},
                                        "expected_amount_usdt": {"type": "number", "description": "Optional: the USDT amount you expect"}},
@@ -1698,7 +1677,8 @@ TOOLS = [    ("list_chains",
      "Returns: risk_level (low|medium|high), safety_score, mint_authority_revoked, freeze_authority_revoked, "
      "lp_locked_pct, lp_holder_pct, top10_holder_pct, holder_count, transfer_fee / transfer_hook presence, "
      "warnings[], not_covered[] and a disclaimer. "
-     "Metered: 5 free calls per day per IP, unlimited with an API key.",
+     "Metered: 5 free calls per day per IP, then 0.01 USDC per call over x402. There is no API key: "
+     "the 402 answer carries the machine-readable terms in structuredContent.accepts[].",
      {"type": "object", "properties": {"mint": {"type": "string", "description": "Solana token mint address (base58)"}},
       "required": ["mint"], "additionalProperties": False},
      lambda a: t_sol_check_token_safety(a.get("mint"))),
@@ -1714,7 +1694,8 @@ TOOLS = [    ("list_chains",
      "sell_tax_pct, is_open_source, is_proxy, is_mintable, owner_change_balance, hidden_owner, "
      "can_take_back_ownership, transfer_pausable, selfdestruct, holder_count, top10_holder_pct, "
      "lp_locked_pct, dex pairs, warnings[], not_covered[] and a disclaimer. "
-     "Metered: 5 free calls per day per IP, unlimited with an API key.",
+     "Metered: 5 free calls per day per IP, then 0.01 USDC per call over x402. There is no API key: "
+     "the 402 answer carries the machine-readable terms in structuredContent.accepts[].",
      {"type": "object", "properties": {"contract": {"type": "string",
                                                     "description": "Base ERC-20 contract address (0x...)"}},
       "required": ["contract"], "additionalProperties": False},
@@ -1730,18 +1711,8 @@ def call_tool(name, args):
     for n, _d, _s, fn in TOOLS:
         if n == name:
             if n not in RISK_TOOLS:
-                if _client_plan() == "key":
-                    _count_key_call()
                 return fn(args or {})
             gate = _risk_gate()                      # 额度用尽则抛 PaymentRequired，不消耗上游
-            if _client_plan() == "key":
-                out = fn(args or {})
-                meter = _key_meter()
-                if isinstance(out, dict):
-                    out["_metering"] = meter
-                else:
-                    out = {"result": out, "_metering": meter}
-                return out
             tier = gate.get("free_tier") or {}
             used_before, limit = tier.get("used_today", 0), tier.get("limit_per_day", -1)
             out = fn(args or {})
@@ -1774,9 +1745,11 @@ def handle(msg):
                              "tron_verify_usdt_transfer before releasing value; sol_check_token_safety "
                              "screens a Solana mint before a trade; base_check_contract_risk screens a Base "
                              "ERC-20 before touching it (honeypot, taxes, verified source, backdoors). "
-                             "Those four risk tools are metered (free daily allowance per IP, then an API "
-                             "key; every answer carries its own _metering block, and a key holder can read "
-                             "usage at https://robotbase.cc/billing/v1/usage).")}}
+                             "Those four risk tools are metered: a free daily allowance per IP, then 0.01 "
+                             "USDC per call paid over x402 by the caller's own wallet - there is no API "
+                             "key, no account and no subscription of any kind. When the allowance runs "
+                             "out the tool answers Payment Required, and every answer carries its own "
+                             "_metering block.")}}
     if method == "notifications/initialized" or mid is None:
         return None
     if method == "ping":
@@ -1886,10 +1859,10 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
 <h2>Rate limits and privacy</h2>
 <div class="card"><div class="grid">
 <div><div class="muted">Verification tools</div><div><b>Free</b> - no key, no signup</div></div>
-<div><div class="muted">Risk tools</div><div><b>5 free/day per IP</b>, then a prepaid API key</div></div>
-<div><div class="muted">Pricing</div><div><b>Free</b> during the pioneer beta - a prepaid API-key tier follows</div></div>
+<div><div class="muted">Risk tools</div><div><b>5 free/day per IP</b>, then <b>$0.01</b> per call by x402</div></div>
+<div><div class="muted">Payment</div><div>USDC on Base or Solana, from your own wallet - <b>no API key, no subscription</b></div></div>
 <div><div class="muted">Anonymous</div><div><b>120 req/min/IP</b></div></div>
-<div><div class="muted">With API key</div><div><b>600 req/min/IP</b> (<code>X-API-Key</code>)</div></div>
+<div><div class="muted">Keyed tier</div><div><b>None</b> - robotbase.cc issues no API key of any kind</div></div>
 <div><div class="muted">Privacy</div><div>Audit keeps only the first 16 chars of the IP SHA256 — <b>query arguments are never logged</b></div></div>
 <div><div class="muted">Data</div><div>Read-only on-chain data; no trading, signing or custody</div></div>
 </div></div>
@@ -1913,13 +1886,14 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
 <h2 id="pricing">Pricing</h2>
 <div class="card"><div class="grid">
 <div><div class="muted">Verification tools (13)</div><div><b>$0</b> — free forever, no key, no signup</div></div>
-<div><div class="muted">Risk intelligence (4 tools)</div><div><b>__RISK_FREE__ calls/day per IP free</b>, then a prepaid API key</div></div>
-<div><div class="muted">Pioneer beta</div><div><b>Free key for the first 100 developers</b> — 600 req/min, unlimited risk calls</div></div>
-<div><div class="muted">After the beta</div><div>prepaid API key, topped up in <b>USDT (TRC-20)</b> or <b>BTC</b> on-chain</div></div>
+<div><div class="muted">Risk intelligence (4 tools)</div><div><b>__RISK_FREE__ calls/day per IP free</b>, then <b>$0.01</b> per call</div></div>
+<div><div class="muted">How you pay</div><div><b>x402</b> — USDC on Base or Solana, paid by the caller's own wallet</div></div>
+<div><div class="muted">Credit packs</div><div><b>10 calls / 0.10 USDC</b> · <b>100 calls / 1.00 USDC</b></div></div>
 </div>
-<p class="muted" style="margin-bottom:0">Keys are issued from the billing gateway at
-<a href="/billing/pricing">/billing/pricing</a>; send yours back as <code>X-API-Key</code> on this same
-endpoint. Nothing is metered by surprise: every risk-tool answer carries its own <code>_metering</code>
+<p class="muted" style="margin-bottom:0"><b>No API keys are issued</b> — no key, no account, no
+subscription. Payment is per call, bought in prepaid credit packs over x402; the authoritative pack
+sizes and receiving addresses are the live ones in <code>structuredContent.accepts[]</code> of any 402
+answer. Nothing is metered by surprise: every risk-tool answer carries its own <code>_metering</code>
 block with the allowance and the reset time (00:00 Asia/Shanghai).</p>
 </div>
 
@@ -1992,13 +1966,14 @@ def server_card():
         "transport": {"type": "streamable-http", "url": "https://robotbase.cc/mcp"},
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {"tools": {"listChanged": False}},
-        "auth": {"type": "none", "optional": "X-API-Key header or ?key= raises rate limit to 600/min per IP"},
-        "rateLimits": {"anonymous": "120/min per IP", "withApiKey": "600/min per IP"},
+        "auth": {"type": "none", "note": "no API key of any kind is issued; metered tools are paid over x402"},
+        "rateLimits": {"anonymous": "120/min per IP", "keyed": "none — there is no keyed tier"},
         "tags": ["bitcoin", "ethereum", "monero", "zcash", "solana", "base", "tron", "blockchain-data",
                  "onchain", "verification", "risk-intelligence", "aml", "rug-pull", "honeypot", "evm",
                  "usdt", "mempool",
                  "fees", "privacy-coins", "read-only", "mcp-server", "web3-agents"],
-        "pricing": {"verification_tools": "free", "risk_tools": "%d free calls/day per IP, then a prepaid API key" % RISK_FREE_PER_DAY,
+        "pricing": {"verification_tools": "free", "risk_tools": "%d free calls/day per IP, then 0.01 USDC per call over x402" % RISK_FREE_PER_DAY,
+                    "api_key": "not offered", "subscription": "not offered",
                     "top_up": TOPUP_URL},
         "tools": [{"name": n, "description": desc[n]} for n, _d, _s, _f in TOOLS],
     }
@@ -2044,24 +2019,22 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id, Accept, X-API-Key")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id, Accept")
         plan = getattr(self, "_plan_name", None)
         if plan:
             self.send_header("X-MCP-Plan", plan)
-            self.send_header("X-RateLimit-Limit", str(600 if plan == "key" else RATE_LIMIT_PER_MIN))
+            self.send_header("X-RateLimit-Limit", str(RATE_LIMIT_PER_MIN))
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(data)
 
     def _plan(self):
-        key = self.headers.get("X-API-Key")
-        if not key and "key=" in (self.path or ""):
-            key = self.path.split("key=", 1)[1].split("&")[0]
-        if key:
-            self._plan_name = verify_key(key)
-        else:
-            self._plan_name = "anon"
+        """2026-10-16：付费只走 x402，API key 档位已取消。
+
+        恒为匿名——`X-API-Key` 不再授予任何额度或速率档位，传了也当没传。
+        """
+        self._plan_name = "anon"
         return self._plan_name
 
     def _rate_ok(self, limit):
@@ -2142,15 +2115,14 @@ other windows: <a href="/mcp/stats?hours=1">1h</a> · <a href="/mcp/stats?hours=
         plan = self._plan()
         _REQ.ip = (self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For")
                    or self.client_address[0])
-        _REQ.key = (self.headers.get("X-API-Key") or
-                    (self.path.split("key=", 1)[1].split("&")[0] if "key=" in self.path else ""))
         _REQ.plan = plan
-        limit = 600 if plan == "key" else RATE_LIMIT_PER_MIN
+        limit = RATE_LIMIT_PER_MIN      # 只有匿名档：付费额度由 x402 信用控制，不再用速率区分
         if not self._rate_ok(limit):
             return self._send(429, json.dumps({"jsonrpc": "2.0", "id": None,
                                                "error": {"code": -32000,
                                                          "message": f"rate limited ({limit}/min per IP); "
-                                                                    f"use X-API-Key for higher limits"}}),
+                                                                    f"robotbase.cc issues no API keys — "
+                                                                    f"paid access is x402 credit on this endpoint"}}),
                               extra={"X-RateLimit-Limit": str(limit)})
         try:
             msg = json.loads(raw.decode() or "{}")

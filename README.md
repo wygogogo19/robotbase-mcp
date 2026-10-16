@@ -28,13 +28,15 @@ This server answers both with **45 strictly read-only tools** (41 free verificat
 
 | Tier | What it covers | Limit |
 |---|---|---|
-| **Verification (13 tools)** | Fee, mempool, tx/block/address verification, node and shielded-pool telemetry, optional raw-tx relay | **Free forever**, no key, no signup |
+| **Verification (41 tools)** | Fee, mempool, tx/block/address verification, node and shielded-pool telemetry, optional raw-tx relay | **Free forever**, no key, no signup |
 | **Risk intelligence (4 tools)** | `tron_check_address_risk`, `tron_verify_usdt_transfer`, `sol_check_token_safety`, `base_check_contract_risk` | **5 calls/day per IP** free, resets 00:00 Asia/Shanghai |
-| **Prepaid API key** | Lifts the risk-tool cap and raises the rate limit | USDT (TRC-20) or BTC on-chain at <https://robotbase.cc/billing/pricing> — the key is issued **automatically** the moment the payment confirms, and usage is readable at `/billing/v1/usage?key=…` |
+| **x402 credit packs** | Past the free allowance, each risk call costs **$0.01** | **10 calls / 0.10 USDC** or **100 calls / 1.00 USDC** in USDC on Base or Solana, paid from the caller's own wallet |
 
 Every metered answer carries its own `_metering` block (allowance, reset time, calls left), and a call that fails local validation — a malformed address or txid — does **not** consume the allowance. Past the free allowance the tool returns `Payment Required` and names the top-up page instead of a partial result.
 
-The API key is the primary billing model because it is the only one every mainstream MCP client can actually use today. Machine-to-machine X402 settlement stays a lab track until mainstream clients can answer a `402 Payment Required` challenge.
+**There is no API key, no account and no subscription — from 2026-10-16 the paid tier is x402 machine payment only.** When the free allowance runs out the tool answers `402 Payment Required` with the full machine-readable terms in `structuredContent.accepts[]`. An agent settles one credit pack with an EIP-3009 authorisation, then re-sends **that same payment payload** in `params._meta["x402/payment"]` on every later call: settlement is idempotent per payment nonce, so the payload is never charged twice — each call simply spends one credit until the pack is empty. Buy another pack to continue.
+
+If you are self-hosting this reference implementation there is no billing layer at all: raise `RISK_FREE_PER_DAY` or wire your own settlement.
 
 ## Connect (3 lines)
 
@@ -144,8 +146,8 @@ Most MCP servers wrap a third-party API. These come from infrastructure we opera
 
 ## Privacy & limits
 
-- **No auth** for anonymous use; optional `X-API-Key` header (or `?key=`) raises the limit.
-- Anonymous **120 req/min per IP**; with API key **600 req/min per IP** (`X-MCP-Plan` / `X-RateLimit-Limit` response headers).
+- **No auth at all** — robotbase.cc issues no API key, and sending `X-API-Key` changes nothing.
+- **120 req/min per IP**, one tier (`X-MCP-Plan` / `X-RateLimit-Limit` response headers). Paid access is x402 credit and does not raise the per-IP rate limit.
 - Audit stores only a **truncated SHA-256 of the client IP** — never query parameters.
 - **Read-only**: no trading, signing, custody, or write methods. BTC transactions are looked up with `txindex`.
 - Responses are trimmed to ~3.8 KB per call to protect LLM context.
@@ -167,7 +169,7 @@ export RB_ZEC_BASE=http://127.0.0.1:8080                  # status API with /api
 export RB_XMR_HELPER=http://127.0.0.1:18085/rpc           # monerod JSON-RPC (xmr_get_node_status)
 export RB_HOME_BASE=http://127.0.0.1:8081                 # gateway aggregation: /api/nodes (eth + xmr telemetry) /api/services
 export RB_USAGE_DB=./usage.db                             # optional usage audit
-export RB_BILLING_DB=./billing.db                         # optional: API-key verification
+export RB_BILLING_DB=./billing.db                         # deprecated: API-key verification (no keys are issued since 2026-10-16)
 export RB_RISK_DB=./risk_quota.db                         # optional: daily risk-tool allowance bookkeeping
 python3 server.py
 ```

@@ -1,8 +1,8 @@
 {
  "name": "robotbase-mcp",
  "title": "RobotBase MCP Server - on-chain verification & risk intelligence for Web3 agents",
- "version": "0.11.0",
- "description": "The verification and risk-intelligence layer for Web3 agents, as one read-only MCP endpoint. Five chains are live, each read from mainnet nodes we run ourselves: Bitcoin (fees, mempool state with a fee-rate histogram and RBF/CPFP feasibility, tx/block/address verification, optional raw-tx relay); Ethereum (Reth execution + Lighthouse consensus, settlement checks with ERC-20 log decoding, fee market, blocks, event logs, account and contract reads); Monero (node telemetry, dynamic fees, mempool, blocks, transaction lookup, ring-size output distribution, and cryptographic tx-proof payment verification); Zcash (all six shielded pools, shielded commitment-tree anchors, transaction checks, network and funding-stream stats); and Tron (node status, blocks and history, transactions with TRC-20 decoding, account permissions, contract reads, chain economics, super representatives and governance proposals). Risk intelligence is light aggregation over public datasets: TRON address risk, TRC-20 USDT settlement verification, Solana rug-pull screening and Base (EVM) contract screening. RobotBase publishes no RPC endpoint of any kind. Verification tools are free; risk tools include a daily free allowance with a prepaid API key above it.",
+ "version": "0.12.0",
+ "description": "The verification and risk-intelligence layer for Web3 agents, as one read-only MCP endpoint. Five chains are live, each read from mainnet nodes we run ourselves: Bitcoin (fees, mempool state with a fee-rate histogram and RBF/CPFP feasibility, tx/block/address verification, optional raw-tx relay); Ethereum (Reth execution + Lighthouse consensus, settlement checks with ERC-20 log decoding, fee market, blocks, event logs, account and contract reads); Monero (node telemetry, dynamic fees, mempool, blocks, transaction lookup, ring-size output distribution, and cryptographic tx-proof payment verification); Zcash (all six shielded pools, shielded commitment-tree anchors, transaction checks, network and funding-stream stats); and Tron (node status, blocks and history, transactions with TRC-20 decoding, account permissions, contract reads, chain economics, super representatives and governance proposals). Risk intelligence is light aggregation over public datasets: TRON address risk, TRC-20 USDT settlement verification, Solana rug-pull screening and Base (EVM) contract screening. RobotBase publishes no RPC endpoint of any kind. Verification tools are free; risk tools include a daily free allowance, then 0.01 USDC per call settled over x402 by the caller's own wallet. No API key, no account and no subscription are offered.",
  "homepage": "https://robotbase.cc/mcp",
  "transport": {
   "type": "streamable-http",
@@ -16,11 +16,11 @@
  },
  "auth": {
   "type": "none",
-  "optional": "X-API-Key header or ?key= raises rate limit to 600/min per IP"
+  "optional": "x402 (USDC) for metered tools; no API keys are issued"
  },
  "rateLimits": {
   "anonymous": "120/min per IP",
-  "withApiKey": "600/min per IP"
+  "note": "no keyed tier exists"
  },
  "tags": [
   "bitcoin",
@@ -48,8 +48,11 @@
  ],
  "pricing": {
   "verification_tools": "free",
-  "risk_tools": "5 free calls/day per IP, then a prepaid API key",
-  "top_up": "https://robotbase.cc/billing/pricing"
+  "risk_tools": "5 free calls/day per IP, then 0.01 USDC per call",
+  "payment": "x402 (HTTP 402) in USDC on Base or Solana; credit packs 10 calls / 0.10 USDC and 100 calls / 1.00 USDC",
+  "api_key": "not offered",
+  "subscription": "not offered",
+  "top_up": "https://robotbase.cc/#pricing"
  },
  "tools": [
   {
@@ -218,19 +221,19 @@
   },
   {
    "name": "tron_check_address_risk",
-   "description": "TRON address risk intelligence: judicial and black-market labels, account profile and a 0-100 safety score. When to use: before accepting USDT from a counterparty - OTC settlement, merchant payout, or any agent that must not receive tainted funds; also to sanity-check an address you are about to pay. Do not use: to confirm that a specific transfer arrived (that is tron_verify_usdt_transfer). Returns: risk_level (low|medium|high|unknown), safety_score, hit_flags (sanctioned / money_laundering / mixer / cybercrime / phishing / blacklist_doubt ...), malicious_contracts_created, account {activated, age_days, balance_trx, is_contract, trc20_holdings}, not_covered[] and a disclaimer. Metered: 5 free calls per day per IP, unlimited with an API key."
+   "description": "TRON address risk intelligence: judicial and black-market labels, account profile and a 0-100 safety score. When to use: before accepting USDT from a counterparty - OTC settlement, merchant payout, or any agent that must not receive tainted funds; also to sanity-check an address you are about to pay. Do not use: to confirm that a specific transfer arrived (that is tron_verify_usdt_transfer). Returns: risk_level (low|medium|high|unknown), safety_score, hit_flags (sanctioned / money_laundering / mixer / cybercrime / phishing / blacklist_doubt ...), malicious_contracts_created, account {activated, age_days, balance_trx, is_contract, trc20_holdings}, not_covered[] and a disclaimer. Metered: 5 free calls per day per IP, then 0.01 USDC per call over x402. There is no API key: the 402 answer carries the machine-readable terms in structuredContent.accepts[]."
   },
   {
    "name": "tron_verify_usdt_transfer",
-   "description": "TRC-20 USDT settlement check by transaction id: did it land, is it irreversible, how much, from and to whom. When to use: an agent or a merchant must confirm a USDT payment before releasing value - this is the settlement check that closes an automated trade loop. Do not use: to assess the counterparty (that is tron_check_address_risk). Data source: our own java-tron full node when the transaction is inside its ~6 day retention window (sub-second, no third party); it falls back to TronGrid automatically for older transactions, and says which one answered in `source`. A local miss is never reported as 'not found' by itself. Returns: found, status (SUCCESS|FAILED), finalized (present on the solidity/irreversible chain), confirmations, blocks_until_finality, block_number, block_time_utc, amount_usdt, from, to, fee_trx, checks {}, verified and a plain-language verdict. Pass expected_to / expected_amount_usdt to have the recipient and amount matched for you. Metered: 5 free calls per day per IP, unlimited with an API key."
+   "description": "TRC-20 USDT settlement check by transaction id: did it land, is it irreversible, how much, from and to whom. When to use: an agent or a merchant must confirm a USDT payment before releasing value - this is the settlement check that closes an automated trade loop. Do not use: to assess the counterparty (that is tron_check_address_risk). Data source: our own java-tron full node when the transaction is inside its ~6 day retention window (sub-second, no third party); it falls back to TronGrid automatically for older transactions, and says which one answered in `source`. A local miss is never reported as 'not found' by itself. Returns: found, status (SUCCESS|FAILED), finalized (present on the solidity/irreversible chain), confirmations, blocks_until_finality, block_number, block_time_utc, amount_usdt, from, to, fee_trx, checks {}, verified and a plain-language verdict. Pass expected_to / expected_amount_usdt to have the recipient and amount matched for you. Metered: 5 free calls per day per IP, then 0.01 USDC per call over x402. There is no API key: the 402 answer carries the machine-readable terms in structuredContent.accepts[]."
   },
   {
    "name": "sol_check_token_safety",
-   "description": "Solana token rug-pull screen: mint and freeze authority, liquidity lock, holder concentration. When to use: before an agent buys or quotes a Solana token, or when a mint address shows up in a trade signal and you need the safety facts first. Do not use: for price or liquidity depth in USD (no DEX aggregator is queried here); for TRON addresses use tron_check_address_risk. Returns: risk_level (low|medium|high), safety_score, mint_authority_revoked, freeze_authority_revoked, lp_locked_pct, lp_holder_pct, top10_holder_pct, holder_count, transfer_fee / transfer_hook presence, warnings[], not_covered[] and a disclaimer. Metered: 5 free calls per day per IP, unlimited with an API key."
+   "description": "Solana token rug-pull screen: mint and freeze authority, liquidity lock, holder concentration. When to use: before an agent buys or quotes a Solana token, or when a mint address shows up in a trade signal and you need the safety facts first. Do not use: for price or liquidity depth in USD (no DEX aggregator is queried here); for TRON addresses use tron_check_address_risk. Returns: risk_level (low|medium|high), safety_score, mint_authority_revoked, freeze_authority_revoked, lp_locked_pct, lp_holder_pct, top10_holder_pct, holder_count, transfer_fee / transfer_hook presence, warnings[], not_covered[] and a disclaimer. Metered: 5 free calls per day per IP, then 0.01 USDC per call over x402. There is no API key: the 402 answer carries the machine-readable terms in structuredContent.accepts[]."
   },
   {
    "name": "base_check_contract_risk",
-   "description": "Base (EVM) token and contract risk screen: honeypot, transfer taxes, verified source, backdoors and liquidity lock. When to use: before an agent trades, quotes or accepts a token on Base, or when an address shows up in an AgentKit / onchain-agent flow and you need the hard facts first - can it be sold, what does the exit cost, who can change the rules. Do not use: for Solana mints (that is sol_check_token_safety) or for TRON addresses (tron_check_address_risk); it does not simulate a live sell. Returns: risk_level (low|medium|high), safety_score, is_honeypot, cannot_sell_all, buy_tax_pct, sell_tax_pct, is_open_source, is_proxy, is_mintable, owner_change_balance, hidden_owner, can_take_back_ownership, transfer_pausable, selfdestruct, holder_count, top10_holder_pct, lp_locked_pct, dex pairs, warnings[], not_covered[] and a disclaimer. Metered: 5 free calls per day per IP, unlimited with an API key."
+   "description": "Base (EVM) token and contract risk screen: honeypot, transfer taxes, verified source, backdoors and liquidity lock. When to use: before an agent trades, quotes or accepts a token on Base, or when an address shows up in an AgentKit / onchain-agent flow and you need the hard facts first - can it be sold, what does the exit cost, who can change the rules. Do not use: for Solana mints (that is sol_check_token_safety) or for TRON addresses (tron_check_address_risk); it does not simulate a live sell. Returns: risk_level (low|medium|high), safety_score, is_honeypot, cannot_sell_all, buy_tax_pct, sell_tax_pct, is_open_source, is_proxy, is_mintable, owner_change_balance, hidden_owner, can_take_back_ownership, transfer_pausable, selfdestruct, holder_count, top10_holder_pct, lp_locked_pct, dex pairs, warnings[], not_covered[] and a disclaimer. Metered: 5 free calls per day per IP, then 0.01 USDC per call over x402. There is no API key: the 402 answer carries the machine-readable terms in structuredContent.accepts[]."
   }
  ]
 }

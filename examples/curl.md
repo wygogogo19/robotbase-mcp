@@ -26,34 +26,44 @@ curl -s https://robotbase.cc/mcp \
 # BTC fees right now
 curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call",
-       "params":{"name":"btc_fee_estimates","arguments":{}}}'
+       "params":{"name":"btc_get_fee_rates","arguments":{}}}'
 
 # Zcash shielded-pool supply
 curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":4,"method":"tools/call",
-       "params":{"name":"zec_chain_info","arguments":{}}}'
+       "params":{"name":"zec_get_pool_status","arguments":{}}}'
 
-# Kaspa: did our solo hashport find a real mainnet block?
+# Monero node state, read straight off our own monerod
 curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":5,"method":"tools/call",
-       "params":{"name":"kas_pool_status","arguments":{}}}'
-
-# Ravencoin: is the node synced and where is the GPU hashport?
-curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":6,"method":"tools/call",
-       "params":{"name":"rvn_pool_status","arguments":{}}}'
+       "params":{"name":"xmr_get_node_status","arguments":{}}}'
 ```
 
-## 4. Higher rate limit (optional)
+## 4. Metered risk tools and x402
+
+There is **no API key**: `X-API-Key` is not part of this service and sending it changes nothing.
+The four risk tools have a free allowance of 5 calls/day per IP; past that the call returns
+`Payment Required` with machine-readable terms in `structuredContent.accepts[]` (USDC on Base or
+Solana, 10 calls / 0.10 USDC or 100 calls / 1.00 USDC):
 
 ```bash
-curl -s https://robotbase.cc/mcp \
-  -H 'content-type: application/json' \
-  -H 'X-API-Key: rb_your_key_here' \
-  -d '{"jsonrpc":"2.0","id":6,"method":"tools/list"}'
+curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":6,"method":"tools/call",
+       "params":{"name":"tron_check_address_risk","arguments":{"address":"T..."}}}'
 ```
 
-Response headers `X-MCP-Plan` (`anon` / `key`) and `X-RateLimit-Limit` show the effective quota.
+Settle one pack, then re-send **the same payment payload** on later calls — it is idempotent per
+payment nonce, so it is charged once and each call spends one credit:
+
+```bash
+curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":7,"method":"tools/call",
+       "params":{"name":"tron_check_address_risk","arguments":{"address":"T..."},
+                 "_meta":{"x402/payment":{ ... settled payment payload ... }}}}'
+```
+
+Response headers `X-MCP-Plan` (`anon`) and `X-RateLimit-Limit` show the effective quota — 120 req/min
+per IP, the only tier there is.
 
 ## 5. Usage audit
 

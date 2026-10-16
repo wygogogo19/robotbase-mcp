@@ -5,13 +5,12 @@
 name: robotbase-mcp
 displayName: RobotBase MCP Server
 description: >-
-  Read-only multi-chain data for AI agents across four production chains (Bitcoin, Ethereum,
-  Monero, Zcash). Mempool & fee estimates, transaction and address lookup, Ethereum execution +
-  consensus state, Monero node + p2pool telemetry, Zcash shielded-pool supply and pool
-  attribution, node status, a halving oracle, fee/mempool oracles, Zcash coinbase attribution and
-  the Ravencoin asset registry — indexes and native endpoints nobody else publishes for
-  these chains. No auth, no tracking. Free beta keys: see the README.
-version: 0.5.2
+  Read-only on-chain verification and risk intelligence for Web3 agents, as one MCP endpoint.
+  Bitcoin, Ethereum, Monero, Zcash and Tron read from full nodes we run ourselves, plus TRON
+  address risk, TRC-20 USDT settlement verification, Solana token safety and Base contract risk.
+  No API key, no account, no subscription — 41 verification tools free, risk tools metered at
+  0.01 USDC per call over x402. No auth, no tracking, no public RPC endpoint.
+version: 0.12.0
 license: MIT
 homepage: https://robotbase.cc/mcp
 repository: https://github.com/<your-org>/robotbase-mcp
@@ -20,13 +19,10 @@ transport:
   type: streamable-http
   url: https://robotbase.cc/mcp
 
-# Hosted endpoint needs no configuration; the optional apiKey only raises rate limits.
+# Hosted endpoint needs no configuration and takes no API key of any kind.
 configSchema:
   type: object
-  properties:
-    apiKey:
-      type: string
-      description: Optional X-API-Key header value (raises the limit from 120 to 600 req/min per IP)
+  properties: {}
   additionalProperties: false
 
 # Running the reference implementation locally (bring your own nodes):
