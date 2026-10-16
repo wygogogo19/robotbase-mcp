@@ -6,7 +6,7 @@
 
 Live today: **Bitcoin · Ethereum · Monero · Zcash**. Provisioning: **Solana · Base · Tron**.
 
-[![Tools](https://img.shields.io/badge/tools-23-brightgreen)](https://robotbase.cc/mcp/tools)
+[![Tools](https://img.shields.io/badge/tools-30-brightgreen)](https://robotbase.cc/mcp/tools)
 [![Protocol](https://img.shields.io/badge/MCP-2025--06--18-blue)](https://modelcontextprotocol.io)
 [![Transport](https://img.shields.io/badge/transport-streamable--http-orange)](https://robotbase.cc/mcp)
 [![Glama](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp/badges/score.svg)](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp)
@@ -22,7 +22,7 @@ Listed in the **official MCP Registry** as `io.github.wygogogo19/robotbase-mcp` 
 
 An autonomous agent handling crypto has exactly two blocking questions: **did this payment actually settle**, and **what will the next one cost**. Ask an LLM those today and it has nowhere reliable to look — the MCP ecosystem is rich in wrappers around hosted indexers and thin on self-run infrastructure.
 
-This server answers both with **23 strictly read-only tools** (19 free verification tools + 4 metered risk tools) backed by our own full nodes and local indexes: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, and a full Monero surface (`xmr_get_fee_rates`, `xmr_get_transaction`, `xmr_get_recent_blocks`, …) read straight off our own monerod.
+This server answers both with **30 strictly read-only tools** (26 free verification tools + 4 metered risk tools) backed by our own full nodes and local indexes: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, a full Monero surface (`xmr_get_fee_rates`, `xmr_get_transaction`, `xmr_get_recent_blocks`, …) read straight off our own monerod, and read-only contract calls on Tron (`tron_read_contract`) executed by our own java-tron node.
 
 ## Pricing
 
@@ -54,7 +54,7 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
        "params":{"name":"btc_get_fee_rates","arguments":{}}}'
 ```
 
-## Tools (23)
+## Tools (30)
 
 | Tool | What it does | Typical question |
 |---|---|---|
@@ -77,6 +77,13 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
 | `xmr_get_transaction(txid)` | Is this txid mined, which block, confirmations, size, outputs, ring size. Amount/sender/recipient are reported as **not disclosed by the protocol** — Monero hides them by design and no third party can recover them | "Did my XMR transfer get mined?" |
 | `xmr_get_network_stats` | Network hashrate, difficulty, emission and fees over the last 720 blocks, protocol version, next hard fork | "How much hashrate secures Monero?" |
 | `broadcast_raw_transaction` | Relay an already-signed BTC transaction through our own node (testmempoolaccept first; operator-gated) | "Broadcast this signed tx for me" |
+| `tron_get_node_status` | Tron node: tip height, finalized (solidity) height and lag, peers, client version, txs in the tip block | "Is the Tron node synced?" |
+| `tron_get_current_block` | The block being produced: number, id, timestamp, tx count by contract type, producing witness | "How busy is Tron right now?" |
+| `tron_get_account(address)` | TRX balance, activation state, energy and bandwidth, witness flag, account age | "How much TRX is in this address?" |
+| `tron_get_contract(address)` | Is the ABI published, name, creator, function list, code hash, TRC-20 detection | "Is this contract verified?" |
+| `tron_read_contract(contract, function, argument)` | **Read-only constant call run by our own node** — `balanceOf`, `allowance`, `decimals`, `symbol`, `name`, `totalSupply`, or any raw selector. No key, no state change | "What is this address's USDT balance?" |
+| `tron_get_chain_economics` | Energy price (sun/unit), transaction fee, account creation fee, witness pay per block, energy/bandwidth limits, next maintenance | "What will a TRC-20 transfer cost in TRX?" |
+| `tron_list_witnesses(limit)` | Super representatives: blocks produced, missed, votes, websites | "Who produces Tron blocks?" |
 
 ### Risk intelligence (metered)
 
