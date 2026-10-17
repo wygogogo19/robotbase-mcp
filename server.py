@@ -917,6 +917,15 @@ def _client_plan():
     return getattr(_REQ, "plan", "anon")
 
 
+def _arg(a, *names):
+    """按顺序取第一个非空字符串参数（参数别名，例如 Base 合约的 contract / address）。"""
+    for n in names:
+        v = (a or {}).get(n)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
 class PaymentRequired(Exception):
     """免费额度用尽——这不是「错误」，是要求充值。"""
 
@@ -1679,9 +1688,11 @@ TOOLS = [    ("list_chains",
      "warnings[], not_covered[] and a disclaimer. "
      "Metered: 5 free calls per day per IP, then 0.01 USDC per call over x402. There is no API key: "
      "the 402 answer carries the machine-readable terms in structuredContent.accepts[].",
-     {"type": "object", "properties": {"mint": {"type": "string", "description": "Solana token mint address (base58)"}},
-      "required": ["mint"], "additionalProperties": False},
-     lambda a: t_sol_check_token_safety(a.get("mint"))),
+     {"type": "object", "properties": {
+         "mint": {"type": "string", "description": "Solana token mint address (base58). Preferred name."},
+         "address": {"type": "string", "description": "Alias for `mint` - accepted so a generic agent can pass `address`."}},
+      "anyOf": [{"required": ["mint"]}, {"required": ["address"]}], "additionalProperties": False},
+     lambda a: t_sol_check_token_safety(_arg(a, "mint", "address", "token_address", "token"))),
     ("base_check_contract_risk",
      "Base (EVM) token and contract risk screen: honeypot, transfer taxes, verified source, backdoors "
      "and liquidity lock. "
@@ -1696,10 +1707,11 @@ TOOLS = [    ("list_chains",
      "lp_locked_pct, dex pairs, warnings[], not_covered[] and a disclaimer. "
      "Metered: 5 free calls per day per IP, then 0.01 USDC per call over x402. There is no API key: "
      "the 402 answer carries the machine-readable terms in structuredContent.accepts[].",
-     {"type": "object", "properties": {"contract": {"type": "string",
-                                                    "description": "Base ERC-20 contract address (0x...)"}},
-      "required": ["contract"], "additionalProperties": False},
-     lambda a: t_base_check_contract_risk(a.get("contract"))),
+     {"type": "object", "properties": {
+         "contract": {"type": "string", "description": "Base ERC-20 / contract address (0x + 40 hex). Preferred name."},
+         "address": {"type": "string", "description": "Alias for `contract` - accepted so a generic agent can pass `address`."}},
+      "anyOf": [{"required": ["contract"]}, {"required": ["address"]}], "additionalProperties": False},
+     lambda a: t_base_check_contract_risk(_arg(a, "contract", "address", "token_address", "token"))),
 ]
 
 

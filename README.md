@@ -34,7 +34,9 @@ This server answers both with **45 strictly read-only tools** (41 free verificat
 
 Every metered answer carries its own `_metering` block (allowance, reset time, calls left), and a call that fails local validation — a malformed address or txid — does **not** consume the allowance. Past the free allowance the tool returns `Payment Required` and names the top-up page instead of a partial result.
 
-**There is no API key, no account and no subscription — from 2026-10-16 the paid tier is x402 machine payment only.** When the free allowance runs out the tool answers `402 Payment Required` with the full machine-readable terms in `structuredContent.accepts[]`. An agent settles one credit pack with an EIP-3009 authorisation, then re-sends **that same payment payload** in `params._meta["x402/payment"]` on every later call: settlement is idempotent per payment nonce, so the payload is never charged twice — each call simply spends one credit until the pack is empty. Buy another pack to continue.
+**There is no API key, no account and no subscription — from 2026-10-16 the paid tier is x402 machine payment only.** When the free allowance runs out the tool answers `402 Payment Required` with the full machine-readable terms in `structuredContent.accepts[]`. An agent settles one credit pack (EIP-3009 on Base, a signed transfer on Solana), then re-sends **that same payment payload** in `params._meta["x402/payment"]` on every later call: settlement is idempotent per payment nonce, so the payload is never charged twice — each call simply spends one credit until the pack is empty. Buy another pack to continue.
+
+Replay works the same on both networks. For Solana the payload carries only the signed transaction, so the server recovers the payer from the settled-payment ledger by the transaction hash — it never re-simulates a transaction that already landed.
 
 If you are self-hosting this reference implementation there is no billing layer at all: raise `RISK_FREE_PER_DAY` or wire your own settlement.
 

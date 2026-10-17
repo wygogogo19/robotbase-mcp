@@ -1,7 +1,7 @@
 {
  "name": "robotbase-mcp",
  "title": "RobotBase MCP Server - on-chain verification & risk intelligence for Web3 agents",
- "version": "0.12.0",
+ "version": "0.12.1",
  "description": "The verification and risk-intelligence layer for Web3 agents, as one read-only MCP endpoint. Five chains are live, each read from mainnet nodes we run ourselves: Bitcoin (fees, mempool state with a fee-rate histogram and RBF/CPFP feasibility, tx/block/address verification, optional raw-tx relay); Ethereum (Reth execution + Lighthouse consensus, settlement checks with ERC-20 log decoding, fee market, blocks, event logs, account and contract reads); Monero (node telemetry, dynamic fees, mempool, blocks, transaction lookup, ring-size output distribution, and cryptographic tx-proof payment verification); Zcash (all six shielded pools, shielded commitment-tree anchors, transaction checks, network and funding-stream stats); and Tron (node status, blocks and history, transactions with TRC-20 decoding, account permissions, contract reads, chain economics, super representatives and governance proposals). Risk intelligence is light aggregation over public datasets: TRON address risk, TRC-20 USDT settlement verification, Solana rug-pull screening and Base (EVM) contract screening. RobotBase publishes no RPC endpoint of any kind. Verification tools are free; risk tools include a daily free allowance, then 0.01 USDC per call settled over x402 by the caller's own wallet. No API key, no account and no subscription are offered.",
  "homepage": "https://robotbase.cc/mcp",
  "transport": {
@@ -49,7 +49,7 @@
  "pricing": {
   "verification_tools": "free",
   "risk_tools": "5 free calls/day per IP, then 0.01 USDC per call",
-  "payment": "x402 (HTTP 402) in USDC on Base or Solana; credit packs 10 calls / 0.10 USDC and 100 calls / 1.00 USDC",
+  "payment": "x402 (HTTP 402) in USDC on Base; credit packs 10 calls / 0.10 USDC and 100 calls / 1.00 USDC",
   "api_key": "not offered",
   "subscription": "not offered",
   "top_up": "https://robotbase.cc/#pricing"
