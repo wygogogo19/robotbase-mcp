@@ -9,10 +9,17 @@ planned（LTC/DOGE/KAS/RVN 已定规格）。修剪与保留窗口是节点的�
 import base64, hashlib, html, json, os, re, socket, sqlite3, threading, time, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# Optional x402 paid tier. Without x402_pay.py (or without RB_X402_* config) the
+# server runs exactly as before: free tools plus the per-IP risk allowance.
+try:
+    import x402_pay
+except Exception:            # noqa: BLE001
+    x402_pay = None
+
 PORT = int(os.environ.get("RB_PORT", "8090"))
 BIND = os.environ.get("RB_BIND", "127.0.0.1")
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "robotbase-mcp", "version": "0.10.0", "title": "RobotBase MCP — on-chain verification & risk intelligence for Web3 agents"}
+SERVER_INFO = {"name": "robotbase-mcp", "version": "0.12.3", "title": "RobotBase MCP — on-chain verification & risk intelligence for Web3 agents"}
 # 部署路径与端口一律由环境变量给出：仓库里不写我们自己那套内部布局。
 BTC_ENV = os.environ.get("RB_BTC_ENV", "")
 BTC_DASHBOARD = os.environ.get("RB_BTC_DASHBOARD", "http://127.0.0.1:8600")
@@ -1724,6 +1731,46 @@ def call_tool(name, args):
         if n == name:
             if n not in RISK_TOOLS:
                 return fn(args or {})
+            # ---- x402 paid tier -------------------------------------------------
+            # A client that settled a credit pack re-sends the SAME payment payload
+            # on every call; settlement is idempotent per nonce, so each call just
+            # spends one credit. See x402_pay.try_pay().
+            payment = getattr(_REQ, "payment", None)
+            if payment and x402_pay is not None and x402_pay.enabled():
+                res = x402_pay.try_pay(name, payment)
+                if not res.get("ok"):
+                    raise PaymentRequired(json.dumps({
+                        "reason": res.get("reason") or "invalid_payment",
+                        "detail": res.get("detail") or "",
+                        "network": res.get("network") or "",
+                    }, ensure_ascii=False))
+                if x402_pay.balance(res["payer"]) <= 0:
+                    raise PaymentRequired(json.dumps({
+                        "reason": "insufficient_credit",
+                        "detail": "payer %s has no remaining credits; buy another pack" % res["payer"],
+                        "network": res.get("network") or "",
+                    }, ensure_ascii=False))
+                # Run the tool first; a tool that fails local validation can opt out
+                # of charging by returning _no_charge.
+                out = fn(args or {})
+                no_charge = isinstance(out, dict) and bool(out.pop("_no_charge", False))
+                left = x402_pay.balance(res["payer"]) if no_charge else x402_pay.spend(res["payer"], name)
+                if left < 0:
+                    left = 0
+                info = {"payer": res["payer"], "credit_remaining": left, "creditRemaining": left,
+                        "charged_this_call": not no_charge,
+                        "settled_tx": res.get("tx", ""),
+                        "replayed_payment": bool(res.get("replayed")),
+                        "how_to_spend_credits": (
+                            "There is no API key. Keep sending this same payment payload in "
+                            "params._meta[\"x402/payment\"]: it will not be settled again, it only "
+                            "spends one credit per successful call until the balance reaches 0.")}
+                if isinstance(out, dict):
+                    out["_x402"] = info
+                else:
+                    out = {"result": out, "_x402": info}
+                return out
+            # ---- free tier ------------------------------------------------------
             gate = _risk_gate()                      # 额度用尽则抛 PaymentRequired，不消耗上游
             tier = gate.get("free_tier") or {}
             used_before, limit = tier.get("used_today", 0), tier.get("limit_per_day", -1)
@@ -1744,6 +1791,9 @@ def handle(msg):
     method = msg.get("method")
     mid = msg.get("id")
     params = msg.get("params") or {}
+    # x402: the payment payload travels in params._meta["x402/payment"]
+    # (MCP transport convention). Cleared per request to avoid thread-local leakage.
+    _REQ.payment = (params.get("_meta") or {}).get("x402/payment") or None
     if method == "initialize":
         return {"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": PROTOCOL_VERSION, "capabilities": {"tools": {"listChanged": False}},
@@ -1779,6 +1829,9 @@ def handle(msg):
             return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": truncate(out)}],
                                                             "isError": False}}
         except PaymentRequired as pay:
+            if x402_pay is not None and x402_pay.enabled():
+                return {"jsonrpc": "2.0", "id": mid,
+                        "result": x402_pay.payment_required(name, str(pay))}
             return {"jsonrpc": "2.0", "id": mid, "result": {
                 "content": [{"type": "text", "text": json.dumps(
                     {"error": "payment_required", "tool": name, "message": str(pay),
@@ -1963,7 +2016,7 @@ def server_card():
     return {
         "name": "robotbase-mcp",
         "title": "RobotBase MCP Server - on-chain verification & risk intelligence for Web3 agents",
-        "version": "0.10.0",
+        "version": "0.12.3",
         "description": "The semantic verification and risk-intelligence layer for Web3 agents, as one "
                        "read-only MCP endpoint. Live: Bitcoin (fees, mempool state, tx/block/address "
                        "verification, optional raw-tx relay), Ethereum (Reth execution + Lighthouse "
@@ -2165,4 +2218,10 @@ other windows: <a href="/mcp/stats?hours=1">1h</a> · <a href="/mcp/stats?hours=
 if __name__ == "__main__":
     init_usage()
     init_risk_db()
+    if x402_pay is not None:
+        try:
+            x402_pay.init()
+            print("[x402] ledger ready; enabled=%s" % x402_pay.enabled(), flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print("[x402] init failed: %s" % exc, flush=True)
     ThreadingHTTPServer((BIND, PORT), H).serve_forever()

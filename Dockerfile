@@ -3,7 +3,7 @@
 FROM python:3.12-slim
 
 WORKDIR /app
-COPY server.py ./
+COPY server.py x402_pay.py ./
 
 ENV RB_BIND=0.0.0.0 \
     RB_PORT=8090 \

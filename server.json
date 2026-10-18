@@ -1,7 +1,7 @@
 {
  "name": "robotbase-mcp",
  "title": "RobotBase MCP Server - on-chain verification & risk intelligence for Web3 agents",
- "version": "0.12.2",
+ "version": "0.12.3",
  "description": "The verification and risk-intelligence layer for Web3 agents, as one read-only MCP endpoint. Five chains are live, each read from mainnet nodes we run ourselves: Bitcoin (fees, mempool state with a fee-rate histogram and RBF/CPFP feasibility, tx/block/address verification, optional raw-tx relay); Ethereum (Reth execution + Lighthouse consensus, settlement checks with ERC-20 log decoding, fee market, blocks, event logs, account and contract reads); Monero (node telemetry, dynamic fees, mempool, blocks, transaction lookup, ring-size output distribution, and cryptographic tx-proof payment verification); Zcash (all six shielded pools, shielded commitment-tree anchors, transaction checks, network and funding-stream stats); and Tron (node status, blocks and history, transactions with TRC-20 decoding, account permissions, contract reads, chain economics, super representatives and governance proposals). Risk intelligence is light aggregation over public datasets: TRON address risk, TRC-20 USDT settlement verification, Solana rug-pull screening and Base (EVM) contract screening. RobotBase publishes no RPC endpoint of any kind. Verification tools are free; risk tools include a daily free allowance, then 0.01 USDC per call settled over x402 by the caller's own wallet. No API key, no account and no subscription are offered.",
  "homepage": "https://robotbase.cc/mcp",
  "transport": {
@@ -133,11 +133,11 @@
   },
   {
    "name": "eth_get_block",
-   "description": "One Ethereum block by number, tag (latest/finalized/safe) or hash: timestamp, transaction count, gas used against the limit, base fee, block builder and size. When to use: block-level context - how full is Ethereum right now, when a block was produced, what the base fee was, or which builder produced it. Do not use: for a transaction (eth_get_transaction) or for fees across blocks (eth_get_fee_rates). Returns: found, number, hash, parent_hash, timestamp, age_s, tx_count, gas_used, gas_limit, gas_used_pct, base_fee_gwei, miner, size_bytes."
+   "description": "One Ethereum block by number, tag (latest/finalized/safe) or hash: timestamp, transaction count, gas used against the limit, base fee, block builder and size. When to use: block-level context - how full is Ethereum right now, when a block was produced, what the base fee was, or which builder produced it. Do not use: for a transaction (eth_get_transaction) or for fees across blocks (eth_get_fee_rates). Returns: found, number, hash, parent_hash, timestamp, age_s, tx_count, gas_used, gas_limit, gas_used_pct, base_fee_gwei, miner, size_bytes. Boundary: block bodies are retained from 15,500,000 (2022-09-14) only; older heights return a pruned-history error, not an empty block."
   },
   {
    "name": "eth_get_logs",
-   "description": "Ethereum event logs over a block range, optionally filtered by contract address and event signature, with ERC-20 Transfer logs decoded (token, from, to, amount). When to use: find transfers or contract events in a window - 'who moved this token in the last N blocks', or watch a contract's activity without an indexer. Do not use: for a single transaction (eth_get_transaction) or to scan huge ranges (max 1000 blocks per call, results truncated with a flag). Returns: filter, matched, returned, truncated, logs[] with block_number, tx_hash, address, topics, data and a decoded block for ERC-20 Transfers."
+   "description": "Ethereum event logs over a block range, optionally filtered by contract address and event signature, with ERC-20 Transfer logs decoded (token, from, to, amount). When to use: find transfers or contract events in a window - 'who moved this token in the last N blocks', or watch a contract's activity without an indexer. Do not use: for a single transaction (eth_get_transaction) or to scan huge ranges (max 1000 blocks per call, results truncated with a flag). Returns: filter, matched, returned, truncated, logs[] with block_number, tx_hash, address, topics, data and a decoded block for ERC-20 Transfers. Boundary: logs are read from receipts, which exist only for a rolling window (~6 days today, 1.4-8.3 days as the 50k-block static-file shard advances); older ranges are refused."
   },
   {
    "name": "xmr_get_output_distribution",
@@ -157,7 +157,7 @@
   },
   {
    "name": "eth_get_transaction",
-   "description": "Ethereum transaction check by hash: success or reverted, gas used, fee paid, confirmations, whether the block is finalized, and any ERC-20 transfers decoded from the receipt logs (token, from, to, amount). When to use: did this ETH or ERC-20 payment actually settle, is it irreversible, who paid whom and how much. Do not use: for fee estimation (eth_get_fee_rates) or for Tron (tron_get_transaction). Returns: found, status, block_number, from, to, value_eth, gas_used, fee_eth, confirmations, finalized, erc20_transfers[]. A miss is reported as absent from *our* node only - never as proof of non-existence."
+   "description": "Ethereum transaction check by hash: success or reverted, gas used, fee paid, confirmations, whether the block is finalized, and any ERC-20 transfers decoded from the receipt logs (token, from, to, amount). When to use: did this ETH or ERC-20 payment actually settle, is it irreversible, who paid whom and how much. Do not use: for fee estimation (eth_get_fee_rates) or for Tron (tron_get_transaction). Returns: found, status, block_number, from, to, value_eth, gas_used, fee_eth, confirmations, finalized, erc20_transfers[]. A miss is reported as absent from *our* node only - never as proof of non-existence. Boundary: the transaction-hash index starts at block 26,170,371 (2026-10-12, only widens) while receipts cover a rolling ~6 days, so a miss on an older transaction means outside our window, not non-existent."
   },
   {
    "name": "eth_get_fee_rates",

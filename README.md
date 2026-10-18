@@ -38,7 +38,35 @@ Every metered answer carries its own `_metering` block (allowance, reset time, c
 
 Replay works the same on both networks. For Solana the payload carries only the signed transaction, so the server recovers the payer from the settled-payment ledger by the transaction hash — it never re-simulates a transaction that already landed.
 
-If you are self-hosting this reference implementation there is no billing layer at all: raise `RISK_FREE_PER_DAY` or wire your own settlement.
+## The x402 payment layer (open source)
+
+[`x402_pay.py`](./x402_pay.py) is the complete paid-tier implementation and it ships in this repo. It is **standard library only** — it talks HTTP to your facilitator and keeps a sqlite ledger. It never touches a private key and never submits a transaction.
+
+What it does:
+
+| Piece | Behaviour |
+|---|---|
+| 402 challenge | `structuredContent.accepts[]` lists every network/asset/pack combination, with `extra.feePayer` for Solana and the EIP-712 domain for EIP-3009 |
+| Settlement | `POST /verify` then `POST /settle` on your facilitator, once per payment nonce |
+| Credit | a settled pack credits `calls` against the payer address; the pack is spent one call at a time |
+| Replay | the client re-sends the **same** payload; the ledger short-circuits it, so nothing is simulated or settled twice (EVM and Solana alike) |
+| Exhaustion | the tool answers `PaymentRequired` / `insufficient_credit` instead of a partial result |
+| Failure safety | a tool that fails local validation returns `_no_charge`, so a bad argument never burns a credit |
+| Concurrency | `spend()` is a single atomic `UPDATE ... WHERE balance>0`; the balance cannot go negative |
+| Reconciliation | if a settlement's response is lost, EIP-3009 `authorizationState` is checked on-chain before crediting again |
+
+Enable it entirely through environment variables (see [`examples/x402.env.example`](./examples/x402.env.example)):
+
+```bash
+export RB_X402_ENABLED=1
+export RB_X402_FACILITATOR_URL=https://facilitator.example
+export RB_X402_OPTIONS='[{"network":"eip155:8453","asset":"0x…","pay_to":"0x…","decimals":6, …}]'
+export RB_X402_PACKS='[{"amount_atomic":"100000","calls":10,"label":"10 calls"}]'
+export RB_X402_LEDGER_DB=./x402_credit.db
+python3 server.py
+```
+
+With those unset, the server runs the free tier only. The reference build in this repo exposes a 17-tool subset (the hosted endpoint runs the full 45); both use the same `x402_pay.py`.
 
 ## Connect (3 lines)
 
@@ -173,10 +201,16 @@ export RB_HOME_BASE=http://127.0.0.1:8081                 # gateway aggregation:
 export RB_USAGE_DB=./usage.db                             # optional usage audit
 export RB_BILLING_DB=./billing.db                         # deprecated: API-key verification (no keys are issued since 2026-10-16)
 export RB_RISK_DB=./risk_quota.db                         # optional: daily risk-tool allowance bookkeeping
+# optional paid tier — see examples/x402.env.example for the full list
+export RB_X402_ENABLED=1
+export RB_X402_FACILITATOR_URL=https://facilitator.example
+export RB_X402_OPTIONS='[ … ]'
+export RB_X402_PACKS='[ … ]'
+export RB_X402_LEDGER_DB=./x402_credit.db
 python3 server.py
 ```
 
-See [`examples/`](./examples) for client configs and [`examples/env.example`](./examples/env.example) for the full variable list. Endpoints exposed by the server itself: `/` (docs), `/tools` (tool list JSON), `/server.json` (server card), `/stats` (usage audit), `/healthz`.
+See [`examples/`](./examples) for client configs, [`examples/env.example`](./examples/env.example) for the node variables and [`examples/x402.env.example`](./examples/x402.env.example) for the payment variables. Endpoints exposed by the server itself: `/` (docs), `/tools` (tool list JSON), `/server.json` (server card), `/stats` (usage audit), `/healthz`.
 
 ## License
 
