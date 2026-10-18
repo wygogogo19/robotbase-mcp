@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""RobotBase MCP Server — one read-only surface for an eight-chain roster.
+"""RobotBase MCP Server — one read-only surface for a five-chain roster.
 
-2026-10-18：对外只保留这一个 MCP，不再提供任何 RPC 端点。名册七条链全部 live：
-BTC/ETH/XMR/ZEC/TRON 由自建节点回答，Base/Solana 走外部 RPC（不做本地节点）。
-TRON 2026-10-15 从 provisioning 升为 live —— 它背后是
-自建的 java-tron lite full node，只覆盖最近 65,536 块（约 2.3 天）与最新状态，
-超出窗口的查询会被明确拒绝。修剪与保留窗口是节点的属性，能力矩阵工具
-（robotbase_capabilities）如实对外说明边界。
+2026-10-18：Base / Solana 的链上数据工具已下线（8 个工具），这份参考实现的名册只保留
+BTC/ETH/XMR/ZEC/TRON 五条链。BTC/ETH/XMR/ZEC 由自建全节点回答；TRON 背后是自建的
+java-tron lite full node，只覆盖最近 65,536 块（约 6 天）与最新状态，超出窗口的查询
+会被明确拒绝。修剪与保留窗口是节点的属性，能力矩阵工具（robotbase_capabilities）如实
+对外说明边界。x402 支付（Base/Solana 上的 USDC）保留，但它只是收款通道，不提供这两条
+链的链上数据服务。
 """
 import base64, hashlib, html, ipaddress, json, os, re, socket, sqlite3, threading, time, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,7 +28,7 @@ except Exception:            # noqa: BLE001
 PORT = int(os.environ.get("RB_PORT", "8090"))
 BIND = os.environ.get("RB_BIND", "127.0.0.1")
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "robotbase-mcp", "version": "0.12.5", "title": "RobotBase MCP — on-chain verification & risk intelligence for Web3 agents"}
+SERVER_INFO = {"name": "robotbase-mcp", "version": "0.12.6", "title": "RobotBase MCP — on-chain verification & risk intelligence for Web3 agents"}
 BTC_ENV = os.environ.get("RB_BTC_ENV", "")
 ZEC_BASE = os.environ.get("RB_ZEC_BASE", "http://127.0.0.1:8080")
 HOME_BASE = os.environ.get("RB_HOME_BASE", "http://127.0.0.1:8081")
@@ -135,17 +135,12 @@ def truncate(obj, limit=3800):
     return s if len(s) <= limit else s[:limit] + '…(truncated)'
 
 
-# 2026-10-14：名册收敛为七条链，成熟度只用 live / provisioning / planned 三态
-# （不再使用 Tier 1/2/3 那种分级）。tier=live 的节点今天就能回答查询；
-# provisioning 的链正在接入聚合与清洗逻辑，planned 的链按需储备，两者都绝不冒充可查询。
-# LTC/DOGE/KAS/RVN 与 TON 均已从名册下线（用户 2026-10-14 决定砍掉 TON）。
-# 2026-10-15：TRON 加入 live（名册里 tier=live，chain_status tron 走节点真实字段）。
+# 2026-10-18：Base / Solana 的链上数据工具下线，名册收敛为五条链
+# （BTC/ETH/XMR/ZEC/TRON），五条今天都是 live。成熟度仍只用 live / provisioning /
+# planned 三态；provisioning / planned 的链绝不冒充可查询。
+# LTC/DOGE/KAS/RVN、TON 以及 Base/Solana 均已从名册下线。
 CHAINS = ("btc", "eth", "xmr", "zec", "tron")
-ROSTER_CHAINS = ("btc", "eth", "xmr", "zec", "sol", "base", "tron")
-
-
-def _roster():
-    return (cached("nodes", 15, lambda: _http_json(HOME_BASE + "/api/nodes")).get("roster") or [])
+ROSTER_CHAINS = ("btc", "eth", "xmr", "zec", "tron")
 
 
 def t_list_chains():
@@ -161,8 +156,7 @@ def t_list_chains():
                     "height": n.get("height"),
                     "state": n.get("state") or c.get("state")})
     if not out:                                  # 网关不可达时退回静态名册
-        out = [{"chain": c, "tier": "live" if (c in CHAINS or c in ("base", "sol")) else "provisioning"}
-               for c in ROSTER_CHAINS]
+        out = [{"chain": c, "tier": "live"} for c in ROSTER_CHAINS]
     return {"chains": out, "updated_utc": d.get("updated_utc"),
             "note": "tier=live answers queries today; provisioning chains are still being wired into the "
                     "aggregation layer, and planned chains have no node at all. Neither is served yet."}
@@ -207,28 +201,6 @@ def t_chain_status(chain):
         n = (cached("nodes", 10, lambda: _http_json(HOME_BASE + "/api/nodes")).get("nodes") or {}).get("tron") or {}
         return {k: n.get(k) for k in ("ok", "synced", "height", "solidity", "peers", "client",
                                       "lag_s", "progress", "state")}
-    if chain in ("base", "sol"):
-        # 这两条链没有本地节点：状态直接问外部 RPC，并如实标注 access=external。
-        try:
-            if chain == "base":
-                head = _hexint(_base_rpc("eth_blockNumber", []))
-                return {"chain": "base", "ok": head is not None, "synced": True, "tier": "live",
-                        "access": "external RPC", "client": "external Base JSON-RPC",
-                        "block": head, "state": "external RPC"}
-            slot = _sol_rpc("getSlot", [{"commitment": "confirmed"}])
-            return {"chain": "sol", "ok": slot is not None, "synced": True, "tier": "live",
-                    "access": "external RPC", "client": "external Solana JSON-RPC",
-                    "slot": slot, "state": "external RPC"}
-        except Exception as exc:  # noqa: BLE001
-            return {"chain": chain, "ok": False, "synced": False, "tier": "live",
-                    "access": "external RPC", "state": "unreachable",
-                    "error": "%s: %s" % (type(exc).__name__, str(exc)[:140])}
-    if chain in ROSTER_CHAINS:                   # 名册里有，但今天还不提供服务（provisioning / planned）
-        spec = next((c for c in _roster() if c.get("id") == chain), None) or {}
-        return {"chain": chain, "served": False, "tier": spec.get("tier", "unknown"),
-                "state": spec.get("state"), "client": spec.get("client"),
-                "capability": spec.get("spec"),
-                "reason": "this chain is on the RobotBase roster but is not serving queries yet"}
     raise ValueError("chain must be one of: " + ", ".join(ROSTER_CHAINS))
 
 
@@ -1229,8 +1201,7 @@ def t_zec_block_attribution_intel(blocks=200):
 # 用户指令：P1 主打「高价值风控工具 + 轻量聚合」，不做通用 RPC 转发。
 # 数据源一律是公开聚合接口（GoPlus Labs + TronGrid），只读、不接触私钥、不托管资金。
 # 计费：每个 IP 每天 5 次免费；超出后走 x402（USDC）。2026-10-16 起不再发放 API key。
-RISK_TOOLS = ("tron_check_address_risk", "tron_verify_usdt_transfer", "sol_check_token_safety",
-              "base_check_contract_risk")
+RISK_TOOLS = ("tron_check_address_risk", "tron_verify_usdt_transfer")
 RISK_FREE_PER_DAY = 5
 RISK_DB = os.environ.get("RB_RISK_DB", "./risk_quota.db")
 GOPLUS_BASE = os.environ.get("RB_GOPLUS_BASE", "https://api.gopluslabs.io/api/v1")
@@ -1371,20 +1342,6 @@ def _meter_payload(used, limit, pending=False, charged=None):
     return payload
 
 
-def _arg(a, *names):
-    """按顺序取第一个非空字符串参数。
-
-    2026-10-17：风控工具的参数名对 Agent 不够宽容——调用方经常把 Base 合约写成 `address`、
-    把 Solana mint 也写成 `address`，于是本地校验直接判"地址格式不对"，看起来像工具坏了。
-    这里统一接受别名，规范名仍然是主名。
-    """
-    for n in names:
-        v = (a or {}).get(n)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return ""
-
-
 def _risk_precheck(name, args):
     """风险工具的本地格式校验（与各工具内部正则保持同一套）。
 
@@ -1401,17 +1358,6 @@ def _risk_precheck(name, args):
         if not re.fullmatch(r"[0-9a-fA-F]{64}", v):
             return {"txid": v, "chain": "TRON", "verified": False,
                     "error": "not a TRON transaction id (expected 64 hex chars)"}
-    elif name == "sol_check_token_safety":
-        v = _arg(a, "mint", "address", "token_address", "token")
-        if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", v):
-            return {"mint": v, "chain": "SOL", "checked": False,
-                    "error": "not a Solana mint address (base58, 32-44 chars)"}
-    elif name == "base_check_contract_risk":
-        v = _arg(a, "contract", "address", "token_address", "token")
-        if not re.fullmatch(r"0x[0-9a-fA-F]{40}", v):
-            return {"contract": v, "chain": "BASE", "checked": False,
-                    "error": "not an EVM contract address (0x + 40 hex chars); "
-                             "pass it as `contract` or `address`"}
     return None
 
 
@@ -1828,618 +1774,6 @@ def _safe_b58(h):
         return h
 
 
-def t_sol_check_token_safety(mint):
-    """Solana 代币防割检测：铸造权/冻结权、LP 锁定、筹码集中度。"""
-    m = (mint or "").strip()
-    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", m):
-        return {"mint": m, "chain": "SOL", "checked": False,
-                "error": "not a Solana mint address (base58, 32-44 chars)", "_no_charge": True}
-    out = {"mint": m, "chain": "SOL", "sources": ["GoPlus Labs solana/token_security"]}
-    try:
-        d = _http_json("%s/solana/token_security?contract_addresses=%s" % (GOPLUS_BASE, m), timeout=15)
-        res = (d.get("result") or {}).get(m)
-    except Exception as exc:  # noqa: BLE001
-        return {"mint": m, "chain": "SOL", "checked": False,
-                "error": "%s: %s" % (type(exc).__name__, str(exc)[:120]), "_no_charge": True}
-    if not res:
-        return {"mint": m, "chain": "SOL", "checked": False,
-                "reason": "no token-security record for this mint (unknown token, not a token mint, "
-                          "or the upstream dataset has not seen it yet)", "_no_charge": True}
-
-    def status(field):
-        return str((res.get(field) or {}).get("status", "0"))
-
-    mintable, freezable = status("mintable"), status("freezable")
-    holders = res.get("holders") or []
-    try:
-        top10 = round(sum(float(h.get("percent") or 0) for h in holders[:10]), 2)
-    except (TypeError, ValueError):
-        top10 = None
-    lp = res.get("lp_holders") or []
-    try:
-        lp_total = round(sum(float(x.get("percent") or 0) for x in lp), 2)
-        lp_locked = round(sum(float(x.get("percent") or 0) for x in lp if x.get("is_locked")), 2)
-    except (TypeError, ValueError):
-        lp_total, lp_locked = None, None
-
-    warnings = []
-    if mintable != "0":
-        warnings.append("mint authority is still live - the supply can be inflated at will")
-    if freezable != "0":
-        warnings.append("freeze authority is still live - your tokens can be frozen")
-    if status("closable") != "0":
-        warnings.append("token account is closable")
-    if str(res.get("non_transferable") or "0") == "1":
-        warnings.append("token is non-transferable")
-    if res.get("transfer_fee"):
-        warnings.append("a transfer fee is configured")
-    if res.get("transfer_hook"):
-        warnings.append("a transfer hook is installed")
-    if top10 is not None and top10 >= 50:
-        warnings.append("top-10 holders control %.1f%% of supply" % top10)
-    if lp_total is not None and lp_total > 0 and (lp_locked or 0) <= 0:
-        warnings.append("liquidity is not locked")
-
-    # 受监管的发行方代币（USDC/USDT 这类）本来就长期持有增发权与冻结权，
-    # 这是合规特征而不是拉盘信号；不区分就会把主流稳定币误判成高危。
-    trusted = str(res.get("trusted_token") or "0") == "1"
-    try:
-        holders_n = int(str(res.get("holder_count") or "0"))
-    except ValueError:
-        holders_n = 0
-    issuer_backed = bool(trusted and holders_n >= 100000 and (top10 or 0) < 20)
-
-    score = 100
-    authority_penalty = (35 if mintable != "0" else 0) + (25 if freezable != "0" else 0)
-    if issuer_backed:
-        authority_penalty = min(authority_penalty, 15)
-    score -= authority_penalty
-    if top10 is not None:
-        score -= min(25, int(max(0, top10 - 30) / 2))
-    if lp_total and not lp_locked:
-        score -= 15
-    if res.get("transfer_fee") or res.get("transfer_hook"):
-        score -= 10
-    score = max(0, min(100, score))
-    hard = ("not locked", "non-transferable", "closable", "transfer hook")
-    if issuer_backed:
-        level = "medium" if any(any(k in w for k in hard) for w in warnings) else "low"
-    else:
-        level = ("high" if any(("mint authority" in w or "freeze authority" in w or "not locked" in w)
-                               for w in warnings)
-                 else "medium" if warnings else "low")
-    out.update({"checked": True, "risk_level": level, "safety_score": score,
-                "name": (res.get("metadata") or {}).get("name"),
-                "symbol": (res.get("metadata") or {}).get("symbol"),
-                "mint_authority_revoked": mintable == "0",
-                "freeze_authority_revoked": freezable == "0",
-                "holder_count": res.get("holder_count"),
-                "top10_holder_pct": top10,
-                "lp_holder_pct": lp_total,
-                "lp_locked_pct": lp_locked,
-                "trusted_by_goplus": trusted,
-                "issuer_backed": issuer_backed,
-                "authority_note": ("this mint is on GoPlus's trusted list with a wide holder base, so live "
-                                   "mint/freeze authority is read as issuer control (how regulated "
-                                   "stablecoins work) rather than as a rug signal"
-                                   if issuer_backed else None),
-                "creators": [c.get("address") for c in (res.get("creators") or [])][:3],
-                "warnings": warnings or ["no red flag in the checked dimensions"],
-                "scoring": "100 minus 35 if mint authority is live, 25 if freeze authority is live "
-                           "(capped at 15 combined for issuer-backed tokens), "
-                           "up to 25 for top-10 concentration, 15 if liquidity is unlocked, "
-                           "10 for transfer fee or hook",
-                "not_covered": ["holder wallet history and wash-trading patterns",
-                                "creator's other deployments",
-                                "on-chain liquidity depth in USD (no DEX aggregator is queried here)"],
-                "disclaimer": "Judgement is derived from the public GoPlus Labs dataset as fetched at "
-                              "call time. It is a risk signal, not investment advice."})
-    return out
-
-
-
-
-# ---- P2 (2026-10-14): Base 合约与代币风控（EVM，GoPlus chain_id 8453，纯聚合）---
-BASE_CHAIN_ID = 8453
-BASESCAN = "https://basescan.org"
-
-_BASE_HARD_FLAGS = ("is_honeypot", "cannot_sell_all", "owner_change_balance", "hidden_owner",
-                    "can_take_back_ownership", "is_blacklisted", "selfdestruct")
-_BASE_WARN_FLAGS = ("is_proxy", "transfer_pausable", "trading_cooldown", "slippage_modifiable",
-                    "personal_slippage_modifiable", "external_call", "is_anti_whale", "is_mintable")
-# 受监管发行方代币（USDC/USDT 这类）本来就有代理升级、暂停、增发权，这些是合规控制而不是
-# 拉盘后门；不区分就会把主流稳定币误判成中危。命中这些关键词的告警在 issuer_backed 时
-# 挪到 issuer_control[]，只说明事实，不参与扣分。
-_BASE_ISSUER_SOFT = ("upgradeable", "mintable", "can be paused", "slippage/tax can be changed",
-                     "anti-whale limits", "trading cooldown")
-
-
-def _goplus_evm_token(chain_id, contract):
-    d = _http_json("%s/token_security/%s?contract_addresses=%s" % (GOPLUS_BASE, chain_id, contract),
-                   timeout=15)
-    res = d.get("result") or {}
-    return res.get(contract) or res.get(contract.lower()) or {}
-
-
-def _pct(v):
-    """GoPlus 的税率是小数（0.05 = 5%）。"""
-    try:
-        return round(float(v) * 100, 3)
-    except (TypeError, ValueError):
-        return None
-
-
-def _flag(res, key):
-    return str(res.get(key) or "0") == "1"
-
-
-def t_base_check_contract_risk(contract):
-    """Base 合约/代币风控：貔貅、税率、开源、后门与 LP 锁定，一次给全。"""
-    c = (contract or "").strip()
-    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", c):
-        return {"contract": c, "chain": "BASE", "checked": False,
-                "error": "not an EVM contract address (0x + 40 hex chars)", "_no_charge": True}
-    c = c.lower()
-    out = {"contract": c, "chain": "BASE", "chain_id": BASE_CHAIN_ID, "asset_scope": "ERC-20 on Base",
-           "sources": ["GoPlus Labs token_security (EVM chain 8453)", BASESCAN + "/address/" + c]}
-    try:
-        res = _goplus_evm_token(BASE_CHAIN_ID, c)
-    except Exception as exc:  # noqa: BLE001
-        return {"contract": c, "chain": "BASE", "checked": False,
-                "error": "%s: %s" % (type(exc).__name__, str(exc)[:120]), "_no_charge": True}
-    if not res:
-        return {"contract": c, "chain": "BASE", "checked": False,
-                "reason": "no token-security record: the contract is not indexed by GoPlus on Base, "
-                          "is not an ERC-20, or was deployed in the last minutes",
-                "how_to_check": BASESCAN + "/address/" + c,
-                "note": "no record is not the same as safe", "_no_charge": True}
-
-    honeypot = _flag(res, "is_honeypot") or _flag(res, "cannot_sell_all")
-    buy_tax = _pct(res.get("buy_tax"))
-    sell_tax = _pct(res.get("sell_tax"))
-    holders = res.get("holders") or []
-    try:
-        top10 = round(sum(float(h.get("percent") or 0) for h in holders[:10]) * 100, 2)
-    except (TypeError, ValueError):
-        top10 = None
-    lp = res.get("lp_holders") or []
-    try:
-        lp_total = round(sum(float(x.get("percent") or 0) for x in lp) * 100, 2)
-        lp_locked = round(sum(float(x.get("percent") or 0) for x in lp if x.get("is_locked")) * 100, 2)
-    except (TypeError, ValueError):
-        lp_total, lp_locked = None, None
-
-    try:
-        holders_n = int(str(res.get("holder_count") or "0"))
-    except ValueError:
-        holders_n = 0
-    # trust_list 是 GoPlus 自己维护的白名单；稳定币的 top-10 里坐的是交易所与财库地址，
-    # 集中度高不等于控盘，所以这里不再拿集中度当门槛，而是把发行方控制类告警单独列出。
-    issuer_backed = bool(_flag(res, "trust_list") and holders_n >= 100000)
-
-    warnings, hard = [], []
-    if _flag(res, "is_honeypot"):
-        hard.append("GoPlus flags this token as a honeypot")
-    if _flag(res, "cannot_sell_all"):
-        hard.append("holders cannot sell the full balance")
-    if _flag(res, "owner_change_balance"):
-        hard.append("the owner can rewrite holder balances")
-    if _flag(res, "hidden_owner"):
-        hard.append("a hidden owner exists")
-    if _flag(res, "can_take_back_ownership"):
-        hard.append("ownership can be taken back after renouncing")
-    if _flag(res, "selfdestruct"):
-        hard.append("the contract can selfdestruct")
-    if _flag(res, "is_blacklisted"):
-        hard.append("the token is blacklisted by GoPlus")
-    if sell_tax is not None and sell_tax >= 10:
-        warnings.append("sell tax is %.2f%% - a large part of the exit is confiscated" % sell_tax)
-    elif sell_tax:
-        warnings.append("sell tax is %.2f%%" % sell_tax)
-    if buy_tax:
-        warnings.append("buy tax is %.2f%%" % buy_tax)
-    if not _flag(res, "is_open_source") and res.get("is_open_source") is not None:
-        warnings.append("contract source is NOT verified/open")
-    if _flag(res, "is_proxy"):
-        warnings.append("contract is upgradeable (proxy) - the logic can be replaced")
-    if _flag(res, "transfer_pausable"):
-        warnings.append("transfers can be paused")
-    if _flag(res, "is_mintable"):
-        warnings.append("supply is mintable")
-    if _flag(res, "trading_cooldown"):
-        warnings.append("a trading cooldown is enforced")
-    if _flag(res, "slippage_modifiable") or _flag(res, "personal_slippage_modifiable"):
-        warnings.append("slippage/tax can be changed by the owner")
-    if _flag(res, "external_call"):
-        warnings.append("contract makes external calls (a rug vector)")
-    if _flag(res, "is_anti_whale"):
-        warnings.append("anti-whale limits are active")
-    if top10 is not None and top10 >= 50:
-        warnings.append("top-10 holders control %.1f%% of supply" % top10)
-    if lp_total is not None and lp_total > 0 and (lp_locked or 0) <= 0:
-        warnings.append("liquidity is not locked")
-    if _flag(res, "honeypot_with_same_creator"):
-        warnings.append("the same creator has shipped honeypots before")
-    if _flag(res, "fake_token") or (res.get("is_true_token") is not None and not _flag(res, "is_true_token")):
-        warnings.append("GoPlus does not treat this as the genuine token")
-    if _flag(res, "is_airdrop_scam"):
-        warnings.append("flagged as an airdrop scam")
-
-    score = 100
-    score -= 45 * len([k for k in _BASE_HARD_FLAGS if _flag(res, k)])
-    if honeypot:
-        score = min(score, 15)
-    tax_penalty = 0
-    if sell_tax is not None and sell_tax >= 10:
-        tax_penalty += 25
-    elif sell_tax is not None and sell_tax >= 5:
-        tax_penalty += 10
-    if buy_tax is not None and buy_tax >= 10:
-        tax_penalty += 15
-    score -= tax_penalty
-    if res.get("is_open_source") is not None and not _flag(res, "is_open_source"):
-        score -= 15
-    issuer_control = []
-    if issuer_backed:
-        issuer_control = [w for w in warnings if any(k in w for k in _BASE_ISSUER_SOFT)]
-        warnings = [w for w in warnings if w not in issuer_control]
-    else:
-        for k in _BASE_WARN_FLAGS:
-            if _flag(res, k):
-                score -= 8
-    if top10 is not None:
-        score -= min(25, int(max(0, top10 - 30) / 2))
-    if lp_total and not lp_locked:
-        score -= 15
-    score = max(0, min(100, score))
-    if hard or honeypot or (sell_tax or 0) >= 10:
-        level = "high"
-    elif warnings:
-        level = "medium"
-    else:
-        level = "low"
-    if issuer_backed and level == "high" and not honeypot:
-        level = "medium"
-
-    out.update({
-        "checked": True, "risk_level": level, "safety_score": score,
-        "token_name": res.get("token_name"), "token_symbol": res.get("token_symbol"),
-        "is_honeypot": _flag(res, "is_honeypot"),
-        "cannot_sell_all": _flag(res, "cannot_sell_all"),
-        "buy_tax_pct": buy_tax, "sell_tax_pct": sell_tax,
-        "is_open_source": None if res.get("is_open_source") is None else _flag(res, "is_open_source"),
-        "is_proxy": _flag(res, "is_proxy"), "is_mintable": _flag(res, "is_mintable"),
-        "owner_change_balance": _flag(res, "owner_change_balance"),
-        "hidden_owner": _flag(res, "hidden_owner"),
-        "can_take_back_ownership": _flag(res, "can_take_back_ownership"),
-        "transfer_pausable": _flag(res, "transfer_pausable"),
-        "selfdestruct": _flag(res, "selfdestruct"),
-        "is_blacklisted": _flag(res, "is_blacklisted"),
-        "honeypot_with_same_creator": _flag(res, "honeypot_with_same_creator"),
-        "holder_count": res.get("holder_count"),
-        "top10_holder_pct": top10,
-        "lp_holder_pct": lp_total, "lp_locked_pct": lp_locked,
-        "trust_list": _flag(res, "trust_list"), "issuer_backed": issuer_backed,
-        "issuer_control": issuer_control or None,
-        "issuer_note": ("this token is on GoPlus's trust list with a wide holder base, so upgradeable "
-                        "proxy / pausable / mintable control is read as issuer compliance control "
-                        "(how regulated stablecoins work) rather than as a rug signal"
-                        if issuer_backed else None),
-        "owner_address": res.get("owner_address"),
-        "dex": [{"name": d.get("name"), "liquidity": d.get("liquidity"),
-                 "pair": d.get("pair")} for d in (res.get("dex") or [])[:5]],
-        "creators": [x.get("address") for x in (res.get("creators") or [])][:3],
-        "warnings": (hard + warnings) or ["no red flag in the checked dimensions"],
-        "scoring": "100 minus 45 per hard backdoor flag (honeypot caps the score at 15), 25 if the sell "
-                   "tax is >=10% (15 if the buy tax is), 15 if the source is not verified, 8 per "
-                   "upgrade/pause/mint/slippage flag, up to 25 for top-10 concentration, 15 if "
-                   "liquidity is unlocked",
-        "not_covered": [
-            "a live sell simulation with a real quote (no swap simulator is queried here)",
-            "whether the owner key is compromised, or off-chain rug intent",
-            "liquidity depth in USD (no DEX aggregator is queried)",
-            "contracts and tokens that GoPlus has not indexed on Base yet"],
-        "disclaimer": "Derived from the public GoPlus Labs dataset as fetched at call time. A risk screen, "
-                      "not investment advice; no record does not mean safe.",
-    })
-    return out
-
-
-# ==================== 2026-10-18: Base / Solana via external RPC ====================
-# 用户决定：这两条链短期不做本地节点，读路径全部走外部 RPC（可用 RB_* 覆盖）。
-# 这些工具只读，响应里明确写 source，不冒充自有节点。
-BASE_RPC_URL = os.environ.get("RB_BASE_RPC", "https://base-rpc.publicnode.com")
-SOLANA_RPC_URL = os.environ.get("RB_SOLANA_RPC", "https://solana-rpc.publicnode.com")
-BASE_RPC_FALLBACKS = [u.strip() for u in os.environ.get(
-    "RB_BASE_RPC_FALLBACKS", "https://base-rpc.publicnode.com,https://base.drpc.org").split(",") if u.strip()]
-SOL_RPC_FALLBACKS = [u.strip() for u in os.environ.get(
-    "RB_SOLANA_RPC_FALLBACKS", "https://solana-rpc.publicnode.com").split(",") if u.strip()]
-
-
-def _rpc(url, method, params, timeout=15, fallbacks=()):
-    """JSON-RPC with retry + endpoint fallback.
-
-    Public endpoints rate-limit aggressively (403/429). A JSON-RPC error is a real
-    answer and is raised immediately; transport/HTTP failures move to the next URL.
-    """
-    urls = [url] + [u for u in fallbacks if u and u != url]
-    last = None
-    for u in urls:
-        for attempt in range(2):
-            try:
-                body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-                req = urllib.request.Request(u, data=json.dumps(body).encode(),
-                                             headers={"content-type": "application/json",
-                                                      "user-agent": "robotbase-mcp/1"})
-                with urllib.request.urlopen(req, timeout=timeout) as r:
-                    d = json.loads(r.read() or b"{}")
-                if d.get("error"):
-                    raise RuntimeError(str((d["error"] or {}).get("message") or d["error"])[:160])
-                return d.get("result")
-            except RuntimeError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                last = exc
-                time.sleep(0.4 * (attempt + 1))
-    raise last if last else RuntimeError("rpc failed")
-
-
-def _base_rpc(method, params, timeout=15):
-    return _rpc(BASE_RPC_URL, method, params, timeout, BASE_RPC_FALLBACKS)
-
-
-def _sol_rpc(method, params, timeout=15):
-    return _rpc(SOLANA_RPC_URL, method, params, timeout, SOL_RPC_FALLBACKS)
-
-
-def _rpc_source(url):
-    """Human-readable source that never leaks a private relay address."""
-    host = urllib.parse.urlparse(url).hostname or ""
-    try:
-        if ipaddress.ip_address(host).is_private or ipaddress.ip_address(host).is_loopback:
-            return "external RPC via managed gateway"
-    except ValueError:
-        pass
-    return "external RPC " + (urllib.parse.urlparse(url).netloc or url)
-
-
-def _hexint(v):
-    try:
-        return int(str(v), 16)
-    except (TypeError, ValueError):
-        return None
-
-
-def t_base_get_balance(address, contract=None):
-    """Base 地址余额：原生 ETH，可选再读一个 ERC-20 的余额。走外部 RPC。"""
-    a = (address or "").strip()
-    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", a):
-        return {"address": a, "chain": "BASE", "checked": False,
-                "error": "not an EVM address (0x + 40 hex)", "_no_charge": True}
-    out = {"address": a.lower(), "chain": "BASE", "chain_id": BASE_CHAIN_ID, "checked": True,
-           "source": _rpc_source(BASE_RPC_URL)}
-    try:
-        wei = _hexint(_base_rpc("eth_getBalance", [a, "latest"]))
-        out["block"] = _hexint(_base_rpc("eth_blockNumber", []))
-    except Exception as exc:  # noqa: BLE001
-        return {"address": a, "chain": "BASE", "checked": False,
-                "error": "%s: %s" % (type(exc).__name__, str(exc)[:120])}
-    out["native_balance_wei"] = str(wei)
-    out["native_balance_eth"] = round(wei / 1e18, 18) if wei is not None else None
-    c = (contract or "").strip()
-    if c:
-        if not re.fullmatch(r"0x[0-9a-fA-F]{40}", c):
-            out["token_error"] = "contract must be 0x + 40 hex"
-            return out
-        try:
-            raw = _base_rpc("eth_call",
-                       [{"to": c, "data": "0x70a08231" + _eth_abi_pad_addr(a)}, "latest"])
-            val = _hexint(raw)
-            dec = _hexint(_base_rpc("eth_call",
-                               [{"to": c, "data": "0x313ce567"}, "latest"])) or 0
-            out["token"] = {"contract": c.lower(), "balance_raw": str(val), "decimals": dec,
-                            "balance": (val / (10 ** dec)) if val is not None and dec else None}
-        except Exception as exc:  # noqa: BLE001
-            out["token_error"] = "%s: %s" % (type(exc).__name__, str(exc)[:120])
-    return out
-
-
-def t_base_get_transaction(txid):
-    """Base 交易核验：是否上链、成功与否、区块、金额、手续费。走外部 RPC。"""
-    h = (txid or "").strip()
-    if not re.fullmatch(r"0x[0-9a-fA-F]{64}", h):
-        return {"txid": h, "chain": "BASE", "found": False,
-                "error": "not an EVM transaction hash (0x + 64 hex)", "_no_charge": True}
-    try:
-        tx = _base_rpc("eth_getTransactionByHash", [h])
-        rc = _base_rpc("eth_getTransactionReceipt", [h])
-        head = _hexint(_base_rpc("eth_blockNumber", []))
-    except Exception as exc:  # noqa: BLE001
-        return {"txid": h, "chain": "BASE", "found": False,
-                "error": "%s: %s" % (type(exc).__name__, str(exc)[:120])}
-    if not tx and not rc:
-        return {"txid": h, "chain": "BASE", "found": False,
-                "reason": "not found on this RPC (mempool, other chain, or typo)",
-                "source": _rpc_source(BASE_RPC_URL)}
-    block = _hexint((tx or rc or {}).get("blockNumber"))
-    gas_used = _hexint((rc or {}).get("gasUsed"))
-    price = _hexint((rc or {}).get("effectiveGasPrice") or (tx or {}).get("gasPrice"))
-    value = _hexint((tx or {}).get("value"))
-    status = _hexint((rc or {}).get("status"))
-    return {
-        "txid": h, "chain": "BASE", "found": True, "checked": True,
-        "status": ("success" if status == 1 else "failed" if status == 0 else "pending"),
-        "block": block,
-        "confirmations": (head - block + 1) if (head is not None and block is not None) else None,
-        "from": (tx or {}).get("from"), "to": (tx or {}).get("to"),
-        "value_wei": str(value), "value_eth": round(value / 1e18, 18) if value is not None else None,
-        "gas_used": gas_used, "fee_wei": str(gas_used * price) if gas_used and price else None,
-        "logs": len((rc or {}).get("logs") or []),
-        "contract_created": (rc or {}).get("contractAddress"),
-        "source": _rpc_source(BASE_RPC_URL),
-    }
-
-
-def t_base_read_contract(contract, function, argument=None, selector=None, parameter=None,
-                         output_type=None):
-    """Base 合约只读调用（eth_call），沿用与 eth_read_contract 相同的 selector 规则。"""
-    c = (contract or "").strip()
-    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", c):
-        return {"error": "not a Base contract address (0x + 40 hex)", "_no_charge": True}
-    fn = (function or "").strip()
-    if selector:
-        sel = str(selector).strip().lower().lstrip("0x")
-        if not re.fullmatch(r"[0-9a-f]{8}", sel):
-            return {"error": "selector must be 4 bytes of hex (8 chars)", "_no_charge": True}
-        sig = fn or "raw"
-        param = (parameter or "").lstrip("0x")
-        kind = output_type or "uint256"
-    else:
-        base = fn.split("(")[0]
-        if base not in ERC20_ARITY:
-            return {"error": "unknown function %r - pass an explicit `selector`" % fn,
-                    "known": sorted(ERC20_ARITY), "_no_charge": True}
-        arity = ERC20_ARITY[base]
-        sig = base + "(" + ",".join(["address"] * arity) + ")"
-        parts = []
-        for arg in (argument,):
-            if arity and not _eth_abi_pad_addr(arg):
-                return {"error": "%s needs an address argument" % base, "_no_charge": True}
-            if arity:
-                parts.append(_eth_abi_pad_addr(arg))
-        param = "".join(parts)
-        kind = output_type or ("string" if base in ("symbol", "name") else "uint256")
-        sel = ERC20_SELECTOR.get(sig)
-        if not sel:
-            return {"error": "no built-in selector for %r" % sig, "_no_charge": True}
-    try:
-        r = _base_rpc("eth_call", [{"to": c, "data": "0x" + sel + param}, "latest"])
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "contract": c, "function": sig,
-                "error": "%s: %s" % (type(exc).__name__, str(exc)[:140])}
-    if not r or r == "0x":
-        return {"ok": False, "contract": c, "function": sig, "error": "eth_call returned empty",
-                "hint": "the function may not exist, or the call reverted"}
-    raw = r[2:]
-    val = _eth_abi_decode(raw, kind)
-    out = {"ok": True, "contract": c, "function": sig, "selector": sel, "output_type": kind,
-           "value": val, "raw": raw, "source": _rpc_source(BASE_RPC_URL)}
-    if isinstance(val, int) and (sig.startswith("balanceOf") or sig.startswith("totalSupply")
-                                 or sig.startswith("allowance")):
-        try:
-            dec = _hexint(_base_rpc("eth_call",
-                               [{"to": c, "data": "0x313ce567"}, "latest"]))
-            if dec is not None:
-                out["decimals"] = dec
-                out["value_human"] = round(val / 10 ** dec, 6)
-        except Exception:  # noqa: BLE001
-            pass
-    return out
-
-
-def t_sol_get_balance(address, mint=None):
-    """Solana 余额：原生 SOL，可选再读一个 SPL token（默认 USDC）。走外部 RPC。"""
-    a = (address or "").strip()
-    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", a):
-        return {"address": a, "chain": "SOL", "checked": False,
-                "error": "not a Solana address (base58, 32-44 chars)", "_no_charge": True}
-    try:
-        b = _sol_rpc("getBalance", [a, {"commitment": "confirmed"}])
-        slot = _sol_rpc("getSlot", [{"commitment": "confirmed"}])
-    except Exception as exc:  # noqa: BLE001
-        return {"address": a, "chain": "SOL", "checked": False,
-                "error": "%s: %s" % (type(exc).__name__, str(exc)[:120])}
-    lamports = int((b or {}).get("value") or 0)
-    out = {"address": a, "chain": "SOL", "checked": True, "slot": slot,
-           "lamports": lamports, "sol": round(lamports / 1e9, 9),
-           "source": _rpc_source(SOLANA_RPC_URL)}
-    if mint:
-        try:
-            r = _sol_rpc("getTokenAccountsByOwner",
-                     [a, {"mint": mint}, {"encoding": "jsonParsed", "commitment": "confirmed"}])
-            total = 0.0
-            for acc in (r or {}).get("value", []):
-                amt = (((acc.get("account") or {}).get("data") or {}).get("parsed") or {}) \
-                    .get("info", {}).get("tokenAmount") or {}
-                total += float(amt.get("uiAmountString") or 0)
-            out["token"] = {"mint": mint, "balance": total,
-                            "accounts": len((r or {}).get("value", []))}
-        except Exception as exc:  # noqa: BLE001
-            out["token_error"] = "%s: %s" % (type(exc).__name__, str(exc)[:120])
-    return out
-
-
-def t_sol_get_transaction(signature):
-    """Solana 交易核验：slot、状态、手续费、余额变化与日志数。走外部 RPC。"""
-    sig = (signature or "").strip()
-    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{60,100}", sig):
-        return {"signature": sig, "chain": "SOL", "found": False,
-                "error": "not a Solana transaction signature (base58)", "_no_charge": True}
-    try:
-        r = _sol_rpc("getTransaction",
-                 [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0,
-                        "commitment": "confirmed"}])
-    except Exception as exc:  # noqa: BLE001
-        return {"signature": sig, "chain": "SOL", "found": False,
-                "error": "%s: %s" % (type(exc).__name__, str(exc)[:120])}
-    if not r:
-        return {"signature": sig, "chain": "SOL", "found": False,
-                "reason": "not found at confirmed commitment (old, dropped, or typo)",
-                "source": _rpc_source(SOLANA_RPC_URL)}
-    meta = r.get("meta") or {}
-    msg = ((r.get("transaction") or {}).get("message") or {})
-    keys = msg.get("accountKeys") or []
-    pre = meta.get("preBalances") or []
-    post = meta.get("postBalances") or []
-    deltas = [{"account": (k.get("pubkey") if isinstance(k, dict) else str(k)),
-               "delta_lamports": (post[i] - pre[i]) if i < len(post) and i < len(pre) else None}
-              for i, k in enumerate(keys[:12])]
-    return {
-        "signature": sig, "chain": "SOL", "found": True,
-        "slot": r.get("slot"), "block_time": r.get("blockTime"),
-        "success": meta.get("err") is None,
-        "error": meta.get("err"),
-        "fee_lamports": meta.get("fee"), "fee_sol": round((meta.get("fee") or 0) / 1e9, 9),
-        "accounts": len(keys), "logs": len(meta.get("logMessages") or []),
-        "balance_changes": deltas,
-        "source": _rpc_source(SOLANA_RPC_URL),
-    }
-
-
-def t_sol_get_account(address):
-    """Solana 账户信息：owner、lamports、是否可执行、数据大小/类型。走外部 RPC。"""
-    a = (address or "").strip()
-    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", a):
-        return {"address": a, "chain": "SOL", "found": False,
-                "error": "not a Solana address (base58)", "_no_charge": True}
-    try:
-        r = _sol_rpc("getAccountInfo",
-                 [a, {"encoding": "jsonParsed", "commitment": "confirmed"}])
-    except Exception as exc:  # noqa: BLE001
-        return {"address": a, "chain": "SOL", "found": False,
-                "error": "%s: %s" % (type(exc).__name__, str(exc)[:120])}
-    v = (r or {}).get("value")
-    if not v:
-        return {"address": a, "chain": "SOL", "found": False,
-                "reason": "account does not exist or has no lamports",
-                "source": _rpc_source(SOLANA_RPC_URL)}
-    data = v.get("data")
-    if isinstance(data, dict):
-        dtype = data.get("parsed", {}).get("type") if isinstance(data.get("parsed"), dict) else None
-        space = data.get("space")
-    else:
-        dtype = None
-        space = None
-    return {
-        "address": a, "chain": "SOL", "found": True, "checked": True,
-        "owner": v.get("owner"), "lamports": v.get("lamports"),
-        "sol": round((v.get("lamports") or 0) / 1e9, 9),
-        "executable": v.get("executable"), "rent_epoch": v.get("rentEpoch"),
-        "data_type": dtype, "data_space": space,
-        "source": _rpc_source(SOLANA_RPC_URL),
-    }
-
-
 TOOLS = [    ("list_chains",
      "List every chain on the RobotBase roster with its state. "
      "When to use: the user asks which chains are supported, which nodes are online, or where to start. "
@@ -2451,8 +1785,8 @@ TOOLS = [    ("list_chains",
      "Do not use: fees (that is btc_get_fee_rates); a specific payment (that is btc_get_transaction); ZEC pool distribution (that is zec_get_pool_status). "
      "Returns: chain, ok, synced, height, peers, mempool, client, state; a chain that is not live yet returns served=false plus its tier instead of an error.",
      {"type": "object", "properties": {"chain": {"type": "string",
-                                                 "enum": ["btc", "eth", "xmr", "zec", "base", "sol", "tron"],
-                                                 "description": "Chain id: btc / eth / xmr / zec / base / sol / tron"}},
+                                                 "enum": ["btc", "eth", "xmr", "zec", "tron"],
+                                                 "description": "Chain id: btc / eth / xmr / zec / tron"}},
       "required": ["chain"], "additionalProperties": False}, lambda a: t_chain_status(a.get("chain"))),    ("robotbase_capabilities",
      "Per-chain capability, retention boundary and fee model. "
      "When to use: before promising that some query is possible, or when a tool refused a query as out of range. "
@@ -2782,7 +2116,7 @@ TOOLS = [    ("list_chains",
      "TRON contract metadata: name, creator, whether its ABI is published on chain, the function list, "
      "code hash and whether it looks like a TRC-20. "
      "When to use: before calling a contract, or to tell an unverified contract from a published one. "
-     "Do not use: for risk/backdoor analysis (that is tron_check_address_risk and, on EVM, base_check_contract_risk). "
+     "Do not use: for risk/backdoor analysis (that is tron_check_address_risk). "
      "Returns: found, address, name, creator, has_abi, abi_entry_count, is_trc20, functions, code_hash.",
      {"type": "object", "properties": {"address": {"type": "string", "description": "TRON contract address"}},
       "required": ["address"], "additionalProperties": False}, lambda a: t_tron_contract(a.get("address"))),
@@ -2873,110 +2207,6 @@ TOOLS = [    ("list_chains",
                                        "expected_amount_usdt": {"type": "number", "description": "Optional: the USDT amount you expect"}},
       "required": ["txid"], "additionalProperties": False},
      lambda a: t_tron_verify_usdt_transfer(a.get("txid"), a.get("expected_to"), a.get("expected_amount_usdt"))),
-    ("sol_check_token_safety",
-     "Solana token rug-pull screen: mint and freeze authority, liquidity lock, holder concentration. "
-     "When to use: before an agent buys or quotes a Solana token, or when a mint address shows up in a "
-     "trade signal and you need the safety facts first. "
-     "Do not use: for price or liquidity depth in USD (no DEX aggregator is queried here); for TRON "
-     "addresses use tron_check_address_risk. "
-     "Returns: risk_level (low|medium|high), safety_score, mint_authority_revoked, freeze_authority_revoked, "
-     "lp_locked_pct, lp_holder_pct, top10_holder_pct, holder_count, transfer_fee / transfer_hook presence, "
-     "warnings[], not_covered[] and a disclaimer. "
-     "Metered: 5 free calls per day per IP, then 0.01 USDC per call over x402. There is no API key: "
-     "the 402 answer carries the machine-readable terms in structuredContent.accepts[].",
-     {"type": "object", "properties": {
-         "mint": {"type": "string", "description": "Solana token mint address (base58). Preferred name."},
-         "address": {"type": "string", "description": "Alias for `mint` - accepted so a generic agent can pass `address`."}},
-      "anyOf": [{"required": ["mint"]}, {"required": ["address"]}],
-      "additionalProperties": False},
-     lambda a: t_sol_check_token_safety(_arg(a, "mint", "address", "token_address", "token"))),
-    ("base_check_contract_risk",
-     "Base (EVM) token and contract risk screen: honeypot, transfer taxes, verified source, backdoors "
-     "and liquidity lock. "
-     "When to use: before an agent trades, quotes or accepts a token on Base, or when an address shows up "
-     "in an AgentKit / onchain-agent flow and you need the hard facts first - can it be sold, what does "
-     "the exit cost, who can change the rules. "
-     "Do not use: for Solana mints (that is sol_check_token_safety) or for TRON addresses "
-     "(tron_check_address_risk); it does not simulate a live sell. "
-     "Returns: risk_level (low|medium|high), safety_score, is_honeypot, cannot_sell_all, buy_tax_pct, "
-     "sell_tax_pct, is_open_source, is_proxy, is_mintable, owner_change_balance, hidden_owner, "
-     "can_take_back_ownership, transfer_pausable, selfdestruct, holder_count, top10_holder_pct, "
-     "lp_locked_pct, dex pairs, warnings[], not_covered[] and a disclaimer. "
-     "Metered: 5 free calls per day per IP, then 0.01 USDC per call over x402. There is no API key: "
-     "the 402 answer carries the machine-readable terms in structuredContent.accepts[].",
-     {"type": "object", "properties": {
-         "contract": {"type": "string", "description": "Base ERC-20 / contract address (0x + 40 hex). Preferred name."},
-         "address": {"type": "string", "description": "Alias for `contract` - accepted so a generic agent can pass `address`."}},
-     "anyOf": [{"required": ["contract"]}, {"required": ["address"]}],
-      "additionalProperties": False},
-     lambda a: t_base_check_contract_risk(_arg(a, "contract", "address", "token_address", "token"))),
-    ("base_get_balance",
-     "Base balance lookup: native ETH for an address, optionally plus one ERC-20 balance. "
-     "When to use: a Base agent needs to know whether a wallet can pay gas, or how much of a token it holds. "
-     "Data source: external Base JSON-RPC (no self-hosted Base node). "
-     "Returns: native_balance_wei / native_balance_eth, current block, and for a token contract "
-     "balance_raw / decimals / balance. "
-     "Free: no metering.",
-     {"type": "object", "properties": {
-         "address": {"type": "string", "description": "Base address (0x + 40 hex)"},
-         "contract": {"type": "string", "description": "Optional ERC-20 contract to read balanceOf"}},
-      "required": ["address"], "additionalProperties": False},
-     lambda a: t_base_get_balance(a.get("address"), a.get("contract"))),
-    ("base_get_transaction",
-     "Base transaction verification: did it land, did it succeed, how many confirmations, what did it cost. "
-     "When to use: an agent or merchant must confirm a Base payment before releasing value. "
-     "Data source: external Base JSON-RPC (no self-hosted Base node). "
-     "Returns: found, status (success|failed|pending), block, confirmations, from, to, value, "
-     "gas_used, fee_wei, logs, contract_created. "
-     "Free: no metering.",
-     {"type": "object", "properties": {"txid": {"type": "string",
-                                                "description": "Base transaction hash (0x + 64 hex)"}},
-      "required": ["txid"], "additionalProperties": False},
-     lambda a: t_base_get_transaction(a.get("txid"))),
-    ("base_read_contract",
-     "Base contract read-only call (eth_call) with ERC-20 sugar: balanceOf / allowance / decimals / "
-     "symbol / name / totalSupply. For any other function pass an explicit 4-byte selector and "
-     "ABI-encoded parameter. Data source: external Base JSON-RPC. No state change.",
-     {"type": "object", "properties": {
-         "contract": {"type": "string", "description": "Base contract (0x + 40 hex)"},
-         "function": {"type": "string", "description": "ERC-20 function name, e.g. balanceOf"},
-         "argument": {"type": "string", "description": "Address argument for balanceOf/allowance"},
-         "selector": {"type": "string", "description": "Optional 4-byte selector (8 hex) for non-ERC20 calls"},
-         "parameter": {"type": "string", "description": "ABI-encoded parameter when selector is given"},
-         "output_type": {"type": "string", "description": "uint256 | string | bool | address"}},
-      "required": ["contract", "function"], "additionalProperties": False},
-     lambda a: t_base_read_contract(a.get("contract"), a.get("function"), a.get("argument"),
-                                    a.get("selector"), a.get("parameter"), a.get("output_type"))),
-    ("sol_get_balance",
-     "Solana balance lookup: native SOL in lamports, optionally plus one SPL token balance "
-     "(pass the mint, e.g. USDC EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v). "
-     "Data source: external Solana JSON-RPC (no self-hosted Solana node). "
-     "Returns: lamports, sol, current slot, and token balance/accounts when a mint is given. "
-     "Free: no metering.",
-     {"type": "object", "properties": {
-         "address": {"type": "string", "description": "Solana address (base58)"},
-         "mint": {"type": "string", "description": "Optional SPL token mint to read"}},
-      "required": ["address"], "additionalProperties": False},
-     lambda a: t_sol_get_balance(a.get("address"), a.get("mint"))),
-    ("sol_get_transaction",
-     "Solana transaction verification by signature: slot, success, fee, balance changes. "
-     "When to use: confirm a Solana payment or program call before releasing value. "
-     "Data source: external Solana JSON-RPC (no self-hosted Solana node). "
-     "Returns: found, slot, block_time, success, error, fee_lamports/fee_sol, accounts, logs, "
-     "and the first 12 account balance deltas. "
-     "Free: no metering.",
-     {"type": "object", "properties": {"signature": {"type": "string",
-                                                     "description": "Solana transaction signature (base58)"}},
-      "required": ["signature"], "additionalProperties": False},
-     lambda a: t_sol_get_transaction(a.get("signature"))),
-    ("sol_get_account",
-     "Solana account info: owner program, lamports, executable flag, parsed data type and space. "
-     "Data source: external Solana JSON-RPC (no self-hosted Solana node). "
-     "Returns found=false when the account does not exist. Free: no metering.",
-     {"type": "object", "properties": {"address": {"type": "string",
-                                                   "description": "Solana account address (base58)"}},
-      "required": ["address"], "additionalProperties": False},
-     lambda a: t_sol_get_account(a.get("address"))),
 ]
 
 
@@ -3149,18 +2379,18 @@ def handle(msg):
             "serverInfo": SERVER_INFO,
             "instructions": ("RobotBase is the semantic verification and risk-intelligence surface for "
                              "Web3 agents. Call list_chains or robotbase_capabilities first to see which "
-                             "chains are live today (BTC/ETH/XMR/ZEC) and what each node can and cannot "
-                             "answer. Every tool is a read-only query: none of them sign, trade, move "
-                             "funds or hold keys, and RobotBase operates no mining pool. For payment "
+                             "chains are live today (BTC/ETH/XMR/ZEC/TRON) and what each node can and "
+                             "cannot answer. Every tool is a read-only query: none of them sign, trade, "
+                             "move funds or hold keys, and RobotBase operates no mining pool. For payment "
                              "safety use tron_check_address_risk before accepting USDT and "
-                             "tron_verify_usdt_transfer before releasing value; sol_check_token_safety "
-                             "screens a Solana mint before a trade; base_check_contract_risk screens a Base "
-                             "ERC-20 before touching it (honeypot, taxes, verified source, backdoors). "
-                             "Those four risk tools are metered: a free daily allowance per IP, then 0.01 "
-                             "USDC per call paid over x402 by the caller's own wallet - there is no API "
-                             "key, no account and no subscription of any kind. When the allowance runs "
-                             "out the tool answers Payment Required with the machine-readable terms in "
-                             "structuredContent.accepts[]; settle a credit pack once and keep sending "
+                             "tron_verify_usdt_transfer before releasing value. Those two risk tools are "
+                             "metered: a free daily allowance per IP, then 0.01 USDC per call paid over "
+                             "x402 by the caller's own wallet - there is no API key, no account and no "
+                             "subscription of any kind. x402 settles in USDC on Base or Solana, but that "
+                             "is a payment rail only: Base and Solana data tools were retired on "
+                             "2026-10-18 and no Base or Solana chain data is served. When the allowance "
+                             "runs out the tool answers Payment Required with the machine-readable terms "
+                             "in structuredContent.accepts[]; settle a credit pack once and keep sending "
                              "the same payment payload so it decrements credit instead of charging "
                              "again. Every answer carries its own _metering block. Metering is safe to retry: "
                              "repeating the exact same risk query within 5 minutes is answered from cache "
@@ -3222,7 +2452,7 @@ def handle(msg):
 DOC_TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>RobotBase MCP · the semantic risk &amp; verification layer for Web3 agents</title>
-<meta name="description" content="One read-only MCP endpoint where an autonomous agent verifies that an on-chain payment settled and prices the next one. Bitcoin, Ethereum, Monero, Zcash and Tron are live; Solana and Base are provisioning. No public RPC, no custody, no tracking.">
+<meta name="description" content="One read-only MCP endpoint where an autonomous agent verifies that an on-chain payment settled and prices the next one. Bitcoin, Ethereum, Monero, Zcash and Tron are live, read from nodes we run ourselves. No public RPC, no custody, no tracking.">
 <style>
 :root{--bg:#070a0f;--panel:#0f141c;--line:#1f2733;--text:#e8eef6;--muted:#8b98a9;--brand:#ff7a2f;--brand2:#ffc46b}
 *{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif;
@@ -3257,8 +2487,8 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
 </script>
 </head><body><div class="wrap">
 <h1>RobotBase MCP Server</h1>
-<div class="tag">Read-only MCP · BTC / ETH / XMR / ZEC live · Solana / Base / Tron provisioning · no RPC endpoint · no custody</div>
-<div class="sub">RobotBase is the semantic risk and verification layer for Web3 agents: one endpoint where an autonomous agent checks whether a payment actually settled on Bitcoin, prices the next transaction, reads the Zcash shielded-pool distribution, screens a TRON address or confirms a USDT-TRC20 transfer, and verifies that a node really is synced - straight from bare-metal nodes we operate ourselves. Tron is live as of today (a self-hosted lite full node: current state plus the most recent ~2.3 days, and it says so rather than guessing). Solana and Base are being wired into the aggregation layer and join the live set once they are. RobotBase publishes no RPC endpoint of any kind: this MCP surface is the only read path. Every tool is read-only, none touch trading or funds, and RobotBase operates no mining pool.</div>
+<div class="tag">Read-only MCP · BTC / ETH / XMR / ZEC / TRON live · no RPC endpoint · no custody</div>
+<div class="sub">RobotBase is the semantic risk and verification layer for Web3 agents: one endpoint where an autonomous agent checks whether a payment actually settled on Bitcoin, prices the next transaction, reads the Zcash shielded-pool distribution, screens a TRON address or confirms a USDT-TRC20 transfer, and verifies that a node really is synced - straight from bare-metal nodes we operate ourselves. Five chains are live: Bitcoin, Ethereum, Monero, Zcash and Tron; Tron runs on a self-hosted lite full node (current state plus the most recent ~6 days) and says so rather than guessing. Base and Solana data tools were retired on 2026-10-18, so the five-chain surface is what this endpoint serves. RobotBase publishes no RPC endpoint of any kind: this MCP surface is the only read path. Every tool is read-only, none touch trading or funds, and RobotBase operates no mining pool.</div>
 
 <div class="card">
   <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
@@ -3302,14 +2532,14 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
                         ├── ETH   Reth execution + Lighthouse consensus
                         ├── XMR   monerod full node
                         ├── ZEC   Zebra full node (incl. value-pool / shielded supply)
-                        ├── SOL / BASE / TRON   provisioning - light API aggregation, no heavy node on this host
+                        ├── TRON  java-tron lite full node (tip state + a recent ~6 day window)
                         └── gateway service aggregation (status pages / dashboards)</pre></div>
 
 <h2>Rate limits and privacy</h2>
 <div class="card"><div class="grid">
 <div><div class="muted">Verification tools</div><div><b>Free</b> - no key, no signup</div></div>
 <div><div class="muted">Risk tools</div><div><b>5 free/day per IP</b>, then <b>$0.01</b> per call by x402</div></div>
-<div><div class="muted">Payment</div><div>USDC on Base or Solana, from your own wallet - <b>no API key, no subscription</b></div></div>
+<div><div class="muted">Payment</div><div>USDC on Base or Solana via x402 - <b>payment rail only, no Base/Solana chain data</b>; no API key, no subscription</div></div>
 <div><div class="muted">Anonymous</div><div><b>120 req/min/IP</b></div></div>
 <div><div class="muted">Privacy</div><div>Audit keeps only the first 16 chars of the IP SHA256 — <b>query arguments are never logged</b></div></div>
 <div><div class="muted">Data</div><div>Read-only on-chain data; no trading, signing or custody</div></div>
@@ -3317,27 +2547,25 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
 
 <h2>Risk intelligence (metered)</h2>
 <div class="card">
-  <p class="muted" style="margin-top:0">Four tools answer questions a free block explorer cannot:
-  is this counterparty tainted, did the USDT really arrive irreversibly, is this Solana token a
-  rug, and can this Base contract be sold at all. They are aggregations over public datasets
-  (GoPlus Labs + TronGrid), read-only, no keys, no custody.</p>
+  <p class="muted" style="margin-top:0">Two tools answer questions a free block explorer cannot:
+  is this counterparty tainted, and did the USDT really arrive irreversibly. They are
+  aggregations over public datasets (GoPlus Labs + TronGrid), read-only, no keys, no custody.</p>
 <ul style="margin:0;padding-left:20px">
 <li><code>tron_check_address_risk</code> - judicial / black-market labels, account age, 0-100 safety score</li>
 <li><code>tron_verify_usdt_transfer</code> - finalized?, amount, sender, recipient, matched against what you expect</li>
-<li><code>sol_check_token_safety</code> - mint &amp; freeze authority, liquidity lock, top-10 concentration</li>
-<li><code>base_check_contract_risk</code> - Base honeypot screen, buy/sell tax, verified source, backdoors, LP lock</li>
 </ul>
   <p class="muted" style="margin-bottom:0">Free allowance: <b>__RISK_FREE__ calls per day per IP</b>. After that the
   tool answers <code>Payment Required</code> with machine-readable terms: 0.01 USDC per call, USDC on
   Base or Solana, paid straight from your agent's wallet. There is no API key to buy - settle a credit
-  pack once and keep sending the same payment payload so it decrements credit instead of charging again.</p>
+  pack once and keep sending the same payment payload so it decrements credit instead of charging again.
+  Payment settles in USDC on Base or Solana via x402; RobotBase does not serve Base or Solana chain data.</p>
 </div>
 
 <h2 id="pricing">Pricing</h2>
 <div class="card"><div class="grid">
 <div><div class="muted">Verification tools (41)</div><div><b>$0</b> — free forever, no key, no signup</div></div>
-<div><div class="muted">Risk intelligence (4 tools)</div><div><b>__RISK_FREE__ calls/day per IP free</b>, then <b>$0.01</b> per call</div></div>
-<div><div class="muted">How you pay</div><div><b>x402</b> — USDC on Base, paid by the caller's own wallet</div></div>
+<div><div class="muted">Risk intelligence (2 tools)</div><div><b>__RISK_FREE__ calls/day per IP free</b>, then <b>$0.01</b> per call</div></div>
+<div><div class="muted">How you pay</div><div><b>x402</b> — USDC on Base or Solana, paid by the caller's own wallet; <b>payment rail only</b>, no Base/Solana chain data</div></div>
 <div><div class="muted">Credit packs</div><div><b>10 calls / 0.10 USDC</b> · <b>100 calls / 1.00 USDC</b> — live terms in <code>accepts[]</code></div></div>
 </div>
 <p class="muted" style="margin-bottom:0"><b>No API keys are issued by robotbase.cc</b> — no key,
@@ -3371,7 +2599,7 @@ def docs_html():
         ("① Chain overview", ["list_chains", "chain_status", "robotbase_capabilities", "robotbase_services"]),
         ("② Bitcoin (BTC) — settlement verification & fees", ["btc_get_fee_rates", "btc_get_mempool_state",
                                                                "btc_get_transaction", "btc_get_block", "btc_get_address",
-                                                               "btc_get_network_stats"]),
+                                                               "btc_get_network_stats", "broadcast_raw_transaction"]),
         ("③ Ethereum (ETH) — settlement, fees and contract reads", ["eth_get_transaction", "eth_get_fee_rates",
                                                                      "eth_get_account", "eth_read_contract",
                                                                      "eth_get_block", "eth_get_logs"]),
@@ -3388,8 +2616,7 @@ def docs_html():
                                                               "tron_get_account", "tron_get_contract",
                                                               "tron_read_contract", "tron_get_chain_economics",
                                                               "tron_list_witnesses", "tron_list_proposals"]),
-        ("⑦ Risk intelligence — metered", ["tron_check_address_risk", "tron_verify_usdt_transfer",
-                                           "sol_check_token_safety", "base_check_contract_risk"]),
+        ("⑦ Risk intelligence — metered", ["tron_check_address_risk", "tron_verify_usdt_transfer"]),
     ]
     desc = {n: d for n, d, _s, _f in TOOLS}
     rows = ""
@@ -3415,7 +2642,7 @@ def server_card():
     return {
         "name": "robotbase-mcp",
         "title": "RobotBase MCP Server - on-chain verification & risk intelligence for Web3 agents",
-        "version": "0.12.5",
+        "version": "0.12.6",
         "description": "The verification and risk-intelligence layer for Web3 agents, as one read-only MCP "
                        "endpoint. Five chains are live, each read from mainnet nodes we run ourselves: "
                        "Bitcoin (fees, mempool state with a fee-rate histogram and RBF/CPFP feasibility, "
@@ -3428,11 +2655,12 @@ def server_card():
                        "stats); and Tron (node status, blocks and history, transactions with TRC-20 "
                        "decoding, account permissions, contract reads, chain economics, super "
                        "representatives and governance proposals). Risk intelligence is light aggregation "
-                       "over public datasets: TRON address risk, TRC-20 USDT settlement verification, "
-                       "Solana rug-pull screening and Base (EVM) contract screening. RobotBase publishes "
-                       "no RPC endpoint of any kind. Verification tools are free; risk tools include a "
-                       "daily free allowance, then 0.01 USDC per call settled over x402 by the caller's "
-                       "own wallet. No API key, no account and no subscription are offered.",
+                       "over public datasets: TRON address risk and TRC-20 USDT settlement verification. "
+                       "RobotBase publishes no RPC endpoint of any kind. Verification tools are free; "
+                       "risk tools include a daily free allowance, then 0.01 USDC per call settled over "
+                       "x402 by the caller's own wallet - x402 runs on Base or Solana as a payment rail "
+                       "only, and no Base or Solana chain data is served. No API key, no account and no "
+                       "subscription are offered.",
         "homepage": "https://robotbase.cc/mcp",
         "transport": {"type": "streamable-http", "url": "https://robotbase.cc/mcp"},
         "endpoints": {
@@ -3444,12 +2672,12 @@ def server_card():
         "capabilities": {"tools": {"listChanged": False}},
         "auth": {"type": "none", "optional": "x402 (USDC) for metered tools; no API keys are issued"},
         "rateLimits": {"anonymous": "120/min per IP", "note": "no keyed tier exists"},
-        "tags": ["bitcoin", "ethereum", "monero", "zcash", "solana", "base", "tron", "blockchain-data",
+        "tags": ["bitcoin", "ethereum", "monero", "zcash", "tron", "blockchain-data",
                  "onchain", "verification", "risk-intelligence", "aml", "rug-pull", "honeypot", "evm",
                  "usdt", "mempool",
                  "fees", "privacy-coins", "read-only", "mcp-server", "web3-agents"],
         "pricing": {"verification_tools": "free", "risk_tools": "%d free calls/day per IP, then 0.01 USDC per call" % RISK_FREE_PER_DAY,
-                    "payment": "x402 (HTTP 402) in USDC on Base; credit packs 10 calls / 0.10 USDC and 100 calls / 1.00 USDC",
+                    "payment": "x402 (HTTP 402) in USDC on Base or Solana; credit packs 10 calls / 0.10 USDC and 100 calls / 1.00 USDC; payment rail only - no Base or Solana chain data",
                     "api_key": "not offered", "subscription": "not offered",
                     "top_up": TOPUP_URL},
         "tools": [{"name": n, "description": desc[n]} for n, _d, _s, _f in TOOLS],

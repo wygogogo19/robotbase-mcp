@@ -6,11 +6,13 @@ name: robotbase-mcp
 displayName: RobotBase MCP Server
 description: >-
   Read-only on-chain verification and risk intelligence for Web3 agents, as one MCP endpoint.
-  Bitcoin, Ethereum, Monero, Zcash and Tron read from full nodes we run ourselves, plus TRON
-  address risk, TRC-20 USDT settlement verification, Solana token safety and Base contract risk.
-  No API key, no account, no subscription — 41 verification tools free, risk tools metered at
-  0.01 USDC per call over x402. No auth, no tracking, no public RPC endpoint.
-version: 0.12.5
+  Bitcoin, Ethereum, Monero, Zcash and Tron read from nodes we run ourselves (Tron via a lite
+  full node), plus TRON address risk and TRC-20 USDT settlement verification. No API key, no
+  account, no subscription — 41 free verification tools and 2 metered risk tools at 0.01 USDC
+  per call over x402. No auth, no tracking, no public RPC endpoint. Base and Solana data tools
+  were retired on 2026-10-18; x402 still settles in USDC on Base or Solana, as a payment rail
+  only.
+version: 0.12.6
 license: MIT
 homepage: https://robotbase.cc/mcp
 repository: https://github.com/<your-org>/robotbase-mcp
@@ -39,9 +41,6 @@ startCommand:
     RB_BTC_RPC_PASS: "${config.btcRpcPass}"
     RB_ELECTRS_HOST: "127.0.0.1"
     RB_ZEC_BASE: "http://127.0.0.1:8080"
-    RB_DOGE_BASE: "http://127.0.0.1:8080"
-    RB_LTC_BASE: "http://127.0.0.1:8080"
-    RB_RVN_ASSET_BASE: "http://127.0.0.1:18081"
     RB_HOME_BASE: "http://127.0.0.1:8081"
 
 categories:
@@ -51,15 +50,15 @@ categories:
 
 tags:
   - bitcoin
-  - kaspa
+  - ethereum
+  - monero
   - zcash
-  - ravencoin
-  - dogecoin
-  - litecoin
+  - tron
   - blockchain-data
   - mempool
   - fees
   - onchain
+  - usdt
   - privacy-coins
   - read-only
   - mcp-server

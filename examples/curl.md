@@ -42,9 +42,10 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
 ## 4. Metered risk tools and x402
 
 There is **no API key**: `X-API-Key` is not part of this service and sending it changes nothing.
-The four risk tools have a free allowance of 5 calls/day per IP; past that the call returns
+The two risk tools have a free allowance of 5 calls/day per IP; past that the call returns
 `Payment Required` with machine-readable terms in `structuredContent.accepts[]` (USDC on Base or
-Solana, 10 calls / 0.10 USDC or 100 calls / 1.00 USDC):
+Solana, 10 calls / 0.10 USDC or 100 calls / 1.00 USDC; Base and Solana are a payment rail only —
+no Base or Solana chain data is served):
 
 ```bash
 curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
