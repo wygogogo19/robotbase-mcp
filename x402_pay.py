@@ -536,6 +536,54 @@ def balance(payer: str) -> int:
         con.close()
 
 
+def credit_summary(payer: str) -> dict[str, Any]:
+    """Public read-only view of one payer's credit balance.
+
+    EVM addresses are case-insensitive; the ledger may store them checksummed.
+    Nothing here is secret - it is derived from on-chain payments and call counts.
+    """
+    p = (payer or "").strip()
+    con = _db()
+    try:
+        row = con.execute(
+            "SELECT payer, network, balance, updated_at FROM x402_credits "
+            "WHERE payer=? OR lower(payer)=lower(?) ORDER BY updated_at DESC LIMIT 1",
+            (p, p)).fetchone()
+        last = con.execute(
+            "SELECT ts, network, amount, tx_hash FROM x402_payments "
+            "WHERE (payer=? OR lower(payer)=lower(?)) AND ok=1 ORDER BY ts DESC LIMIT 1",
+            (p, p)).fetchone()
+        calls = con.execute(
+            "SELECT COUNT(*) c, COALESCE(SUM(-delta),0) s FROM x402_credit_events "
+            "WHERE (payer=? OR lower(payer)=lower(?)) AND reason='call'",
+            (p, p)).fetchone()
+        def iso(ts):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(ts))) if ts else None
+        def iso_bj(ts):
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(int(ts) + 8 * 3600)) if ts else None
+        return {
+            "payer": row["payer"] if row else p,
+            "found": row is not None,
+            "network": row["network"] if row else "",
+            "credits_remaining": int(row["balance"]) if row else 0,
+            "calls_charged": int(calls["c"]) if calls else 0,
+            "credits_spent": int(calls["s"]) if calls else 0,
+            "updated_at": iso(row["updated_at"]) if row else None,
+            "updated_at_bj": iso_bj(row["updated_at"]) if row else None,
+            "last_payment": ({
+                "at": iso(last["ts"]), "at_bj": iso_bj(last["ts"]),
+                "network": last["network"], "amount_atomic": last["amount"],
+                "tx": last["tx_hash"] or "",
+            } if last else None),
+            "packs": [{"calls": int(x["calls"]), "amount_atomic": str(x["amount_atomic"]),
+                       "label": x.get("label", "")} for x in packs()],
+            "how_to_spend": ("send the settled payment payload in params._meta[\"x402/payment\"]; "
+                             "each successful call spends one credit. There is no API key."),
+        }
+    finally:
+        con.close()
+
+
 def spend(payer: str, tool: str) -> int:
     """原子扣 1 次信用，返回剩余；余额不足返回 -1。
 

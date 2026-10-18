@@ -10,7 +10,7 @@ description: >-
   address risk, TRC-20 USDT settlement verification, Solana token safety and Base contract risk.
   No API key, no account, no subscription — 41 verification tools free, risk tools metered at
   0.01 USDC per call over x402. No auth, no tracking, no public RPC endpoint.
-version: 0.12.3
+version: 0.12.4
 license: MIT
 homepage: https://robotbase.cc/mcp
 repository: https://github.com/<your-org>/robotbase-mcp

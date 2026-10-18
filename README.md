@@ -50,6 +50,8 @@ What it does:
 | Settlement | `POST /verify` then `POST /settle` on your facilitator, once per payment nonce |
 | Credit | a settled pack credits `calls` against the payer address; the pack is spent one call at a time |
 | Replay | the client re-sends the **same** payload; the ledger short-circuits it, so nothing is simulated or settled twice (EVM and Solana alike) |
+| Retry safety | the same payer + tool + arguments within 5 minutes returns the cached answer with `charged_this_call=false` |
+| Balance | `GET /credits?payer=<address>` returns credits left, calls charged, last payment and the live pack list |
 | Exhaustion | the tool answers `PaymentRequired` / `insufficient_credit` instead of a partial result |
 | Failure safety | a tool that fails local validation returns `_no_charge`, so a bad argument never burns a credit |
 | Concurrency | `spend()` is a single atomic `UPDATE ... WHERE balance>0`; the balance cannot go negative |
@@ -66,7 +68,17 @@ export RB_X402_LEDGER_DB=./x402_credit.db
 python3 server.py
 ```
 
-With those unset, the server runs the free tier only. The reference build in this repo exposes a 17-tool subset (the hosted endpoint runs the full 45); both use the same `x402_pay.py`.
+With those unset, the server runs the free tier only. This repo now ships the **same 45-tool surface** as the hosted endpoint — the only difference is where the per-chain backends point (your `RB_*` variables instead of ours).
+
+Check a payer's balance without spending a call:
+
+```
+GET https://robotbase.cc/mcp/credits?payer=<the address that paid>
+→ { "found": true, "credits_remaining": 19, "calls_charged": 1,
+    "last_payment": { … }, "packs": [ … ] }
+```
+
+EVM addresses are case-insensitive; there is no authentication because the balance is derived from public on-chain payments.
 
 ## Connect (3 lines)
 

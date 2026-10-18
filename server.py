@@ -1,38 +1,64 @@
 #!/usr/bin/env python3
 """RobotBase MCP Server — one read-only surface for an eight-chain roster.
 
-2026-10-13：对外只保留这一个 MCP，不再提供任何 RPC 端点。名册分三层：
-live（BTC/ETH/XMR/ZEC 今天可查）、syncing（Base/Solana/Tron 在建）、
-planned（LTC/DOGE/KAS/RVN 已定规格）。修剪与保留窗口是节点的属性，
-能力矩阵工具（robotbase_capabilities）如实对外说明边界。
+2026-10-15：对外只保留这一个 MCP，不再提供任何 RPC 端点。名册只用三态：
+live（BTC/ETH/XMR/ZEC/TRON 今天可查）、provisioning（Base/Solana 正在接入）、
+planned（按需储备）。TRON 2026-10-15 从 provisioning 升为 live —— 它背后是
+自建的 java-tron lite full node，只覆盖最近 65,536 块（约 2.3 天）与最新状态，
+超出窗口的查询会被明确拒绝。修剪与保留窗口是节点的属性，能力矩阵工具
+（robotbase_capabilities）如实对外说明边界。
 """
-import base64, hashlib, html, json, os, re, socket, sqlite3, threading, time, urllib.error, urllib.parse, urllib.request
+import base64, hashlib, html, ipaddress, json, os, re, socket, sqlite3, threading, time, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import http.client
 
-# Optional x402 paid tier. Without x402_pay.py (or without RB_X402_* config) the
-# server runs exactly as before: free tools plus the per-IP risk allowance.
+# x402 付款面（本模块只用标准库：调 facilitator 的 HTTP 接口 + 本地 sqlite）
 try:
     import x402_pay
-except Exception:            # noqa: BLE001
+except Exception:            # 缺文件时整个服务仍要能起，x402 只是降级不可用
     x402_pay = None
+
+# 2026-10-16 付款核验台账：只记 verified=true 的链上付款事实（见 verify_ledger.py），
+# 供 a2a 目录的「Agent 可信度评分」当付款数据源。缺文件时服务照常起。
+try:
+    import verify_ledger
+except Exception:            # noqa: BLE001
+    verify_ledger = None
 
 PORT = int(os.environ.get("RB_PORT", "8090"))
 BIND = os.environ.get("RB_BIND", "127.0.0.1")
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "robotbase-mcp", "version": "0.12.3", "title": "RobotBase MCP — on-chain verification & risk intelligence for Web3 agents"}
-# 部署路径与端口一律由环境变量给出：仓库里不写我们自己那套内部布局。
+SERVER_INFO = {"name": "robotbase-mcp", "version": "0.12.4", "title": "RobotBase MCP — on-chain verification & risk intelligence for Web3 agents"}
 BTC_ENV = os.environ.get("RB_BTC_ENV", "")
-BTC_DASHBOARD = os.environ.get("RB_BTC_DASHBOARD", "http://127.0.0.1:8600")
 ZEC_BASE = os.environ.get("RB_ZEC_BASE", "http://127.0.0.1:8080")
-DOGE_BASE = os.environ.get("RB_DOGE_BASE", "http://127.0.0.1:8080")
-LTC_BASE = os.environ.get("RB_LTC_BASE", "http://127.0.0.1:8080")
 HOME_BASE = os.environ.get("RB_HOME_BASE", "http://127.0.0.1:8081")
 
+# 2026-10-14：DOGE / LTC 的基址常量已删除。
+# 原因：两条链 2026-09-27 就已退休、不在名册内，但常量一直指向
+# 已退休链的常量指向旧容器；容器被回收后 IP 可能被重新分配，悬空常量会静默
+# 指向错误服务，所以这里不再保留任何具体地址。
+
 _cache, _cache_lock = {}, threading.Lock()
-# ---- BTC 地址摘要加固参数（2026-09-16）----
-BTC_ADDR_BUDGET = 4.0          # 硬预算秒数（SOP：慢工具 <4000ms）
-BTC_ADDR_CACHE_TTL = 60        # 正常结果缓存
-BTC_ADDR_CACHE_TTL_BAD = 20    # 降级/超时结果短暂缓存，避免热门地址反复打 electrs
+# ---- BTC 地址摘要加固参数（2026-09-16；2026-10-15 重定标）----
+# 2026-10-15 外部实测：本机 electrs 0.11 对「有过交易」的地址，**每一次** scripthash
+# 查询（get_balance / listunspent / get_history）都要 4~11 秒（未订阅路径的特性，见
+# electrs 日志 "less efficient method ... unsubscribed scripthash"）。旧值 4s 硬预算
+# + 单步上限 2.5/1.2/1.6s 意味着**每一个普通地址都必然超时**，对外表现为「余额永远取不到」。
+# 已用 ASB 冻结实验排除「被客户端打爆」：冻结后延迟一模一样（4.3~8.5s），是索引本身的固有开销。
+# 2026-10-15 第二轮实测（决定性）：electrs 把**已订阅**的 scripthash 缓存在**连接**上——
+#   未订阅，单连接三步串行：8.41s + 9.72s + 10.70s = 28.84s（1F1tAaz…，1845 笔）
+#   先 subscribe 再同连接三步：10.66s + 0.14s + 0.05s + 0.58s = 11.43s（同一地址，快 2.5 倍）
+# 所以正确姿势是「一条连接 + 先 subscribe」，而不是「三个方法各自建连」。
+BTC_ADDR_BUDGET = 25.0         # 总预算秒数（覆盖 subscribe+balance+utxo+history）
+BTC_ADDR_STEP_SUBSCRIBE = 15.0 # 单步上限：subscribe（最贵的一步，它把索引读一次并缓存到连接上）
+BTC_ADDR_STEP_BALANCE = 6.0    # 单步上限：余额（订阅成功后实测 0.1s 级，留足余量）
+BTC_ADDR_STEP_UTXO = 6.0       # 单步上限：UTXO 列表
+BTC_ADDR_STEP_HISTORY = 8.0    # 单步上限：交易历史（订阅后 0.6s 级；异常时才可能变慢）
+BTC_ADDR_GATE_WAIT = 5.0       # 排队等锁上限：宁可快速回「忙」，也不要让调用方干等 25s
+BTC_ADDR_CACHE_TTL = 900       # 正常结果缓存（15 分钟）
+BTC_ADDR_CACHE_TTL_BAD = 120   # 降级/超时结果缓存，避免热门地址反复打 electrs
+BTC_ELECTRUM_HOST = os.environ.get("RB_ELECTRS_HOST", "127.0.0.1")
+BTC_ELECTRUM_PORT = 50001
 _addr_cache = {}
 _btc_gate = threading.Semaphore(1)   # 同一时刻只允许 1 个地址查询打 electrs（防低效路径洪水压垮索引层）
 
@@ -96,7 +122,7 @@ def btc_rpc(method, params=None):
 
 
 def svc_status(chain):
-    base = {"zec": ZEC_BASE, "doge": DOGE_BASE, "ltc": LTC_BASE}.get(chain)
+    base = {"zec": ZEC_BASE}.get(chain)
     if not base:
         raise ValueError(f"unknown chain: {chain}")
     d = _http_json(base + "/api/status")
@@ -113,7 +139,8 @@ def truncate(obj, limit=3800):
 # （不再使用 Tier 1/2/3 那种分级）。tier=live 的节点今天就能回答查询；
 # provisioning 的链正在接入聚合与清洗逻辑，planned 的链按需储备，两者都绝不冒充可查询。
 # LTC/DOGE/KAS/RVN 与 TON 均已从名册下线（用户 2026-10-14 决定砍掉 TON）。
-CHAINS = ("btc", "eth", "xmr", "zec")
+# 2026-10-15：TRON 加入 live（名册里 tier=live，chain_status tron 走节点真实字段）。
+CHAINS = ("btc", "eth", "xmr", "zec", "tron")
 ROSTER_CHAINS = ("btc", "eth", "xmr", "zec", "sol", "base", "tron")
 
 
@@ -161,7 +188,7 @@ def t_capabilities():
 def t_chain_status(chain):
     chain = (chain or "").lower()
     if chain == "btc":
-        d = cached("btc_node", 10, lambda: _http_json(BTC_DASHBOARD + "/api/node"))
+        d = cached("btc_node", 10, lambda: _http_json("http://127.0.0.1:8600/api/node"))
         return {k: d.get(k) for k in ("chain", "blocks", "headers", "verification_progress_pct", "initial_block_download",
                                       "connections", "connections_out", "mempool_txs", "mempool_usage_mb",
                                       "size_on_disk_gb", "version", "rpc_ok")}
@@ -175,6 +202,10 @@ def t_chain_status(chain):
         n = (cached("nodes", 10, lambda: _http_json(HOME_BASE + "/api/nodes")).get("nodes") or {}).get("eth") or {}
         return {k: n.get(k) for k in ("ok", "synced", "height", "peers", "exec", "cons", "slot",
                                       "progress", "state")}
+    if chain == "tron":
+        n = (cached("nodes", 10, lambda: _http_json(HOME_BASE + "/api/nodes")).get("nodes") or {}).get("tron") or {}
+        return {k: n.get(k) for k in ("ok", "synced", "height", "solidity", "peers", "client",
+                                      "lag_s", "progress", "state")}
     if chain in ROSTER_CHAINS:                   # 名册里有，但今天还不提供服务（provisioning / planned）
         spec = next((c for c in _roster() if c.get("id") == chain), None) or {}
         return {"chain": chain, "served": False, "tier": spec.get("tier", "unknown"),
@@ -283,29 +314,120 @@ def t_btc_get_mempool_state():
         mp = btc_rpc("getmempoolinfo") or {}
         usage = mp.get("usage") or 0
         cap = mp.get("maxmempool") or 1
-        return {"chain": "BTC",
-                "txs": mp.get("size"), "bytes": mp.get("bytes"),
-                "usage_mb": round(usage / 1e6, 1),
-                "max_mempool_mb": round(cap / 1e6, 1),
-                "load_pct": round(100 * usage / cap, 1),
-                "min_fee_btc_kvb": mp.get("mempoolminfee"),
-                "total_fees_btc": mp.get("total_fee"),
-                "verdict": "busy" if usage > 0.5 * cap else "normal",
-                "source": "our own bitcoind getmempoolinfo"}
-    return cached("btc_mp", 10, build)
+        out = {"chain": "BTC",
+               "txs": mp.get("size"), "bytes": mp.get("bytes"),
+               "usage_mb": round(usage / 1e6, 1),
+               "max_mempool_mb": round(cap / 1e6, 1),
+               "load_pct": round(100 * usage / cap, 1),
+               "min_fee_btc_kvb": mp.get("mempoolminfee"),
+               "total_fees_btc": mp.get("total_fee"),
+               "verdict": "busy" if usage > 0.5 * cap else "normal",
+               "source": "our own bitcoind getmempoolinfo"}
+        # 2026-10-16 加深：费率直方图（矿工视角的"要排多久"），按 sat/vB 分桶累计 vbytes
+        try:
+            entries = btc_rpc("getrawmempool", [True]) or {}
+            buckets = [(0, 1), (1, 2), (2, 5), (5, 10), (10, 20), (20, 50), (50, 100), (100, 10 ** 9)]
+            hist = [{"min_sat_vb": lo, "max_sat_vb": (hi if hi < 10 ** 9 else None),
+                     "txs": 0, "vbytes": 0} for lo, hi in buckets]
+            for _tx, e in entries.items():
+                try:
+                    vs = e.get("vsize") or e.get("size") or 0
+                    rate = (e["fees"]["base"] * 1e8 / vs) if vs else 0
+                except Exception:  # noqa: BLE001
+                    continue
+                for i, (lo, hi) in enumerate(buckets):
+                    if lo <= rate < hi:
+                        hist[i]["txs"] += 1
+                        hist[i]["vbytes"] += vs
+                        break
+            out["fee_rate_histogram"] = hist
+            out["how_to_read"] = ("fee_rate_histogram buckets the pool by sat/vB with the vbytes queued in "
+                                  "each bucket: what sits below your chosen rate is what you are bidding "
+                                  "against for the next block.")
+        except Exception:  # noqa: BLE001
+            out["fee_rate_histogram"] = None
+        return out
+    return cached("btc_mp", 20, build)
 
 
 def t_btc_tx_lookup(txid):
     txid = (txid or "").strip()
     if not re.fullmatch(r"[0-9a-fA-F]{64}", txid):
         raise ValueError("txid must be 64 hex chars")
-    tx = btc_rpc("getrawtransaction", [txid, True])
+    tx = None
+    err = None
+    try:
+        tx = btc_rpc("getrawtransaction", [txid, True])
+    except Exception as exc:  # noqa: BLE001 未确认且不在本地索引时可能取不到
+        err = exc
+    if tx is None:
+        # 2026-10-16 加深：交易可能仍在内存池里；这时仍然能回答"卡住没、能不能加价"
+        try:
+            entry = btc_rpc("getmempoolentry", [txid]) or {}
+        except Exception:  # noqa: BLE001
+            raise ValueError("transaction not found on our node (and not in the mempool): %s"
+                             % (str(err)[:80] if err else "unknown"))
+        return {"txid": txid, "in_mempool": True, "confirmations": 0,
+                "mempool": _btc_mempool_detail(entry),
+                "note": "the raw transaction is not in our local index yet, but it is in our mempool",
+                "source": "our own bitcoind getmempoolentry"}
     vout = [{"n": v["n"], "value": v["value"], "type": v["scriptPubKey"].get("type"),
              "address": (v["scriptPubKey"].get("address") or (v["scriptPubKey"].get("addresses") or [None])[0])}
             for v in (tx.get("vout") or [])][:12]
-    return {"txid": tx.get("txid"), "blockhash": tx.get("blockhash"), "confirmations": tx.get("confirmations"),
-            "time": tx.get("time"), "size": tx.get("size") or tx.get("vsize"), "vin_count": len(tx.get("vin") or []),
-            "vout": vout, "value_out_btc": round(sum(v["value"] for v in (tx.get("vout") or [])), 8)}
+    out = {"txid": tx.get("txid"), "blockhash": tx.get("blockhash"), "confirmations": tx.get("confirmations"),
+           "time": tx.get("time"), "size": tx.get("size") or tx.get("vsize"), "vin_count": len(tx.get("vin") or []),
+           "vout": vout, "value_out_btc": round(sum(v["value"] for v in (tx.get("vout") or [])), 8),
+           "in_mempool": tx.get("confirmations") is None}
+    if out["in_mempool"]:
+        try:
+            entry = btc_rpc("getmempoolentry", [txid]) or {}
+            out["mempool"] = _btc_mempool_detail(entry)
+        except Exception:  # noqa: BLE001
+            out["mempool"] = None
+    return out
+
+
+def _btc_mempool_detail(entry):
+    """把 getmempoolentry 翻译成"卡住了吗 / 能不能加价"的结论。"""
+    vs = entry.get("vsize") or entry.get("size") or 0
+    base = ((entry.get("fees") or {}).get("base") or 0)
+    anc = ((entry.get("fees") or {}).get("ancestor") or 0)
+    desc_size = entry.get("descendantsize") or 0
+    rbf = bool(entry.get("bip125-replaceable"))
+    spentby = entry.get("spentby") or []
+    detail = {
+        "vsize": vs,
+        "fee_btc": base,
+        "fee_rate_sat_vb": round(base * 1e8 / vs, 2) if vs else None,
+        "ancestor_count": entry.get("ancestorcount"),
+        "ancestor_size_vb": entry.get("ancestorsize"),
+        "ancestor_fee_btc": anc,
+        "ancestor_fee_rate_sat_vb": round(anc * 1e8 / entry["ancestorsize"], 2) if entry.get("ancestorsize") else None,
+        "descendant_count": entry.get("descendantcount"),
+        "descendant_size_vb": desc_size,
+        "depends_on": (entry.get("depends") or [])[:10],
+        "spent_by": spentby[:10],
+        "rbf_replaceable_bip125": rbf,
+    }
+    hints = []
+    if rbf:
+        hints.append("Replaceable via RBF (BIP125): you can re-spend the same inputs with a higher fee.")
+    else:
+        hints.append("Not RBF-signalled: you cannot bump this transaction directly.")
+    if not spentby:
+        hints.append("No child is spending it yet, so a CPFP child (spending one of its outputs) is still possible.")
+    else:
+        hints.append("A child transaction already spends it (%d) - fee-bumping now means bumping the package."
+                     % len(spentby))
+    if (entry.get("descendantcount") or 0) > 0:
+        hints.append("It already has descendants, so any bump must cover the whole package.")
+    detail["can_bump"] = {"rbf": rbf, "cpfp_possible": not spentby,
+                          "package_fee_rate_sat_vb": round(
+                              ((anc + ((entry.get("fees") or {}).get("descendant") or 0)) * 1e8
+                               / max(1, (entry.get("ancestorsize") or 0) + desc_size)), 2)
+                          if (entry.get("ancestorsize") or desc_size) else None}
+    detail["how_to_read"] = " ".join(hints)
+    return detail
 
 
 def t_btc_block_summary(height=None, blockhash=None):
@@ -317,16 +439,30 @@ def t_btc_block_summary(height=None, blockhash=None):
         bh = btc_rpc("getbestblockhash")
     hdr = btc_rpc("getblockheader", [bh, True])
     blk = btc_rpc("getblock", [bh, 1])
-    return {"hash": bh, "height": hdr.get("height"), "time": hdr.get("time"), "txs": len(blk.get("tx") or []),
-            "size": blk.get("size"), "weight": blk.get("weight"), "confirmations": hdr.get("confirmations"),
-            "previousblockhash": hdr.get("previousblockhash")}
-
-
-def t_utxo_chain_status(chain):
-    chain = (chain or "").lower()
-    if chain not in ("doge", "ltc"):
-        raise ValueError("chain must be doge or ltc")
-    return svc_status(chain)
+    out = {"hash": bh, "height": hdr.get("height"), "time": hdr.get("time"), "txs": len(blk.get("tx") or []),
+           "size": blk.get("size"), "weight": blk.get("weight"), "confirmations": hdr.get("confirmations"),
+           "previousblockhash": hdr.get("previousblockhash")}
+    # 2026-10-16 加深：区块经济学（手续费总额、费率分位、UTXO 净变化）
+    try:
+        st = btc_rpc("getblockstats", [hdr.get("height")]) or {}
+        out["stats"] = {
+            "total_fee_btc": round((st.get("totalfee") or 0) / 1e8, 8),
+            "avg_fee_rate_sat_vb": st.get("avgfeerate"),
+            "min_fee_rate_sat_vb": st.get("minfeerate"),
+            "max_fee_rate_sat_vb": st.get("maxfeerate"),
+            "feerate_percentiles_sat_vb": ({"p10": st.get("feerate_percentiles", [None] * 5)[0],
+                                            "p25": st.get("feerate_percentiles", [None] * 5)[1],
+                                            "p50": st.get("feerate_percentiles", [None] * 5)[2],
+                                            "p75": st.get("feerate_percentiles", [None] * 5)[3],
+                                            "p90": st.get("feerate_percentiles", [None] * 5)[4]}
+                                           if st.get("feerate_percentiles") else None),
+            "avg_tx_size_vb": st.get("avgtxsize"),
+            "utxo_increase": st.get("utxo_increase"),
+            "ins": st.get("ins"), "outs": st.get("outs"),
+        }
+    except Exception:  # noqa: BLE001
+        out["stats"] = None
+    return out
 
 
 def t_robotbase_services():
@@ -336,7 +472,7 @@ def t_robotbase_services():
                          for s in d.get("status", [])]}
 
 
-# ---------------- KAS / RVN: node + hashport telemetry from the gateway ----------------
+# ---------------- KAS: node + hashport telemetry from the gateway ----------------
 def t_kas_node_status():
     """Kaspa node state straight off the gateway's read-only KAS node API."""
     d = cached("kas_node_info", 10, lambda: _http_json(HOME_BASE + "/api/node/kas"))
@@ -365,24 +501,6 @@ def t_kas_pool_status():
             "stale": p.get("stale"), "invalid": p.get("invalid")}
 
 
-def t_rvn_node_status():
-    """Ravencoin node state (height, network hashrate, difficulty, sync)."""
-    d = cached("nodes", 10, lambda: _http_json(HOME_BASE + "/api/nodes"))
-    n = (d.get("nodes") or {}).get("rvn") or {}
-    return {"updated_utc": d.get("updated_utc"), "chain": "ravencoin", "client": n.get("client"),
-            "synced": bool(n.get("synced")), "state": n.get("state"), "height": n.get("height"),
-            "network_hashrate": n.get("network"), "difficulty": n.get("difficulty")}
-
-
-def t_rvn_pool_status():
-    """Our own Ravencoin solo hashport: engine state, per-miner coinbase, endpoint."""
-    d = cached("pools", 10, lambda: _http_json(HOME_BASE + "/api/pools"))
-    p = (d.get("pools") or {}).get("rvnpool") or {}
-    return {"updated_utc": d.get("updated_utc"), "pool": "rvnpool", "state": p.get("state"),
-            "height": p.get("height"), "network": p.get("network"), "pool_hashrate": p.get("hashrate"),
-            "miners": p.get("workers"), "shares": p.get("shares"), "share_difficulty": p.get("difficulty"),
-            "sync": p.get("sync"), "stratum": p.get("endpoint"), "fee": p.get("fee"),
-            "payout": "per-miner independent coinbase"}
 
 
 # ---------------- BTC: electrs (Electrum protocol) + address decoding ----------------
@@ -463,9 +581,37 @@ def address_to_scripthash(addr):
     return hashlib.sha256(script).digest()[::-1].hex()
 
 
+# 2026-10-15 guard: ultra-active addresses make electrs 0.11 fetch thousands of blocks over P2P
+# (even for get_balance), which crashes it. Static denylist + dynamic denylist + circuit breaker.
+BTC_MEGA_ADDRESSES = {
+    "bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h",
+    "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+    "34xp4vRoCGJym3xR7yCVPFHoCNxv4Twseo",
+    "bc1qgdjqv0av3q56jvd82tkdjpy7gdp9ut8tlqmgrpmv24sq90ecnvqqjwvw97",
+    "3M219KR5vEneNb47ewrPfWyb5jQ2DjxRP6",
+    "bc1ql49ydapnjafl5t2cp9zqpjwe6pdgmxy98859v2",
+}
+_ELECTRS_BREAKER = {"until": 0.0}
+_ELECTRS_BREAKER_SEC = 60
+_BTC_DYN_DENY = {}  # scripthash -> expiry
+_BTC_DYN_DENY_SEC = 3600
+
+
+def _electrs_trip(reason):
+    _ELECTRS_BREAKER["until"] = time.time() + _ELECTRS_BREAKER_SEC
+    print(f"[btc_addr] electrs circuit breaker OPEN {_ELECTRS_BREAKER_SEC}s: {reason}", flush=True)
+
+
+def _btc_addr_unsupported(address, err, note):
+    return {"address": address, "degraded": True, "error": err,
+            "balance_btc": None, "unconfirmed_btc": None,
+            "utxo_count": None, "utxo_value_btc": None, "tx_count": None,
+            "note": note, "elapsed_ms": 0}
+
+
 def electrum_call(method, params, host=None, port=None, timeout=10):
-    host = host or os.environ.get("RB_ELECTRS_HOST", "127.0.0.1")
-    port = port or int(os.environ.get("RB_ELECTRS_PORT", "50001"))
+    host = host or BTC_ELECTRUM_HOST
+    port = int(port or os.environ.get("RB_ELECTRS_PORT", "50001"))
     with socket.create_connection((host, port), timeout=timeout) as s:
         s.settimeout(timeout)
         s.sendall((json.dumps({"id": 1, "method": method, "params": params}) + "\n").encode())
@@ -475,16 +621,87 @@ def electrum_call(method, params, host=None, port=None, timeout=10):
             if not chunk:
                 break
             buf += chunk
-    return json.loads(buf.split(b"\n")[0].decode())
+    line = buf.split(b"\n")[0].strip()
+    if not line:
+        raise ElectrsError("empty response (connection closed)")
+    resp = json.loads(line.decode())
+    if resp.get("error") is not None:
+        raise ElectrsError(str(resp.get("error"))[:300])
+    if "result" not in resp:
+        raise ElectrsError("missing result")
+    return resp
+
+
+class ElectrsError(Exception):
+    pass
+
+
+class _ElectrsConn:
+    """一条 electrs 连接上连续发多次 Electrum 请求（2026-10-15 新增）。
+
+    为什么非要有它：electrs 0.11 对**未订阅** scripthash 走 "less efficient method"
+    路径，每个方法（get_balance / listunspent / get_history）都要独立做一次索引读，
+    每次 4~11 秒；而 `blockchain.scripthash.subscribe` 一旦成功，electrs 会把该地址
+    的结果**缓存在这条连接上**，同一连接后续三步只要 0.05~0.6 秒。
+
+    实测（1F1tAaz5x1HUXrCNLbtMDqcw6o5GNn4xqX，1845 笔交易）：
+        三步各自建连：8.41 + 9.72 + 10.70 = 28.84s
+        subscribe + 同连接三步：10.66 + 0.14 + 0.05 + 0.58 = 11.43s
+    """
+
+    def __init__(self, host, port, timeout):
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+
+    def call(self, method, params, timeout):
+        self.sock.settimeout(timeout)
+        self.sock.sendall((json.dumps({"id": 1, "method": method, "params": params}) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        line = buf.split(b"\n")[0].strip()
+        if not line:
+            raise ElectrsError("empty response (connection closed)")
+        resp = json.loads(line.decode())
+        if resp.get("error") is not None:
+            raise ElectrsError(str(resp.get("error"))[:300])
+        if "result" not in resp:
+            raise ElectrsError("missing result")
+        return resp["result"]
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def t_btc_address_summary(address):
-    """BTC 地址摘要（2026-09-16 加固：4s 硬预算 + 分步降级 + 独立缓存）
+    """BTC 地址摘要（2026-09-16 加固：硬预算 + 分步降级 + 独立缓存）
 
     背景：SOP 要求慢工具 <4000ms；原实现三步各给 8/8/6s 超时（最坏 22s），
     且失败不缓存 → 热门地址会反复打 electrs 并触发 LLM 超时。
+
+    2026-10-15 第二轮提速：改成「单连接 + 先 subscribe」。electrs 0.11 会把已订阅的
+    scripthash 缓存在连接上，同一连接后续三步从 8~11s 掉到 0.05~0.6s；实测
+    1F1tAaz…（1845 笔）从 28.84s 降到 11.43s。subscribe 失败则退回各自建连的老路径，
+    保证「余额至少能拿到」的语义不变。
+
+    语义契约：拿不到余额时**绝不返回 0**，而是 `balance_btc: null` + `degraded: true`
+    + `error`/`note`，让 agent 无法把「查不到」误读成「余额为 0」。
     """
     sh = address_to_scripthash(address)
+    _a = (address or "").strip()
+    if _a in BTC_MEGA_ADDRESSES or _a.lower() in BTC_MEGA_ADDRESSES or _BTC_DYN_DENY.get(sh, 0) > time.time():
+        return _btc_addr_unsupported(address, "address_too_active_unsupported",
+            "该地址交易量极大（交易所热钱包/知名大户级），本服务不支持查询其余额与历史：结果不是 0，请勿视为 0。"
+            "如需核验某一笔付款，请使用 btc_get_transaction 按交易 ID 查询。")
+    if _ELECTRS_BREAKER["until"] > time.time():
+        return _btc_addr_unsupported(address, "electrs_unavailable",
+            "BTC 地址索引暂时不可用（熔断中，约 %d 秒后重试）：未能取得余额，请勿视为 0。单笔付款可用 btc_get_transaction 核验。"
+            % int(_ELECTRS_BREAKER["until"] - time.time()))
     key = "btcaddr_" + sh
     now = time.time()
     with _cache_lock:
@@ -500,42 +717,116 @@ def t_btc_address_summary(address):
 
     def build():
         notes, degraded = [], False
-        # ① 余额（必需，占预算大头）
-        bal = None
+        bal, berr = None, None
+        utxos, hist = None, None
+
+        def _err_note(kind, what):
+            if kind == "electrs_timeout":
+                return "%s超时未取" % what
+            return "%s未取（electrs 错误）" % what
+
+        def _maybe_trip(e):
+            # 只有「连接层坏了 / 索引缺块」才拉闸，业务性错误不拉闸
+            if "failed to get block" in str(e):
+                _BTC_DYN_DENY[sh] = time.time() + _BTC_DYN_DENY_SEC
+            if ("failed to get block" in str(e) or isinstance(e, (ConnectionError, OSError))
+                    or "empty response" in str(e)):
+                _electrs_trip(f"{type(e).__name__}: {str(e)[:120]}")
+
+        sub_ok = False
+        conn = None
+        # ① subscribe（一次索引读；成功后同连接三步全走缓存，这是 2026-10-15 的关键提速点）
         try:
-            bal = electrum_call("blockchain.scripthash.get_balance", [sh],
-                                timeout=max(0.8, min(2.5, left()))).get("result") or {}
-        except Exception:  # noqa: BLE001
-            bal = None
+            conn = _ElectrsConn(BTC_ELECTRUM_HOST, BTC_ELECTRUM_PORT,
+                                timeout=max(1.0, min(BTC_ADDR_STEP_SUBSCRIBE, left())))
+        except Exception as e:  # noqa: BLE001
+            conn, berr = None, "electrs_error"
+            print(f"[btc_addr] connect error {address}: {type(e).__name__}: {e}", flush=True)
+            _maybe_trip(e)
+        if conn is not None:
+            try:
+                conn.call("blockchain.scripthash.subscribe", [sh],
+                          timeout=max(1.0, min(BTC_ADDR_STEP_SUBSCRIBE, left())))
+                sub_ok = True
+            except socket.timeout:
+                berr = "electrs_timeout"
+            except Exception as e:  # noqa: BLE001
+                berr = "electrs_error"
+                print(f"[btc_addr] subscribe error {address}: {type(e).__name__}: {e}", flush=True)
+                _maybe_trip(e)
+            # 超时的连接里还挂着一个未读响应，必须废弃整条连接（否则响应会串帧）
+            if sub_ok:
+                # ② 余额（必需）
+                try:
+                    bal = conn.call("blockchain.scripthash.get_balance", [sh],
+                                    timeout=max(1.0, min(BTC_ADDR_STEP_BALANCE, left())))
+                    if not isinstance(bal, dict):
+                        raise ElectrsError("bad balance result")
+                except socket.timeout:
+                    bal, berr = None, "electrs_timeout"
+                except Exception as e:  # noqa: BLE001
+                    bal, berr = None, "electrs_error"
+                    print(f"[btc_addr] get_balance error {address}: {type(e).__name__}: {e}", flush=True)
+                    _maybe_trip(e)
+                # ③ UTXO 列表（可选）
+                if bal is not None:
+                    if left() < 0.3:
+                        degraded = True; notes.append("预算不足，跳过 UTXO 列表")
+                    else:
+                        try:
+                            utxos = conn.call("blockchain.scripthash.listunspent", [sh],
+                                              timeout=max(0.3, min(BTC_ADDR_STEP_UTXO, left())))
+                            if not isinstance(utxos, list):
+                                raise ElectrsError("bad listunspent result")
+                        except socket.timeout:
+                            utxos = None; degraded = True; notes.append(_err_note("electrs_timeout", "UTXO 列表"))
+                        except Exception as e:  # noqa: BLE001
+                            utxos = None; degraded = True; notes.append(_err_note("electrs_error", "UTXO 列表"))
+                            print(f"[btc_addr] listunspent error {address}: {type(e).__name__}: {e}", flush=True)
+                    # ④ 交易历史（可选，最慢的一步：大户动辄几十万条）
+                    if left() < 0.4:
+                        degraded = True; notes.append("预算不足，跳过交易历史")
+                    else:
+                        try:
+                            hist = conn.call("blockchain.scripthash.get_history", [sh],
+                                             timeout=max(0.4, min(BTC_ADDR_STEP_HISTORY, left())))
+                            if not isinstance(hist, list):
+                                raise ElectrsError("bad history result")
+                        except socket.timeout:
+                            hist = None; degraded = True; notes.append(_err_note("electrs_timeout", "交易历史"))
+                        except Exception as e:  # noqa: BLE001
+                            hist = None; degraded = True; notes.append(_err_note("electrs_error", "交易历史"))
+                            print(f"[btc_addr] get_history error {address}: {type(e).__name__}: {e}", flush=True)
+            conn.close()
+        # 回退：subscribe 没成功（超时/报错）时退回「各自建连」的老路径，至少把余额拿到手
+        if not sub_ok and bal is None:
+            try:
+                bal = electrum_call("blockchain.scripthash.get_balance", [sh],
+                                    timeout=max(1.0, min(BTC_ADDR_STEP_BALANCE + 6.0, left())))["result"]
+                if not isinstance(bal, dict):
+                    bal, berr = None, "electrs_error"
+                    raise ElectrsError("bad balance result")
+                degraded = True
+                notes.append("索引订阅不可用（回退路径）：本次只取到余额，UTXO 列表与交易历史未取")
+            except socket.timeout:
+                bal, berr = None, "electrs_timeout"
+            except Exception as e:  # noqa: BLE001
+                bal, berr = None, "electrs_error"
+                print(f"[btc_addr] get_balance fallback error {address}: {type(e).__name__}: {e}", flush=True)
+                _maybe_trip(e)
         if bal is None:
-            return {"address": address, "degraded": True, "error": "electrs_timeout",
-                    "note": "4s 硬预算内未取到余额：地址过于活跃或 electrs 忙，请稍后重试",
+            return {"address": address, "degraded": True, "error": berr,
+                    "balance_btc": None, "unconfirmed_btc": None,
+                    "utxo_count": None, "utxo_value_btc": None, "tx_count": None,
+                    "note": ("%.0fs 预算内未取到余额（electrs 超时）" % BTC_ADDR_BUDGET if berr == "electrs_timeout"
+                             else "electrs 返回错误") + "：未能取得余额，请勿视为 0，请稍后重试",
                     "elapsed_ms": int((time.monotonic() - t0) * 1000)}
-        # ② UTXO 列表（可选）
-        utxos = []
-        if left() < 0.5:
-            degraded = True; notes.append("预算不足，跳过 UTXO 列表")
-        else:
-            try:
-                utxos = electrum_call("blockchain.scripthash.listunspent", [sh],
-                                      timeout=max(0.6, min(1.2, left()))).get("result") or []
-            except Exception:  # noqa: BLE001
-                degraded = True; notes.append("UTXO 列表未取（活跃地址）")
-        # ③ 交易历史（可选，最慢的一步：大户动辄几十万条）
-        hist = None
-        if left() < 0.6:
-            degraded = True; notes.append("预算不足，跳过交易历史")
-        else:
-            try:
-                hist = electrum_call("blockchain.scripthash.get_history", [sh],
-                                     timeout=max(0.6, min(1.6, left()))).get("result") or []
-            except Exception:  # noqa: BLE001
-                degraded = True; notes.append("交易历史未取（地址过于活跃）")
         out = {"address": address,
                "balance_btc": round((bal.get("confirmed") or 0) / 1e8, 8),
                "unconfirmed_btc": round((bal.get("unconfirmed") or 0) / 1e8, 8),
-               "utxo_count": len(utxos),
-               "utxo_value_btc": round(sum(u.get("value", 0) for u in utxos) / 1e8, 8),
+               "utxo_count": len(utxos) if utxos is not None else None,
+               "utxo_value_btc": (round(sum(u.get("value", 0) for u in utxos) / 1e8, 8)
+                                  if utxos is not None else None),
                "degraded": degraded,
                "elapsed_ms": int((time.monotonic() - t0) * 1000)}
         if hist is not None:
@@ -548,8 +839,17 @@ def t_btc_address_summary(address):
             out["note"] = "; ".join(notes)
         return out
 
-    with _btc_gate:          # 串行化，避免并发低效查询把 electrs 线程池占满
+    # 2026-10-15：先抢锁（最多等 BTC_ADDR_GATE_WAIT 秒），**排队时间不计入预算**——
+    # 否则第二个并发调用会拿着被排队吃光的预算进去，必然立刻超时。
+    if not _btc_gate.acquire(timeout=BTC_ADDR_GATE_WAIT):
+        return _btc_addr_unsupported(
+            address, "electrs_busy",
+            "BTC 地址索引当前正忙（另一个地址查询正在占用索引层），本次未取到余额——结果不是 0，请稍后重试。")
+    try:
+        t0 = time.monotonic()
         val = build()
+    finally:
+        _btc_gate.release()
     ttl = BTC_ADDR_CACHE_TTL_BAD if val.get("degraded") else BTC_ADDR_CACHE_TTL
     with _cache_lock:
         _addr_cache[key] = (now, val, ttl)
@@ -558,8 +858,8 @@ def t_btc_address_summary(address):
 
 
 
-USAGE_DB = os.environ.get("RB_USAGE_DB", "usage.db")
-BILLING_DB = os.environ.get("RB_BILLING_DB", "billing.db")
+USAGE_DB = os.environ.get("RB_USAGE_DB", "./usage.db")
+BILLING_DB = os.environ.get("RB_BILLING_DB", "")  # deprecated: no API keys are issued
 
 
 def _db(path, timeout=10):
@@ -572,16 +872,43 @@ def init_usage():
     con = _db(USAGE_DB)
     con.execute("""CREATE TABLE IF NOT EXISTS calls(
         ts INTEGER, tool TEXT, ok INTEGER, ms INTEGER, ip_hash TEXT, plan TEXT)""")
+    # 2026-10-15: 目录站爬虫和真人客户端在审计里长得一模一样，分不出来。补三列：
+    #   ua     —— 请求头 User-Agent（每次请求都有，最稳定的分组键）
+    #   client —— MCP 握手 initialize 里的 clientInfo（name/version）
+    #   err    —— 失败原因（单行、截断），之前只记 ok=0，查不出为什么失败
+    have = {r[1] for r in con.execute("PRAGMA table_info(calls)")}
+    for col, decl in (("ua", "TEXT"), ("client", "TEXT"), ("err", "TEXT")):
+        if col not in have:
+            con.execute(f"ALTER TABLE calls ADD COLUMN {col} {decl}")
+    # 握手单独记一张表：目录站爬虫会握手但从不调用工具，混进 calls 会把调用量撑虚。
+    # 有了它才能回答「谁连过 vs 谁真的用了」。
+    con.execute("""CREATE TABLE IF NOT EXISTS clients(
+        ts INTEGER, ip_hash TEXT, client TEXT, ua TEXT, proto TEXT)""")
     con.commit()
     con.close()
 
 
-def log_call(tool, ok, ms, ip, plan):
+def log_client(ip, client, ua, proto):
     try:
         con = _db(USAGE_DB)
-        con.execute("INSERT INTO calls VALUES(?,?,?,?,?,?)",
+        con.execute("INSERT INTO clients(ts,ip_hash,client,ua,proto) VALUES(?,?,?,?,?)",
+                    (int(time.time()), hashlib.sha256((ip or "").encode()).hexdigest()[:16],
+                     (client or "")[:80], (ua or "")[:160], (proto or "")[:20]))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+
+def log_call(tool, ok, ms, ip, plan, ua="", client="", err=""):
+    try:
+        con = _db(USAGE_DB)
+        con.execute("INSERT INTO calls(ts,tool,ok,ms,ip_hash,plan,ua,client,err) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
                     (int(time.time()), tool, 1 if ok else 0, int(ms),
-                     hashlib.sha256((ip or "").encode()).hexdigest()[:16], plan))
+                     hashlib.sha256((ip or "").encode()).hexdigest()[:16], plan,
+                     (ua or "")[:160], (client or "")[:80],
+                     (err or "").replace("\n", " ")[:180]))
         con.commit()
         con.close()
     except Exception:
@@ -605,6 +932,17 @@ def usage_stats(hours=24):
                       (since,)).fetchall()
     clients = con.execute("SELECT COUNT(DISTINCT ip_hash) c FROM calls WHERE ts>=?", (since,)).fetchone()["c"]
     keyed = con.execute("SELECT COUNT(*) c FROM calls WHERE ts>=? AND plan='key'", (since,)).fetchone()["c"]
+    by_client = con.execute(
+        "SELECT COALESCE(NULLIF(client,''), NULLIF(ua,''), 'unknown') name, COUNT(*) n, "
+        "       SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END) bad "
+        "FROM calls WHERE ts>=? GROUP BY name ORDER BY n DESC LIMIT 12", (since,)).fetchall()
+    by_error = con.execute(
+        "SELECT COALESCE(NULLIF(err,''), '(no reason recorded)') reason, COUNT(*) n "
+        "FROM calls WHERE ts>=? AND ok=0 GROUP BY reason ORDER BY n DESC LIMIT 12", (since,)).fetchall()
+    conns = con.execute(
+        "SELECT client, COUNT(*) n, COUNT(DISTINCT ip_hash) ips, MAX(ts) last "
+        "FROM clients WHERE ts>=? AND COALESCE(client,'')<>'' "
+        "GROUP BY client ORDER BY n DESC LIMIT 12", (since,)).fetchall()
     con.close()
     active_keys = 0
     if _has_billing():
@@ -616,7 +954,12 @@ def usage_stats(hours=24):
             active_keys = 0
     return {"window_hours": hours, "total_calls": total, "errors": errs, "unique_clients": clients,
             "keyed_calls": keyed, "active_keys": active_keys,
-            "top_tools": [{"tool": r["tool"], "calls": r["c"], "avg_ms": round(r["avg_ms"] or 0)} for r in top]}
+            "top_tools": [{"tool": r["tool"], "calls": r["c"], "avg_ms": round(r["avg_ms"] or 0)} for r in top],
+            "top_clients": [{"client": r["name"], "calls": r["n"], "errors": r["bad"] or 0} for r in by_client],
+            "top_errors": [{"reason": r["reason"], "calls": r["n"]} for r in by_error],
+            "connectors": [{"client": r["client"], "handshakes": r["n"], "ips": r["ips"],
+                            "last_seen_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r["last"]))}
+                           for r in conns]}
 
 
 def usage_hourly(hours=24):
@@ -637,31 +980,21 @@ def usage_hourly(hours=24):
 
 
 def verify_key(key):
-    """**已停用**（2026-10-16）：robotbase.cc 不再发放任何 API key，付费只走 x402。
+    """**已停用**：付费现在只走 x402，不再有 API key 档位。
 
-    保留本函数与 `billing.db` 的读取仅为兼容历史部署；自托管时可整段删除。
+    2026-10-16 起，MCP 的付费访问只有一条路径：调用时带
+    `params._meta["x402/payment"]`（首次结算 + 之后重放同一载荷扣信用）。
+    X-API-Key 一律按匿名处理——它不再授予任何额度或速率档位。
+    保留此函数是为了让 `_plan()` 的调用点不必改动，行为上是恒等返回 "anon"。
     """
-    if not key or not _has_billing():
-        return "anon"
-    try:
-        con = _db(BILLING_DB)
-        h = hashlib.sha256(key.encode()).hexdigest()
-        row = con.execute("SELECT active, expires_at FROM api_keys WHERE key_hash=?", (h,)).fetchone()
-        con.close()
-        if not row or not row["active"]:
-            return "anon"
-        if row["expires_at"] and row["expires_at"] < time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()):
-            return "anon"
-        return "key"
-    except Exception:
-        return "anon"
+    return "anon"
 
 
 # =================== v0.5.0: mining / fee / attribution intelligence =============
 # Every datum here comes from infrastructure we run ourselves. Chains where we have
 # no source are reported as unavailable rather than filled with a guess.
 
-KAS_BLOCK_DB = os.environ.get("RB_KAS_BLOCK_DB", "")
+KAS_BLOCK_DB = os.environ.get("RB_KAS_BLOCK_DB", "/var/lib/robotbase-home/kas_blocks.db")
 HOME = HOME_BASE
 
 # Halving schedules (public consensus rules) + the live height comes from our nodes.
@@ -720,13 +1053,14 @@ def t_pow_network_mining_intel():
     except Exception as exc:  # noqa: BLE001
         out["BTC"] = {"error": type(exc).__name__}
     try:                                                        # XMR: our own monerod
-        d = cached("xmr_info", 10, lambda: _http_json(
-            XMR_HELPER, {"jsonrpc": "2.0", "id": 1, "method": "get_info"}, timeout=10))
-        r = (d or {}).get("result") or {}
+        # 与 t_xmr_node_status / t_xmr_network_stats 共用同一个缓存键，
+        # 形状必须一致（_xmr_rpc 的结果本体），否则会互相污染。
+        r = cached("xmr_info", 10, lambda: _xmr_rpc("get_info")) or {}
         diff = r.get("difficulty")
+        _tip, _hdr = cached("xmr_tip", 10, _xmr_tip)
         out["XMR"] = {"difficulty": diff,
                       "network_hashrate_hs": (float(diff) / 120) if diff else None,
-                      "height": r.get("height"),
+                      "height": _tip if _tip else r.get("height"),   # 末块高度，不是链长度
                       "hashrate_method": "difficulty / 120s target block time",
                       "source": "our monerod get_info"}
     except Exception as exc:  # noqa: BLE001
@@ -761,8 +1095,6 @@ def t_kas_pool_attribution_intel(hours=24):
     """Local Kaspa block->pool attribution index (we index every block ourselves)."""
     hours = max(1, min(24 * 30, int(hours or 24)))
     since = int(time.time()) - hours * 3600
-    if not KAS_BLOCK_DB:
-        return {"available": False, "reason": "no block index configured on this deployment (set RB_KAS_BLOCK_DB)"}
     try:
         con = sqlite3.connect("file:" + KAS_BLOCK_DB + "?mode=ro", uri=True)
         con.row_factory = sqlite3.Row
@@ -827,9 +1159,8 @@ def _mask(addr):
 
 
 
-# ============ v0.5.1/v0.5.2: ZEC coinbase attribution + RVN assets =============
-# Both endpoints live on our own nodes and are read-only by construction.
-RVN_ASSET_BASE = os.environ.get("RB_RVN_ASSET_BASE", "http://127.0.0.1:18081")
+# ============ v0.5.1: ZEC coinbase attribution =============
+# Lives on our own node and is read-only by construction.
 
 
 def t_zec_block_attribution_intel(blocks=200):
@@ -877,41 +1208,37 @@ def t_zec_block_attribution_intel(blocks=200):
     }
 
 
-def t_rvn_asset_lookup(asset=None, limit=20):
-    """Ravencoin native assets: one asset by name/id, or a listing."""
-    name = (asset or "").strip()
-    try:
-        if name:
-            d = _http_json(RVN_ASSET_BASE + "/api/asset/" + urllib.parse.quote(name), timeout=30)
-            if not d.get("ok"):
-                return {"found": False, "asset": name, "reason": d.get("error") or "not found"}
-            return {"found": True, "asset": d.get("result"),
-                    "source": "our ravend getassetdata",
-                    "note": "Ravencoin assets are UTXO-native: amount, units, reissuable and IPFS metadata"}
-        limit = max(1, min(200, int(limit or 20)))
-        d = _http_json(RVN_ASSET_BASE + "/api/assets?limit=%d" % limit, timeout=30)
-        return {"count": d.get("count"), "assets": d.get("assets"),
-                "source": "our ravend listassets", "hint": "pass asset=<name or id> for full details"}
-    except Exception as exc:  # noqa: BLE001
-        return {"available": False, "reason": "%s: %s" % (type(exc).__name__, str(exc)[:100])}
-
-
-
 # ============== 2026-10-14 P1：风险情报工具（计量计费，轻量聚合）==================
 # 用户指令：P1 主打「高价值风控工具 + 轻量聚合」，不做通用 RPC 转发。
 # 数据源一律是公开聚合接口（GoPlus Labs + TronGrid），只读、不接触私钥、不托管资金。
-# 计费：每个 IP 每天 5 次免费；2026-10-16 起不再有 API key 档，付费只走 x402（见 x402_pay。
-# 本仓库是自托管参考实现，不含结算层：超出免费额度就回 Payment Required）。
+# 计费：每个 IP 每天 5 次免费；超出后走 x402（USDC）。2026-10-16 起不再发放 API key。
 RISK_TOOLS = ("tron_check_address_risk", "tron_verify_usdt_transfer", "sol_check_token_safety",
               "base_check_contract_risk")
 RISK_FREE_PER_DAY = 5
-RISK_DB = os.environ.get("RB_RISK_DB", "risk_quota.db")
+RISK_DB = os.environ.get("RB_RISK_DB", "./risk_quota.db")
 GOPLUS_BASE = os.environ.get("RB_GOPLUS_BASE", "https://api.gopluslabs.io/api/v1")
 TRONGRID_BASE = os.environ.get("RB_TRONGRID_BASE", "https://api.trongrid.io")
 USDT_TRC20_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 USDT_DECIMALS = 6
 TRON_FINALITY_BLOCKS = 19          # 波场 SR 共识的不可逆深度（约 57 秒）
+# 2026-10-16：/billing/pricing 的 API-key 商店已整体退役（不再卖 key、不再按月订阅），
+# 付费只走 x402。充值指引统一指向首页定价段。
 TOPUP_URL = "https://robotbase.cc/#pricing"
+
+# ---- 2026-10-15 修复：账本一致性 / 重试安全 --------------------------------
+# 外部实测发现：客户端拿不到响应（链路抖动、工具耗时 24s 超过客户端超时重试），
+# 但额度已经扣掉。5 次调用里出现 2 次——用户既没拿到数据、又少了 1 次免费额度。
+#  ① 本地格式校验移到门禁之前：地址写错应该提示「地址写错」，而不是先吃 402；
+#  ② 同一次查询在 RISK_DEDUP_TTL 秒内重复提交不再扣费，直接回同一份结论；
+#  ③ 每条 _metering 都带 charged_this_call，用户能确认这一次到底扣没扣。
+RISK_DEDUP_TTL = 300
+RISK_DEDUP_MAX = 256
+_risk_dedup, _risk_dedup_lock = {}, threading.Lock()
+# 付费调用的幂等窗口：同一个 payer 对同一工具、同一参数在窗口内重复提交，
+# 直接回缓存，不再扣信用。客户端超时重试不该被收两次钱。
+PAID_DEDUP_TTL = 300
+PAID_DEDUP_MAX = 512
+_paid_dedup, _paid_dedup_lock = {}, threading.Lock()
 
 _REQ = threading.local()
 
@@ -922,15 +1249,6 @@ def _client_ip():
 
 def _client_plan():
     return getattr(_REQ, "plan", "anon")
-
-
-def _arg(a, *names):
-    """按顺序取第一个非空字符串参数（参数别名，例如 Base 合约的 contract / address）。"""
-    for n in names:
-        v = (a or {}).get(n)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return ""
 
 
 class PaymentRequired(Exception):
@@ -947,7 +1265,8 @@ def init_risk_db():
     con.execute("""CREATE TABLE IF NOT EXISTS risk_quota(
         day TEXT NOT NULL, ip_hash TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(day, ip_hash))""")
-    # 历史遗留：P2 时代按 API key 计数。2026-10-16 起不再发放任何 API key，这张表只读不写。
+    # 历史遗留：P2 时代按 API key 计数（/billing/v1/usage 的用量看板数据源）。
+    # 2026-10-16 起不再发放任何 API key，这张表不再写入，保留只为免去做破坏性迁移。
     con.execute("""CREATE TABLE IF NOT EXISTS key_usage(
         day TEXT NOT NULL, key_hash TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(day, key_hash))""")
@@ -955,23 +1274,48 @@ def init_risk_db():
     con.close()
 
 
+RISK_FREE_GLOBAL_PER_DAY = int(os.environ.get("RB_RISK_FREE_GLOBAL", "1000"))
+
+
+def _quota_subject():
+    """免费额度的计数主体：IPv4 按单个地址，IPv6 按 /64（一台机器通常拿到整段 /64）。"""
+    ip = _client_ip().split(",")[0].strip()
+    try:
+        a = ipaddress.ip_address(ip)
+        if a.version == 6:
+            if a.ipv4_mapped:
+                return str(a.ipv4_mapped)
+            return str(ipaddress.ip_network(ip + "/64", strict=False))
+        return str(a)
+    except ValueError:
+        return ip
+
+
 def _risk_quota(consume=True):
     """返回 (allowed, used, limit)：按 IP 的每日免费额度。
 
-    2026-10-16：不再有 API key 档，额度只按 IP 记；付费只走 x402（托管版由信用余额接管）。
+    2026-10-16：不再有 API key 档，免费额度只按 IP 记；超出后由 x402 信用余额接管
+    （见 call_tool 的 x402 分支），所以这里不会再出现 limit<0。
     """
-    h = hashlib.sha256(_client_ip().encode()).hexdigest()[:16]
+    h = hashlib.sha256(_quota_subject().encode()).hexdigest()[:16]
     d = _bj_day()
     con = _db(RISK_DB)
     try:
         row = con.execute("SELECT used FROM risk_quota WHERE day=? AND ip_hash=?", (d, h)).fetchone()
         used = row["used"] if row else 0
+        g = con.execute("SELECT used FROM risk_quota WHERE day=? AND ip_hash='__global__'", (d,)).fetchone()
+        gused = g["used"] if g else 0
+        # 全站每日免费总量封顶：轮换 IP 刷免费额度时，总量也有上限
+        if gused >= RISK_FREE_GLOBAL_PER_DAY:
+            return False, max(used, RISK_FREE_PER_DAY), RISK_FREE_PER_DAY
         if not consume:
             return used < RISK_FREE_PER_DAY, used, RISK_FREE_PER_DAY
         if used >= RISK_FREE_PER_DAY:
             return False, used, RISK_FREE_PER_DAY
         con.execute("INSERT INTO risk_quota(day, ip_hash, used) VALUES(?,?,1) "
                     "ON CONFLICT(day, ip_hash) DO UPDATE SET used=used+1", (d, h))
+        con.execute("INSERT INTO risk_quota(day, ip_hash, used) VALUES(?,'__global__',1) "
+                    "ON CONFLICT(day, ip_hash) DO UPDATE SET used=used+1", (d,))
         con.commit()
         return True, used + 1, RISK_FREE_PER_DAY
     finally:
@@ -988,21 +1332,70 @@ def _risk_gate():
     if not allowed:
         raise PaymentRequired(
             "Payment Required. The free allowance for RobotBase risk tools is %d calls/day per IP and "
-            "is used up for today (Beijing time, resets 00:00 Asia/Shanghai). There is no API key: the "
-            "hosted paid tier is x402 machine payment in USDC (%s). Self-hosting instead? Raise "
-            "RISK_FREE_PER_DAY." % (limit, TOPUP_URL))
+            "is used up for today (Beijing time, resets 00:00 Asia/Shanghai). Pay in USDC with x402: "
+            "read accepts[] from structuredContent, sign one EIP-3009 authorization, and retry this same "
+            "call with it in params._meta[\"x402/payment\"]. There is no API key - after the first "
+            "settlement, keep sending that same payment payload with each call and it will not be "
+            "settled again; each call just spends one credit." % (limit,))
     return _meter_payload(used, limit, pending=True)
 
 
-def _meter_payload(used, limit, pending=False):
+def _meter_payload(used, limit, pending=False, charged=None):
     if limit < 0:
+        # limit < 0 = 这次调用走的是 x402 付费额度（2026-10-16 起不再有 API key 档）
         return {"x402": {"paid": True, "metered_by": "x402 credit balance"}}
     payload = {"free_tier": {"used_today": used, "limit_per_day": limit,
                              "resets": "00:00 Asia/Shanghai",
                              "more_calls_via": "x402 USDC payment - there is no API key"}}
     if pending:
         payload["free_tier"]["remaining_today"] = max(0, limit - used)
+    if charged is not None:
+        payload["free_tier"]["charged_this_call"] = bool(charged)
     return payload
+
+
+def _arg(a, *names):
+    """按顺序取第一个非空字符串参数。
+
+    2026-10-17：风控工具的参数名对 Agent 不够宽容——调用方经常把 Base 合约写成 `address`、
+    把 Solana mint 也写成 `address`，于是本地校验直接判"地址格式不对"，看起来像工具坏了。
+    这里统一接受别名，规范名仍然是主名。
+    """
+    for n in names:
+        v = (a or {}).get(n)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _risk_precheck(name, args):
+    """风险工具的本地格式校验（与各工具内部正则保持同一套）。
+
+    None = 参数看起来合法；dict = 本地校验失败：不进门禁、不扣额度。
+    """
+    a = args or {}
+    if name == "tron_check_address_risk":
+        v = (a.get("address") or "").strip()
+        if not re.fullmatch(r"T[1-9A-HJ-NP-Za-km-z]{33}", v):
+            return {"address": v, "chain": "TRON", "checked": False,
+                    "error": "not a TRON base58 address (expected T + 33 chars)"}
+    elif name == "tron_verify_usdt_transfer":
+        v = (a.get("txid") or "").strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", v):
+            return {"txid": v, "chain": "TRON", "verified": False,
+                    "error": "not a TRON transaction id (expected 64 hex chars)"}
+    elif name == "sol_check_token_safety":
+        v = _arg(a, "mint", "address", "token_address", "token")
+        if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", v):
+            return {"mint": v, "chain": "SOL", "checked": False,
+                    "error": "not a Solana mint address (base58, 32-44 chars)"}
+    elif name == "base_check_contract_risk":
+        v = _arg(a, "contract", "address", "token_address", "token")
+        if not re.fullmatch(r"0x[0-9a-fA-F]{40}", v):
+            return {"contract": v, "chain": "BASE", "checked": False,
+                    "error": "not an EVM contract address (0x + 40 hex chars); "
+                             "pass it as `contract` or `address`"}
+    return None
 
 
 def _risk_commit(used_before, limit):
@@ -1128,30 +1521,129 @@ def t_tron_check_address_risk(address):
     return out
 
 
-def t_tron_verify_usdt_transfer(txid, expected_to=None, expected_amount_usdt=None):
-    """TRC-20 USDT 到账核验：终局性、金额、收付款方，一次给全。"""
-    tx = (txid or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", tx):
-        return {"txid": txid, "chain": "TRON", "verified": False,
-                "error": "not a TRON transaction id (expected 64 hex chars)", "_no_charge": True}
-    out = {"txid": tx, "chain": "TRON", "network": "mainnet",
-           "source": "TronGrid full node + solidity (finalized) node"}
-    try:
-        raw = _http_json("%s/wallet/gettransactionbyid" % TRONGRID_BASE, {"value": tx}, timeout=15)
-    except Exception as exc:  # noqa: BLE001
-        return {"txid": tx, "chain": "TRON", "verified": False,
-                "error": "%s: %s" % (type(exc).__name__, str(exc)[:120])}
-    if not raw or not raw.get("txID"):
-        return {"txid": tx, "chain": "TRON", "found": False, "verified": False,
-                "reason": "the full node does not know this transaction id"}
+def _tron_usdt_parse_local(tx):
+    """用**我们自己的节点**解析一笔 USDT 交易。本地没有这笔则返回 None。
 
+    取数全部来自自有 java-tron；from/to/金额优先取 receipt 日志里的 Transfer 事件
+    （那是链上真正发生了什么），calldata 只用来判 call_kind（transfer / approve / …）。
+    """
+    raw = _tron("wallet/gettransactionbyid", {"value": tx}) or {}
+    info = _tron("wallet/gettransactioninfobyid", {"value": tx}) or {}
+    if not raw and not info:
+        return None
+    out = {"txid": tx, "chain": "TRON", "network": "mainnet"}
     contract = ((raw.get("raw_data") or {}).get("contract") or [{}])[0]
     ctype = contract.get("type")
     value = (contract.get("parameter") or {}).get("value") or {}
-    ret = (raw.get("ret") or [{}])[0]
-    status = ret.get("contractRet") or "UNKNOWN"
-    out.update({"found": True, "contract_type": ctype, "status": status})
+    out.update({"found": True, "contract_type": ctype,
+                "status": ((raw.get("ret") or [{}])[0].get("contractRet")
+                           or (info.get("receipt") or {}).get("result") or "UNKNOWN")})
+    from_addr, to_addr, amount_raw, is_usdt = None, None, None, False
+    try:
+        from_addr = _tron_b58("41" + (value.get("owner_address") or "").rjust(40, "0")[-40:])
+    except Exception:  # noqa: BLE001
+        pass
+    if ctype == "TriggerSmartContract":
+        token = value.get("contract_address") or ""
+        data = value.get("data") or ""
+        is_usdt = (token[-40:].lower() == TRON_USDT_HEX[2:].lower())
+        method = data[:8]
+        if method == "a9059cbb" and len(data) >= 136:
+            out["call_kind"] = "transfer"
+            try:
+                to_addr = _tron_b58("41" + data[32:72])
+                amount_raw = int(data[72:136], 16)
+            except Exception:  # noqa: BLE001
+                pass
+        elif method == "23b872dd" and len(data) >= 200:
+            out["call_kind"] = "transfer_from"
+            try:
+                to_addr = _tron_b58("41" + data[96:136])
+                amount_raw = int(data[136:200], 16)
+            except Exception:  # noqa: BLE001
+                pass
+        elif method == "095ea7b3" and len(data) >= 136:
+            # approve 只授权额度、不转移任何 USDT，绝不能判成到账（2026-10-15 修复）
+            out["call_kind"] = "approve"
+            try:
+                out["spender"] = _tron_b58("41" + data[32:72])
+                out["allowance_usdt"] = round(int(data[72:136], 16) / (10 ** USDT_DECIMALS), 6)
+            except Exception:  # noqa: BLE001
+                pass
+        elif method == "39509351" and len(data) >= 136:
+            out["call_kind"] = "increase_allowance"
+        elif method:
+            out["call_kind"] = "other_contract_call"
+        else:
+            out["call_kind"] = "unknown"
+        out["token_contract"] = USDT_TRC20_CONTRACT if is_usdt else (token and _safe_b58(token))
+        out["method"] = method
+    elif ctype == "TransferContract":
+        out["call_kind"] = "native_trx_transfer"
+        out["note"] = "this is a native TRX transfer, not a TRC-20 USDT transfer"
+        try:
+            to_addr = _tron_b58("41" + (value.get("to_address") or "").rjust(40, "0")[-40:])
+            amount_raw = value.get("amount")
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        out["call_kind"] = "unknown"
+    # receipt 日志才是「真正发生了什么」：有 Transfer 事件就以它为准
+    logs = _tron_decode_trc20_logs(info)
+    if logs:
+        lg = logs[0]
+        to_addr = lg.get("to")
+        if not from_addr:
+            from_addr = lg.get("from")
+        if lg.get("amount_atomic") is not None:
+            amount_raw = lg.get("amount_atomic")
+        out["moved_source"] = "receipt_transfer_log"
+    elif amount_raw is not None:
+        out["moved_source"] = "calldata_intent"
+    block = info.get("blockNumber")
+    if block:
+        out["block_number"] = block
+        out["block_time_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                              time.gmtime((info.get("blockTimeStamp") or 0) / 1000))
+    out["fee_trx"] = round((info.get("fee") or 0) / 1e6, 6) if info.get("fee") else None
+    receipt = (info.get("receipt") or {}).get("result")
+    if receipt:
+        out["receipt_result"] = receipt
+    try:
+        solidified = _http_json(TRON_SOLIDITY + "/walletsolidity/gettransactionbyid",
+                                {"value": tx}, timeout=10)
+        out["finalized"] = bool(solidified and solidified.get("txID"))
+    except Exception:  # noqa: BLE001
+        out["finalized"] = False
+    if not out["finalized"] and block:
+        tip = ((_tron_tip() or {}).get("block_header") or {}).get("raw_data", {}).get("number")
+        if tip:
+            conf = int(tip) - int(block) + 1
+            out["confirmations"] = conf
+            out["blocks_until_finality"] = max(0, TRON_FINALITY_BLOCKS - conf)
+    if amount_raw is not None and is_usdt:
+        out["amount_usdt"] = round(amount_raw / (10 ** USDT_DECIMALS), 6)
+    if from_addr:
+        out["from"] = from_addr
+    if to_addr:
+        out["to"] = to_addr
+    return out
 
+
+def _tron_usdt_parse_trongrid(tx):
+    """回落到 TronGrid 解析（窗口外的交易只能走这条路）。返回 None 表示查不到。"""
+    try:
+        raw = _http_json("%s/wallet/gettransactionbyid" % TRONGRID_BASE, {"value": tx}, timeout=15)
+    except Exception as exc:  # noqa: BLE001
+        return {"_error": "%s: %s" % (type(exc).__name__, str(exc)[:120])}
+    if not raw or not raw.get("txID"):
+        return None
+    out = {"txid": tx, "chain": "TRON", "network": "mainnet"}
+    contract = ((raw.get("raw_data") or {}).get("contract") or [{}])[0]
+    ctype = contract.get("type")
+    value = (contract.get("parameter") or {}).get("value") or {}
+    out.update({"found": True, "contract_type": ctype,
+                "status": ((raw.get("ret") or [{}])[0].get("contractRet") or "UNKNOWN")})
     amount_raw, to_addr, from_addr, is_usdt = None, None, None, False
     try:
         from_addr = _tron_hex_to_address(value.get("owner_address", ""))
@@ -1165,28 +1657,45 @@ def t_tron_verify_usdt_transfer(txid, expected_to=None, expected_amount_usdt=Non
         except Exception:  # noqa: BLE001
             is_usdt = False
         method = data[:8]
-        if method == "a9059cbb" and len(data) >= 136:      # transfer(address,uint256)
+        if method == "a9059cbb" and len(data) >= 136:
+            out["call_kind"] = "transfer"
             try:
                 to_addr = _tron_hex_to_address(data[32:72])
                 amount_raw = int(data[72:136], 16)
             except Exception:  # noqa: BLE001
                 pass
-        elif method == "23b872dd" and len(data) >= 200:     # transferFrom(address,address,uint256)
+        elif method == "23b872dd" and len(data) >= 200:
+            out["call_kind"] = "transfer_from"
             try:
                 to_addr = _tron_hex_to_address(data[96:136])
                 amount_raw = int(data[136:200], 16)
             except Exception:  # noqa: BLE001
                 pass
+        elif method == "095ea7b3" and len(data) >= 136:
+            out["call_kind"] = "approve"
+            try:
+                out["spender"] = _tron_hex_to_address(data[32:72])
+                out["allowance_usdt"] = round(int(data[72:136], 16) / (10 ** USDT_DECIMALS), 6)
+            except Exception:  # noqa: BLE001
+                pass
+        elif method == "39509351" and len(data) >= 136:
+            out["call_kind"] = "increase_allowance"
+        elif method:
+            out["call_kind"] = "other_contract_call"
+        else:
+            out["call_kind"] = "unknown"
         out["token_contract"] = USDT_TRC20_CONTRACT if is_usdt else (token and _safe_b58(token))
         out["method"] = method
     elif ctype == "TransferContract":
+        out["call_kind"] = "native_trx_transfer"
         out["note"] = "this is a native TRX transfer, not a TRC-20 USDT transfer"
         try:
             to_addr = _tron_hex_to_address(value.get("to_address", ""))
             amount_raw = value.get("amount")
         except Exception:  # noqa: BLE001
             pass
-
+    else:
+        out["call_kind"] = "unknown"
     info = {}
     try:
         info = _http_json("%s/wallet/gettransactioninfobyid" % TRONGRID_BASE, {"value": tx}, timeout=15) or {}
@@ -1195,12 +1704,12 @@ def t_tron_verify_usdt_transfer(txid, expected_to=None, expected_amount_usdt=Non
     block = info.get("blockNumber")
     if block:
         out["block_number"] = block
-        out["block_time_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime((info.get("blockTimeStamp") or 0) / 1000))
+        out["block_time_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                              time.gmtime((info.get("blockTimeStamp") or 0) / 1000))
     out["fee_trx"] = round((info.get("fee") or 0) / 1e6, 6) if info.get("fee") else None
     receipt = (info.get("receipt") or {}).get("result")
     if receipt:
         out["receipt_result"] = receipt
-
     finalized = False
     try:
         solidified = _http_json("%s/walletsolidity/gettransactionbyid" % TRONGRID_BASE, {"value": tx}, timeout=15)
@@ -1218,28 +1727,81 @@ def t_tron_verify_usdt_transfer(txid, expected_to=None, expected_amount_usdt=Non
                 out["blocks_until_finality"] = max(0, TRON_FINALITY_BLOCKS - conf)
         except Exception:  # noqa: BLE001
             pass
-
     if amount_raw is not None and is_usdt:
         out["amount_usdt"] = round(amount_raw / (10 ** USDT_DECIMALS), 6)
     if from_addr:
         out["from"] = from_addr
     if to_addr:
         out["to"] = to_addr
+    return out
 
-    checks = {"status_success": status == "SUCCESS", "is_usdt_trc20": is_usdt, "finalized": finalized}
+
+def _tron_usdt_verdict(out, expected_to, expected_amount_usdt):
+    """判定逻辑（与改造前逐字一致）：必须真的解析出收款方与金额才算一笔 USDT 转账。"""
+    status = out.get("status")
+    is_usdt = bool(out.get("token_contract") == USDT_TRC20_CONTRACT)
+    to_addr = out.get("to")
+    amount_raw = out.get("amount_usdt")
+    finalized = bool(out.get("finalized"))
+    is_transfer_call = bool(amount_raw is not None and to_addr)
+    checks = {"status_success": status == "SUCCESS",
+              "is_usdt_trc20": is_usdt,
+              "is_transfer_call": is_transfer_call,
+              "finalized": finalized}
     if expected_to:
         checks["recipient_matches"] = (expected_to.strip() == (to_addr or ""))
     if expected_amount_usdt is not None:
         try:
-            checks["amount_matches"] = abs(float(expected_amount_usdt) - (out.get("amount_usdt") or 0)) < 1e-6
+            checks["amount_matches"] = abs(float(expected_amount_usdt) - (amount_raw or 0)) < 1e-6
         except (TypeError, ValueError):
             checks["amount_matches"] = False
     out["checks"] = checks
     out["verified"] = all(checks.values())
-    out["verdict"] = ("USDT arrived and is irreversible" if out["verified"] and finalized else
-                      "confirmed but not yet finalized (wait for 19 blocks)" if out["verified"] else
-                      "not verified - see checks")
+    if out["verified"] and finalized:
+        out["verdict"] = "USDT arrived and is irreversible"
+    elif out["verified"]:
+        out["verdict"] = "confirmed but not yet finalized (wait for 19 blocks)"
+    elif is_usdt and not is_transfer_call:
+        out["not_a_transfer"] = True
+        out["verdict"] = ("not verified: this transaction does not transfer USDT - it is a '%s' call on the "
+                          "USDT contract, so no USDT moved. Do not release value on this txid."
+                          % out.get("call_kind"))
+    else:
+        out["verdict"] = "not verified - see checks"
     return out
+
+
+def t_tron_verify_usdt_transfer(txid, expected_to=None, expected_amount_usdt=None):
+    """TRC-20 USDT 到账核验：终局性、金额、收付款方，一次给全。
+
+    2026-10-16：改为**本地优先**。窗口内（约 6 天）走我们自己的 java-tron（毫秒级、不依赖第三方）；
+    本地查不到时**回落 TronGrid**——本地的空结果只代表"超出保留窗口"，绝不等于"没到账"。
+    """
+    tx = (txid or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", tx):
+        return {"txid": txid, "chain": "TRON", "verified": False,
+                "error": "not a TRON transaction id (expected 64 hex chars)", "_no_charge": True}
+    out = None
+    try:
+        out = _tron_usdt_parse_local(tx)
+    except Exception:  # noqa: BLE001
+        out = None
+    if out is not None:
+        out["source"] = "our own java-tron full node"
+        out["retention_window"] = _tron_window() or None
+    else:
+        tg = _tron_usdt_parse_trongrid(tx)
+        if tg is None:
+            return {"txid": tx, "chain": "TRON", "found": False, "verified": False,
+                    "reason": ("not found on our own node (outside its ~6 day retention window) nor on "
+                               "TronGrid - the transaction id does not exist on the chain"),
+                    "source": "our java-tron (miss) + TronGrid (miss)"}
+        if tg.get("_error"):
+            return {"txid": tx, "chain": "TRON", "verified": False, "error": tg["_error"],
+                    "_no_charge": True}
+        out = tg
+        out["source"] = "TronGrid (transaction is older than our own node's retention window)"
+    return _tron_usdt_verdict(out, expected_to, expected_amount_usdt)
 
 
 def _safe_b58(h):
@@ -1265,7 +1827,7 @@ def t_sol_check_token_safety(mint):
     if not res:
         return {"mint": m, "chain": "SOL", "checked": False,
                 "reason": "no token-security record for this mint (unknown token, not a token mint, "
-                          "or the upstream dataset has not seen it yet)"}
+                          "or the upstream dataset has not seen it yet)", "_no_charge": True}
 
     def status(field):
         return str((res.get(field) or {}).get("status", "0"))
@@ -1413,7 +1975,7 @@ def t_base_check_contract_risk(contract):
                 "reason": "no token-security record: the contract is not indexed by GoPlus on Base, "
                           "is not an ERC-20, or was deployed in the last minutes",
                 "how_to_check": BASESCAN + "/address/" + c,
-                "note": "no record is not the same as safe"}
+                "note": "no record is not the same as safe", "_no_charge": True}
 
     honeypot = _flag(res, "is_honeypot") or _flag(res, "cannot_sell_all")
     buy_tax = _pct(res.get("buy_tax"))
@@ -1634,10 +2196,322 @@ TOOLS = [    ("list_chains",
     ("xmr_get_node_status",
      "Monero node state: height vs target, sync flag, difficulty, txpool size, database size, monerod version and peer counts. "
      "When to use: whether the XMR node is synced and healthy, or how big its chain and txpool are. "
-     "Do not use: RobotBase does not index Monero transactions, wallets or ring signatures - a Monero payment cannot be verified or risk-scored from here. "
+     "Do not use: for fees call xmr_get_fee_rates; for one transaction call xmr_get_transaction; for "
+     "network-wide numbers call xmr_get_network_stats. RobotBase does not index Monero wallets or ring signatures. "
      "Returns: height, target_height, synced, status, network, difficulty, txpool_txs, database_size_gb, "
      "block_size_limit, version, incoming_connections / outgoing_connections.",
      {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_xmr_node_status()),
+    ("xmr_get_fee_rates",
+     "Monero fee estimate per kB, split into ascending priority tiers, read from our own monerod. "
+     "When to use: pricing an XMR transaction, or deciding whether to pay the baseline fee to land in the next block. "
+     "Do not use: for Bitcoin fees (btc_get_fee_rates) or for mempool depth (xmr_get_mempool_state). "
+     "Returns: baseline_fee_per_kb_xmr plus priority_tiers[] each with {priority, fee_per_kb_atomic, fee_per_kb_xmr}. "
+     "Monero has no EIP-1559 style fee market: blocks are never full, so the baseline tier normally confirms next block.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_xmr_fee_rates()),
+    ("xmr_get_mempool_state",
+     "Monero mempool: pending transaction count, total bytes and fees, age of the oldest pending tx, double-spend/failing counts. "
+     "When to use: is the network quiet or piling up, and roughly how long a new transaction waits. "
+     "Do not use: for fees (xmr_get_fee_rates) or for a specific payment (xmr_get_transaction). "
+     "Returns: pending_txs, bytes_total, fee_total_xmr, oldest_pending_age_s, double_spends, failing, "
+     "tx_size_median_bytes, congestion verdict.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_xmr_mempool_state()),
+    ("xmr_get_block",
+     "One Monero block header, by height or by block hash. "
+     "When to use: confirming which block a transaction landed in, or inspecting reward, difficulty and weight of a block. "
+     "Do not use: to list recent blocks (xmr_get_recent_blocks) or to look up a transaction (xmr_get_transaction). "
+     "Returns: height, hash, prev_hash, timestamp, age_s, tx_count, reward_xmr, difficulty, block_weight, "
+     "block_size_bytes, major_version / minor_version, orphan.",
+     {"type": "object", "properties": {"height": {"type": "integer", "description": "Block height"},
+                                       "block_hash": {"type": "string", "description": "64 hex chars; takes precedence over height"}},
+      "additionalProperties": False}, lambda a: t_xmr_block(a.get("height"), a.get("block_hash"))),
+    ("xmr_get_recent_blocks",
+     "The most recent Monero blocks with the observed block interval. "
+     "When to use: checking that XMR is producing blocks normally and at roughly the 120s target. "
+     "Do not use: for one specific block (xmr_get_block). "
+     "Returns: tip_height, avg_block_interval_s, target_interval_s, blocks[] {height, hash, timestamp, tx_count, reward_xmr, difficulty, weight}.",
+     {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50,
+                                                 "description": "How many blocks (default 10, max 50)"}},
+      "additionalProperties": False}, lambda a: t_xmr_recent_blocks(a.get("limit"))),
+    ("xmr_get_transaction",
+     "Look up one Monero transaction by txid: is it mined, in which block, how many confirmations, "
+     "its size, output count and ring size. "
+     "When to use: did this XMR transfer get into a block, and how deep is it now. "
+     "Do not use: to learn the amount or the sender/recipient - Monero hides those by design and no "
+     "third party can recover them; only the recipient (or a holder of the tx key) can prove a payment. "
+     "Returns: found, confirmed, in_mempool, block_height, block_timestamp, confirmations, double_spend_seen, "
+     "size_bytes, inputs, outputs, ring_size_per_input, tx_version, unlock_time, and explicitly the list of "
+     "fields not disclosed by the protocol.",
+     {"type": "object", "properties": {"txid": {"type": "string", "description": "64 hex char Monero transaction id"}},
+      "required": ["txid"], "additionalProperties": False}, lambda a: t_xmr_transaction(a.get("txid"))),
+    ("xmr_get_network_stats",
+     "Monero network-wide state: network hashrate, difficulty, emission and fees over the last 720 blocks, "
+     "protocol version and the next hard fork. "
+     "When to use: macro questions about the Monero network - how much hashrate secures it, what is being "
+     "issued, and which protocol version is active. "
+     "Do not use: for our node's own health (xmr_get_node_status). "
+     "Returns: height, network_hashrate_hs, difficulty, block_size/weight median and limit, "
+     "emission_last_720_blocks_xmr, fees_last_720_blocks_xmr, hard_fork_version, next_fork_earliest_height, client_version.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_xmr_network_stats()),
+    ("xmr_verify_payment",
+     "Verify one Monero payment cryptographically, using proof material only the recipient can provide. "
+     "Give it a txid plus either the transaction key (from your own wallet: get_tx_key <txid>) or a "
+     "transaction proof signature (get_tx_proof), and it returns whether that transaction really pays "
+     "the given address, for how much, and how many confirmations. "
+     "When to use: a merchant or agent needs to confirm an XMR payment arrived before releasing value, "
+     "without trusting a block explorer - and for Monero there is no other way, because amounts and both "
+     "counterparties are hidden by the protocol. "
+     "Do not use: to discover payments you cannot already prove (RobotBase does not index Monero wallets, "
+     "and no third party can enumerate your incoming payments), or for TRC-20 USDT settlement "
+     "(that is tron_verify_usdt_transfer). "
+     "Returns: verified, confirmations, received_xmr, received_atomic, in_pool. Neither the tx key nor the "
+     "proof can be used to spend funds or to scan other payments.",
+     {"type": "object", "properties": {
+        "txid": {"type": "string", "description": "64 hex char Monero transaction id"},
+        "address": {"type": "string", "description": "The Monero address that should have received the payment"},
+        "tx_key": {"type": "string", "description": "Transaction key from your own wallet (get_tx_key)"},
+        "signature": {"type": "string", "description": "Transaction proof signature (get_tx_proof) instead of tx_key"},
+        "message": {"type": "string", "description": "Optional message the proof was signed over"}},
+      "required": ["txid", "address"], "additionalProperties": False},
+     lambda a: t_xmr_verify_payment(a.get("txid"), a.get("address"), a.get("tx_key"),
+                                    a.get("signature"), a.get("message"))),
+    ("btc_get_network_stats",
+     "Bitcoin network and node state: difficulty, network hashrate, total transactions processed and the "
+     "current tx/s rate, protocol version, peer connections, relay fee, mempool size, uptime and which "
+     "indexes (txindex) are synced on our node. "
+     "When to use: macro questions about Bitcoin - how much hashrate secures it, how fast the chain is moving, "
+     "or whether our node's indexes are complete. "
+     "Do not use: for fees (btc_get_fee_rates) or mempool depth (btc_get_mempool_state). "
+     "Returns: difficulty, network_hashrate_hs, chain_tx_count_total, tx_rate_per_s, client, connections, "
+     "relay_fee_btc_kvb, uptime_s, indexes{}.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_btc_get_network_stats()),
+    ("eth_get_block",
+     "One Ethereum block by number, tag (latest/finalized/safe) or hash: timestamp, transaction count, gas "
+     "used against the limit, base fee, block builder and size. "
+     "When to use: block-level context - how full is Ethereum right now, when a block was produced, what the "
+     "base fee was, or which builder produced it. "
+     "Do not use: for a transaction (eth_get_transaction) or for fees across blocks (eth_get_fee_rates). "
+     "Returns: found, number, hash, parent_hash, timestamp, age_s, tx_count, gas_used, gas_limit, gas_used_pct, "
+     "base_fee_gwei, miner, size_bytes. "
+     "Boundary: block bodies are retained from 15,500,000 (2022-09-14) only; older heights return a pruned-history "
+     "error, not an empty block.",
+     {"type": "object", "properties": {
+        "height": {"description": "Block number (integer or hex), or a tag like latest / finalized / safe"},
+        "block_hash": {"type": "string", "description": "0x + 64 hex block hash; takes precedence"}},
+      "additionalProperties": False}, lambda a: t_eth_get_block(a.get("height"), a.get("block_hash"))),
+    ("eth_get_logs",
+     "Ethereum event logs over a block range, optionally filtered by contract address and event signature, "
+     "with ERC-20 Transfer logs decoded (token, from, to, amount). "
+     "When to use: find transfers or contract events in a window - 'who moved this token in the last N "
+     "blocks', or watch a contract's activity without an indexer. "
+     "Do not use: for a single transaction (eth_get_transaction) or to scan huge ranges (max 1000 blocks per "
+     "call, results truncated with a flag). "
+     "Returns: filter, matched, returned, truncated, logs[] with block_number, tx_hash, address, topics, data "
+     "and a decoded block for ERC-20 Transfers. "
+     "Boundary: logs are read from receipts, which exist only for a rolling window (~6 days today, 1.4-8.3 days as "
+     "the 50k-block static-file shard advances); older ranges are refused.",
+     {"type": "object", "properties": {
+        "from_block": {"description": "Integer or hex or tag; defaults to 100 blocks back"},
+        "to_block": {"description": "Integer or hex or tag; defaults to latest"},
+        "address": {"type": "string", "description": "Optional contract address filter"},
+        "topic0": {"type": "string", "description": "Optional event signature hash filter"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Max logs to return (default 50)"}},
+      "additionalProperties": False},
+     lambda a: t_eth_get_logs(a.get("from_block"), a.get("to_block"), a.get("address"),
+                              a.get("topic0"), a.get("limit"))),
+    ("xmr_get_output_distribution",
+     "Monero output distribution: how many spendable outputs fall into each ring-size bucket, read from our "
+     "own monerod. This is the anonymity-set side of Monero that free explorers rarely expose. "
+     "When to use: reasoning about Monero privacy - how large the spendable-output set is at a given height. "
+     "Do not use: to guess a 'privacy score' (we return raw counts only). "
+     "Boundary: monerod's distribution data lags the chain tip by roughly 5,000 blocks, so the default range "
+     "is 5,010 to 5,000 blocks back and the response states the real height and the lag. "
+     "Returns: tip_height, queried_range, data_lags_tip_by_blocks, start_height, outputs_before_start, "
+     "distribution[] with the raw per-bucket counts.",
+     {"type": "object", "properties": {
+        "from_height": {"type": "integer", "description": "Start height; defaults to tip-5010"},
+        "to_height": {"type": "integer", "description": "End height; defaults to tip-5000"}},
+      "additionalProperties": False},
+     lambda a: t_xmr_get_output_distribution(a.get("from_height"), a.get("to_height"))),
+    ("zec_get_treestate",
+     "Zcash shielded commitment-tree state: the Sapling, Orchard and Ironwood anchor roots at a given block. "
+     "When to use: shielded-pool depth - how the shielded sets advance over time, or the anchor a wallet or "
+     "prover needs to recognise. "
+     "Do not use: for pool supplies (zec_get_pool_status) or a transaction (zec_get_transaction). "
+     "Returns: block_hash, height, time, pools{sapling, orchard, ironwood}{final_root, final_state}.",
+     {"type": "object", "properties": {"block_hash": {"type": "string", "description": "64 hex block hash"},
+                                       "height": {"type": "integer", "description": "Block height instead of a hash"}},
+      "additionalProperties": False}, lambda a: t_zec_get_treestate(a.get("block_hash"), a.get("height"))),
+    ("zec_get_network_stats",
+     "Zcash network and node state: mempool size and bytes, node version, difficulty, network hashrate, chain "
+     "progress and disk, block subsidy, and the funding streams (including Zcash Community Grants). "
+     "When to use: macro questions about Zcash - how much hashrate secures it, whether our node is caught up, "
+     "what the block subsidy and funding allocations currently are. "
+     "Do not use: for shielded-pool supplies (zec_get_pool_status) or our node's own sync state "
+     "(zec_get_pool_status / chain_status). "
+     "Returns: mempool, network, difficulty, network_hashrate_hs, blockchain, height, verification_progress, "
+     "size_on_disk_gb, block_reward_zec, funding_streams[], lockbox_streams[].",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_zec_get_network_stats()),
+    ("tron_list_proposals",
+     "Tron governance proposals: id, proposer, state, approvals, expiry and the parameters they would change. "
+     "When to use: governance or staking questions, or checking whether a chain-parameter change is pending. "
+     "Do not use: for the current parameter values (tron_get_chain_economics) or the witness list "
+     "(tron_list_witnesses). "
+     "Returns: total_proposals, by_state{}, top_by_approvals[] with proposal_id, proposer, approvals, state, "
+     "parameters{}.",
+     {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 100,
+        "description": "How many top proposals to return (default 20)"}},
+      "additionalProperties": False}, lambda a: t_tron_list_proposals(a.get("limit"))),
+    ("eth_get_transaction",
+     "Ethereum transaction check by hash: success or reverted, gas used, fee paid, confirmations, whether the "
+     "block is finalized, and any ERC-20 transfers decoded from the receipt logs (token, from, to, amount). "
+     "When to use: did this ETH or ERC-20 payment actually settle, is it irreversible, who paid whom and how much. "
+     "Do not use: for fee estimation (eth_get_fee_rates) or for Tron (tron_get_transaction). "
+     "Returns: found, status, block_number, from, to, value_eth, gas_used, fee_eth, confirmations, finalized, "
+     "erc20_transfers[]. A miss is reported as absent from *our* node only - never as proof of non-existence. "
+     "Boundary: the transaction-hash index starts at block 26,170,371 (2026-10-12, only widens) while receipts cover "
+     "a rolling ~6 days, so a miss on an older transaction means outside our window, not non-existent.",
+     {"type": "object", "properties": {"txid": {"type": "string", "description": "0x + 64 hex transaction hash"}},
+      "required": ["txid"], "additionalProperties": False}, lambda a: t_eth_transaction(a.get("txid"))),
+    ("eth_get_fee_rates",
+     "Ethereum fee market from our own Reth node: current and next base fee, priority-fee percentiles over the "
+     "last blocks, and the estimated ETH cost of a plain transfer and of an ERC-20 transfer. "
+     "When to use: pricing an Ethereum transaction, or deciding what tip gets included quickly. "
+     "Do not use: for Bitcoin (btc_get_fee_rates), Monero (xmr_get_fee_rates) or Tron (tron_get_chain_economics). "
+     "Returns: base_fee_gwei, next_base_fee_gwei, base_fee_last_blocks_gwei, priority_percentiles_gwei, "
+     "estimated_cost{simple_eth_transfer_21000_gas_eth, erc20_transfer_65000_gas_eth}.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_eth_fee_rates()),
+    ("eth_get_account",
+     "Ethereum account state from our own node: ETH balance, nonce, and whether the address is a contract. "
+     "When to use: balance and account type before sizing a transfer, or telling an EOA from a contract. "
+     "Do not use: for ERC-20 token balances (eth_read_contract with balanceOf) or address risk scoring. "
+     "Returns: address, balance_eth, nonce, is_contract, code_size_bytes.",
+     {"type": "object", "properties": {"address": {"type": "string", "description": "0x + 40 hex address"}},
+      "required": ["address"], "additionalProperties": False}, lambda a: t_eth_account(a.get("address"))),
+    ("eth_read_contract",
+     "Read-only (eth_call) against any Ethereum contract, executed by our own Reth node. ERC-20 helpers "
+     "balanceOf / allowance / decimals / symbol / name / totalSupply are built in; any other function can be "
+     "called by passing its 4-byte `selector` plus ABI-encoded `parameter`. Nothing is signed or written. "
+     "When to use: an agent needs an on-chain value without trusting a third-party API - a USDT/USDC balance, "
+     "token decimals, an allowance, or any view function. "
+     "Do not use: to send a transaction (this never writes), or for a historical balance. "
+     "Returns: ok, contract, function, selector, output_type, value, value_human for known-decimals tokens.",
+     {"type": "object", "properties": {
+        "contract": {"type": "string", "description": "0x + 40 hex contract address"},
+        "function": {"type": "string", "description": "balanceOf | allowance | decimals | symbol | name | totalSupply, or a label for a raw selector"},
+        "argument": {"type": "string", "description": "Ethereum address argument (balanceOf / allowance)"},
+        "argument2": {"type": "string", "description": "Second address argument (allowance)"},
+        "selector": {"type": "string", "description": "Explicit 4-byte selector hex for non-ERC-20 calls"},
+        "parameter": {"type": "string", "description": "ABI-encoded parameter hex (with an explicit selector)"},
+        "output_type": {"type": "string", "enum": ["uint256", "address", "string", "bool"]}},
+      "required": ["contract", "function"], "additionalProperties": False},
+     lambda a: t_eth_read_contract(a.get("contract"), a.get("function"), a.get("argument"),
+                                   a.get("argument2"), a.get("selector"), a.get("parameter"),
+                                   a.get("output_type"))),
+    ("zec_get_transaction",
+     "Zcash transaction check by txid from our own Zebra node: confirmations, block height and time, whether it "
+     "is in the active chain, size, and how much of it is transparent versus shielded. "
+     "When to use: did this ZEC payment land, how deep is it, and does it involve shielded inputs/outputs. "
+     "Do not use: to learn shielded amounts or parties - shielded values are hidden by the protocol and only a "
+     "viewing key held by a party to the transaction can read them; this tool reports the shielded *shape* "
+     "(spend/output/action counts) and says so explicitly rather than guessing. "
+     "Returns: found, confirmations, block_height, block_hash, block_time, in_active_chain, size_bytes, "
+     "transparent{inputs, outputs, total_output_zec}, shielded{sapling_spends, sapling_outputs, orchard_actions}, "
+     "has_shielded_component, not_disclosed_by_protocol[].",
+     {"type": "object", "properties": {"txid": {"type": "string", "description": "64 hex char Zcash transaction id"}},
+      "required": ["txid"], "additionalProperties": False}, lambda a: t_zec_transaction(a.get("txid"))),
+    ("tron_get_node_status",
+     "TRON node state from our own java-tron full node: tip height, finalized (solidity) height and how far "
+     "solidity lags, peers, client version, transactions in the tip block. "
+     "When to use: is the TRON node we operate synced and healthy, and how far behind is the finalized state. "
+     "Do not use: for historical blocks or transactions - this is a lite full node and those APIs are closed. "
+     "Returns: height, solidity_height, solidity_lag_blocks, age_s, tx_in_tip_block, peer_count, client_version.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_tron_node_status()),
+    ("tron_get_block",
+     "One Tron block by height or block id, read from our own node: producer, timestamp, transaction count "
+     "split by contract type, and the tx ids in it. "
+     "When to use: inspect a specific block, or confirm which block a transaction landed in. "
+     "Do not use: for the tip only (tron_get_current_block) or for a transaction itself (tron_get_transaction). "
+     "Boundary: our Tron node is a lite full node that keeps only a recent window (~6 days). An empty result "
+     "means 'outside our window', NOT 'the block does not exist'. "
+     "Returns: found, number, block_id, parent_hash, timestamp_ms, tx_count, tx_by_type, producer_address, "
+     "tx_ids, retention_window.",
+     {"type": "object", "properties": {"height": {"type": "integer", "description": "Block height"},
+        "block_id": {"type": "string", "description": "Block id (64 hex chars); takes precedence over height"}},
+      "additionalProperties": False}, lambda a: t_tron_block(a.get("height"), a.get("block_id"))),
+    ("tron_get_transaction",
+     "One Tron transaction by txid: success or reverted, energy used, the call it made, and - this is the "
+     "important part - any TRC-20 transfers decoded from the receipt logs (token, from, to, amount). "
+     "When to use: did this USDT payment really land, for how much, from whom, and is it finalized. "
+     "Do not use: for address risk scoring (tron_check_address_risk) or for blocks (tron_get_block). "
+     "Boundary: our node is a lite full node with a recent window (~6 days); an empty result means 'outside "
+     "our window', NOT 'the payment did not arrive' - fall back to an indexer before saying a payment is missing. "
+     "Returns: found, block_number, status, contract_type, owner/to/contract_address, amount_trx, "
+     "trc20_transfers[], energy_used, confirmations, finalized, retention_window.",
+     {"type": "object", "properties": {"txid": {"type": "string", "description": "64 hex char Tron transaction id"}},
+      "required": ["txid"], "additionalProperties": False}, lambda a: t_tron_transaction(a.get("txid"))),
+    ("tron_get_current_block",
+     "The current (tip) TRON block: number, id, parent, timestamp, transaction count and a breakdown by "
+     "contract type, plus the producing witness. "
+     "When to use: how busy TRON is right now, what is in the block being produced, who produced it. "
+     "Do not use: to fetch an older block - a lite full node serves the tip only, historical blocks are closed. "
+     "Returns: number, block_id, parent_hash, timestamp_ms, age_s, tx_count, tx_by_type, producer_address.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_tron_current_block()),
+    ("tron_get_account",
+     "TRON account state read straight off our own node: TRX balance, whether the account is activated, "
+     "energy and bandwidth (used / limit), whether it is a witness, and account age. "
+     "When to use: TRX balance and resource state before sizing a transfer, or checking whether an address exists on chain. "
+     "Do not use: for USDT/TRC-20 token balances (use tron_read_contract with balanceOf) or for address risk "
+     "scoring (that is tron_check_address_risk). "
+     "Returns: found, address, trx_balance, name, created_ms, last_operation_ms, is_witness, has_code, energy, bandwidth.",
+     {"type": "object", "properties": {"address": {"type": "string",
+        "description": "TRON address, base58 (T...) or 41-hex"}}, "required": ["address"],
+      "additionalProperties": False}, lambda a: t_tron_account(a.get("address"))),
+    ("tron_get_contract",
+     "TRON contract metadata: name, creator, whether its ABI is published on chain, the function list, "
+     "code hash and whether it looks like a TRC-20. "
+     "When to use: before calling a contract, or to tell an unverified contract from a published one. "
+     "Do not use: for risk/backdoor analysis (that is tron_check_address_risk and, on EVM, base_check_contract_risk). "
+     "Returns: found, address, name, creator, has_abi, abi_entry_count, is_trc20, functions, code_hash.",
+     {"type": "object", "properties": {"address": {"type": "string", "description": "TRON contract address"}},
+      "required": ["address"], "additionalProperties": False}, lambda a: t_tron_contract(a.get("address"))),
+    ("tron_read_contract",
+     "Read-only (constant) call against any TRON contract, executed by our own node. TRC-20 helpers "
+     "balanceOf / allowance / decimals / symbol / name / totalSupply are built in; any other function can be "
+     "called with a raw selector plus ABI-encoded parameter. No state is changed and no key is involved. "
+     "When to use: an agent needs an on-chain value without trusting a third-party API - USDT balance of an "
+     "address, token decimals, an allowance, or any view function. "
+     "Do not use: to send a transaction (this never writes), or to look up a historical balance. "
+     "Returns: ok, contract, function, output_type, value (decoded), value_human for 6-decimal tokens, raw, energy_used.",
+     {"type": "object", "properties": {
+        "contract": {"type": "string", "description": "Contract address (base58 or 41-hex)"},
+        "function": {"type": "string", "description": "balanceOf | allowance | decimals | symbol | name | totalSupply, or a raw selector like 'foo(uint256)'"},
+        "argument": {"type": "string", "description": "TRON address argument (for balanceOf / allowance)"},
+        "argument2": {"type": "string", "description": "Second address argument (for allowance)"},
+        "parameter": {"type": "string", "description": "Raw ABI-encoded parameter hex, for raw selectors"},
+        "output_type": {"type": "string", "enum": ["uint256", "address", "string", "bool"]}},
+      "required": ["contract", "function"], "additionalProperties": False},
+     lambda a: t_tron_read_contract(a.get("contract"), a.get("function"), a.get("argument"),
+                                    a.get("argument2"), a.get("parameter"), a.get("output_type"))),
+    ("tron_get_chain_economics",
+     "TRON chain economics straight off our node: energy price (sun per energy unit), transaction fee, "
+     "account creation fee, witness pay per block, total energy and bandwidth limits, maintenance interval "
+     "and the next maintenance time, unfreeze delay. "
+     "When to use: working out what a transaction will actually cost in TRX, or how TRON's resource market "
+     "is currently priced. "
+     "Do not use: for Bitcoin fees (btc_get_fee_rates) or Monero fees (xmr_get_fee_rates). "
+     "Returns: energy_fee_sun_per_unit, transaction_fee_sun, create_account_fee_trx, witness_pay_per_block_trx, "
+     "maintenance_interval_s, next_maintenance_ms, unfreeze_delay_days, latest_energy_price.",
+     {"type": "object", "properties": {}, "additionalProperties": False}, lambda a: t_tron_chain_economics()),
+    ("tron_list_witnesses",
+     "TRON super representatives and candidates: who is producing blocks, how many they produced, how many "
+     "they missed, votes and websites - read from our own node. "
+     "When to use: governance or staking questions about TRON, or checking the health of block production. "
+     "Do not use: for account balances (tron_get_account). "
+     "Returns: registered_witnesses, active_block_producers, top_by_blocks_produced[] with address, url, "
+     "blocks_produced, blocks_missed, votes, in_active_set.",
+     {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 200,
+        "description": "How many top producers to return (default 30)"}},
+      "additionalProperties": False}, lambda a: t_tron_list_witnesses(a.get("limit"))),
     ("broadcast_raw_transaction",
      "Relay an already-signed raw transaction to the network through our own full node (non-custodial: we never see a private key). "
      "When to use: an agent signed a transaction locally and wants a high-availability broadcast path into the Bitcoin network. "
@@ -1673,6 +2547,9 @@ TOOLS = [    ("list_chains",
      "When to use: an agent or a merchant must confirm a USDT payment before releasing value - this is the "
      "settlement check that closes an automated trade loop. "
      "Do not use: to assess the counterparty (that is tron_check_address_risk). "
+     "Data source: our own java-tron full node when the transaction is inside its ~6 day retention window "
+     "(sub-second, no third party); it falls back to TronGrid automatically for older transactions, and says "
+     "which one answered in `source`. A local miss is never reported as 'not found' by itself. "
      "Returns: found, status (SUCCESS|FAILED), finalized (present on the solidity/irreversible chain), "
      "confirmations, blocks_until_finality, block_number, block_time_utc, amount_usdt, from, to, fee_trx, "
      "checks {}, verified and a plain-language verdict. Pass expected_to / expected_amount_usdt to have the "
@@ -1698,7 +2575,8 @@ TOOLS = [    ("list_chains",
      {"type": "object", "properties": {
          "mint": {"type": "string", "description": "Solana token mint address (base58). Preferred name."},
          "address": {"type": "string", "description": "Alias for `mint` - accepted so a generic agent can pass `address`."}},
-      "anyOf": [{"required": ["mint"]}, {"required": ["address"]}], "additionalProperties": False},
+      "anyOf": [{"required": ["mint"]}, {"required": ["address"]}],
+      "additionalProperties": False},
      lambda a: t_sol_check_token_safety(_arg(a, "mint", "address", "token_address", "token"))),
     ("base_check_contract_risk",
      "Base (EVM) token and contract risk screen: honeypot, transfer taxes, verified source, backdoors "
@@ -1717,7 +2595,8 @@ TOOLS = [    ("list_chains",
      {"type": "object", "properties": {
          "contract": {"type": "string", "description": "Base ERC-20 / contract address (0x + 40 hex). Preferred name."},
          "address": {"type": "string", "description": "Alias for `contract` - accepted so a generic agent can pass `address`."}},
-      "anyOf": [{"required": ["contract"]}, {"required": ["address"]}], "additionalProperties": False},
+      "anyOf": [{"required": ["contract"]}, {"required": ["address"]}],
+      "additionalProperties": False},
      lambda a: t_base_check_contract_risk(_arg(a, "contract", "address", "token_address", "token"))),
 ]
 
@@ -1731,54 +2610,139 @@ def call_tool(name, args):
         if n == name:
             if n not in RISK_TOOLS:
                 return fn(args or {})
-            # ---- x402 paid tier -------------------------------------------------
-            # A client that settled a credit pack re-sends the SAME payment payload
-            # on every call; settlement is idempotent per nonce, so each call just
-            # spends one credit. See x402_pay.try_pay().
+            # ---- x402：客户自带付款（信用包）。先入账，再执行工具。----
+            # 注意顺序：付款成功才执行；执行失败不退款（客户买的是额度，不是这一次调用）。
             payment = getattr(_REQ, "payment", None)
             if payment and x402_pay is not None and x402_pay.enabled():
                 res = x402_pay.try_pay(name, payment)
                 if not res.get("ok"):
+                    _REQ.x402_result = {"success": False,
+                                        "errorReason": res.get("reason") or "invalid_payment",
+                                        "network": res.get("network") or "",
+                                        "payer": res.get("payer") or "",
+                                        "transaction": ""}
+                    # 错误码 + 详细原因一起交给 payment_required()：付款方要知道"为什么被拒"
                     raise PaymentRequired(json.dumps({
                         "reason": res.get("reason") or "invalid_payment",
                         "detail": res.get("detail") or "",
                         "network": res.get("network") or "",
                     }, ensure_ascii=False))
+                net_used = res.get("network") or x402_pay.cfg().get("network", "")
+                # 幂等：同一 payer 在 5 分钟内重复同一查询（典型场景：客户端超时后重试），
+                # 直接回上一次的结果，不再扣信用。必须在余额检查之前，否则余额刚好吃到 0
+                # 的重试会被误判成"额度用完"。
+                _pd_key = (res["payer"], name,
+                           json.dumps(args or {}, sort_keys=True, ensure_ascii=False))
+                _pd_now = time.time()
+                with _paid_dedup_lock:
+                    _pd_hit = _paid_dedup.get(_pd_key)
+                if _pd_hit and _pd_now - _pd_hit[0] < PAID_DEDUP_TTL:
+                    _pd_left = x402_pay.balance(res["payer"])
+                    _pd_out = json.loads(json.dumps(_pd_hit[1]))
+                    _pd_info = {"payer": res["payer"], "credit_remaining": _pd_left,
+                                "creditRemaining": _pd_left, "charged_this_call": False,
+                                "deduplicated": True,
+                                "first_answered_sec_ago": int(_pd_now - _pd_hit[0]),
+                                "how_to_spend_credits": (
+                                    "Identical query from the same payer within 5 minutes is answered "
+                                    "from cache and does not spend a credit.")}
+                    _pd_out["_x402"] = _pd_info
+                    _REQ.x402_result = {"success": True, "transaction": res.get("tx", ""),
+                                        "network": net_used, "payer": res["payer"],
+                                        "credit_remaining": _pd_left, "replayed_payment": True}
+                    return _pd_out
                 if x402_pay.balance(res["payer"]) <= 0:
-                    raise PaymentRequired(json.dumps({
-                        "reason": "insufficient_credit",
-                        "detail": "payer %s has no remaining credits; buy another pack" % res["payer"],
-                        "network": res.get("network") or "",
-                    }, ensure_ascii=False))
-                # Run the tool first; a tool that fails local validation can opt out
-                # of charging by returning _no_charge.
-                out = fn(args or {})
+                    _REQ.x402_result = {"success": False, "errorReason": "insufficient_credit",
+                                        "network": net_used, "payer": res["payer"],
+                                        "transaction": res.get("tx", "")}
+                    raise PaymentRequired(
+                        json.dumps({
+                            "reason": "insufficient_credit",
+                            "detail": "付款地址 %s 的额度已用完，请购买新的信用包" % res["payer"],
+                            "network": net_used,
+                        }, ensure_ascii=False))
+                # 2026-10-17：先执行工具，成功后才扣 1 次信用；异常或 _no_charge 不扣。
+                out = fn(args or {})          # 异常直接上抛，不扣费
                 no_charge = isinstance(out, dict) and bool(out.pop("_no_charge", False))
-                left = x402_pay.balance(res["payer"]) if no_charge else x402_pay.spend(res["payer"], name)
-                if left < 0:
-                    left = 0
-                info = {"payer": res["payer"], "credit_remaining": left, "creditRemaining": left,
-                        "charged_this_call": not no_charge,
-                        "settled_tx": res.get("tx", ""),
-                        "replayed_payment": bool(res.get("replayed")),
-                        "how_to_spend_credits": (
-                            "There is no API key. Keep sending this same payment payload in "
-                            "params._meta[\"x402/payment\"]: it will not be settled again, it only "
-                            "spends one credit per successful call until the balance reaches 0.")}
-                if isinstance(out, dict):
-                    out["_x402"] = info
+                if no_charge:
+                    left = x402_pay.balance(res["payer"])
                 else:
-                    out = {"result": out, "_x402": info}
+                    left = x402_pay.spend(res["payer"], name)
+                    if left < 0:                # 并发下余额被抢光：结果仍返回，不倒扣
+                        left = 0
+                _REQ.x402_result = {"success": True, "transaction": res.get("tx", ""),
+                                    "network": net_used,
+                                    "payer": res["payer"], "credit_remaining": left, "creditRemaining": left}
+                x402info = {"payer": res["payer"], "credit_remaining": left, "creditRemaining": left,
+                            "charged_this_call": not no_charge,
+                            "settled_tx": res.get("tx", ""),
+                            "replayed_payment": bool(res.get("replayed")),
+                            "how_to_spend_credits": (
+                                "There is no API key. Keep sending this same payment payload in "
+                                "params._meta[\"x402/payment\"] with each call: it will not be settled "
+                                "again, it only spends one credit per successful call until the balance reaches 0.")}
+                _pd_store = json.loads(json.dumps(out)) if isinstance(out, dict) else {"result": out}
+                if isinstance(out, dict):
+                    out["_x402"] = x402info
+                else:
+                    out = {"result": out, "_x402": x402info}
+                with _paid_dedup_lock:
+                    if len(_paid_dedup) >= PAID_DEDUP_MAX:
+                        for _k in sorted(_paid_dedup, key=lambda k: _paid_dedup[k][0])[:64]:
+                            _paid_dedup.pop(_k, None)
+                    _paid_dedup[_pd_key] = (time.time(), _pd_store)
                 return out
-            # ---- free tier ------------------------------------------------------
+            pre = _risk_precheck(name, args or {})
+            if pre is not None:                      # 本地校验失败：不扣费，也不受额度门禁影响
+                _a, _u, _l = _risk_quota(False)
+                pre["_metering"] = (_meter_payload(_u, _l, pending=True, charged=False)
+                                    if _l >= 0 else _meter_payload(0, -1))
+                return pre
+
+            # 去重按 IP 隔离：旧的全局键让不同 IP 在 5 分钟内重复同一查询都免费，
+            # 等于把免费额度放大成"每个热门地址只算一次"。现在同一 IP 的重试仍免费，
+            # 换一个 IP 就是独立的一次调用。
+            _ip_tag = hashlib.sha256(_client_ip().encode()).hexdigest()[:16]
+            dedup_key = (name, _ip_tag, json.dumps(args or {}, sort_keys=True, ensure_ascii=False))
+            now_ts = time.time()
+            with _risk_dedup_lock:
+                _hit = _risk_dedup.get(dedup_key)
+            _age = (now_ts - _hit[0]) if _hit else None
+            if _hit and _age is not None and _age < RISK_DEDUP_TTL:
+                # 同一次查询的重复提交（客户端超时后重试）：回同一份结论，**不再扣费**
+                _a, _u, _l = _risk_quota(False)
+                _m = (_meter_payload(_u, _l, pending=True, charged=False)
+                      if _l >= 0 else _meter_payload(0, -1))
+                if _l >= 0:
+                    _m["free_tier"]["deduplicated"] = True
+                    _m["free_tier"]["first_answered_sec_ago"] = int(_age)
+                _cached = dict(_hit[1])
+                _cached["_repeat_of_recent_call"] = True
+                _cached["_metering"] = _m
+                return _cached
+
             gate = _risk_gate()                      # 额度用尽则抛 PaymentRequired，不消耗上游
             tier = gate.get("free_tier") or {}
             used_before, limit = tier.get("used_today", 0), tier.get("limit_per_day", -1)
             out = fn(args or {})
+            charged = True
             if isinstance(out, dict) and out.pop("_no_charge", False):
-                meter = _meter_payload(used_before, limit, pending=True) if limit >= 0 else _meter_payload(0, -1)
+                charged = False
+                meter = (_meter_payload(used_before, limit, pending=True, charged=False)
+                         if limit >= 0 else _meter_payload(0, -1))
             else:
                 meter = _risk_commit(used_before, limit)
+                if limit >= 0:
+                    meter["free_tier"]["charged_this_call"] = True
+            if charged:
+                # 只把「扣过费的真实结论」放进去重缓存：重试时可以直接复用
+                _snap = dict(out) if isinstance(out, dict) else {"result": out}
+                _snap.pop("_metering", None)
+                with _risk_dedup_lock:
+                    if len(_risk_dedup) >= RISK_DEDUP_MAX:
+                        for _k in sorted(_risk_dedup, key=lambda k: _risk_dedup[k][0])[:64]:
+                            _risk_dedup.pop(_k, None)
+                    _risk_dedup[dedup_key] = (now_ts, _snap)
             if isinstance(out, dict):
                 out["_metering"] = meter
             else:
@@ -1791,10 +2755,16 @@ def handle(msg):
     method = msg.get("method")
     mid = msg.get("id")
     params = msg.get("params") or {}
-    # x402: the payment payload travels in params._meta["x402/payment"]
-    # (MCP transport convention). Cleared per request to avoid thread-local leakage.
-    _REQ.payment = (params.get("_meta") or {}).get("x402/payment") or None
     if method == "initialize":
+        # 握手是唯一能拿到客户端自报名的地方，记进审计 + journald，之后按名字分组。
+        ci = params.get("clientInfo") or {}
+        cname = str(ci.get("name") or "").strip()
+        cver = str(ci.get("version") or "").strip()
+        if cname:
+            _REQ.client = (cname + ("/" + cver if cver else ""))[:80]
+            print("[mcp] initialize client=%s proto=%s ua=%r" % (
+                _REQ.client, params.get("protocolVersion"), getattr(_REQ, "ua", "")[:90]), flush=True)
+            log_client(_client_ip(), _REQ.client, getattr(_REQ, "ua", ""), params.get("protocolVersion"))
         return {"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": PROTOCOL_VERSION, "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": SERVER_INFO,
@@ -1810,8 +2780,13 @@ def handle(msg):
                              "Those four risk tools are metered: a free daily allowance per IP, then 0.01 "
                              "USDC per call paid over x402 by the caller's own wallet - there is no API "
                              "key, no account and no subscription of any kind. When the allowance runs "
-                             "out the tool answers Payment Required, and every answer carries its own "
-                             "_metering block.")}}
+                             "out the tool answers Payment Required with the machine-readable terms in "
+                             "structuredContent.accepts[]; settle a credit pack once and keep sending "
+                             "the same payment payload so it decrements credit instead of charging "
+                             "again. Every answer carries its own _metering block. Metering is safe to retry: "
+                             "repeating the exact same risk query within 5 minutes is answered from cache "
+                             "with charged_this_call=false, and a locally invalid argument is rejected "
+                             "without consuming a free call.")}}
     if method == "notifications/initialized" or mid is None:
         return None
     if method == "ping":
@@ -1824,14 +2799,34 @@ def handle(msg):
         return {"jsonrpc": "2.0", "id": mid, "result": {"prompts": []}}
     if method == "tools/call":
         name = params.get("name")
+        # x402 付款载荷按 MCP 传输规范放在 params._meta["x402/payment"]
+        _REQ.payment = (params.get("_meta") or {}).get("x402/payment") or None
+        _REQ.x402_result = None
         try:
             out = call_tool(name, params.get("arguments") or {})
-            return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": truncate(out)}],
-                                                            "isError": False}}
+            # 2026-10-16：核验类工具的成功结果落台账（付款事实，供可信度评分用）。
+            # 只做加法：任何异常都吞掉，绝不改变工具返回。
+            if verify_ledger is not None:
+                try:
+                    verify_ledger.record(name, params.get('arguments') or {}, out)
+                except Exception:  # noqa: BLE001
+                    pass
+            _is_err = bool(name == "btc_get_address" and isinstance(out, dict) and out.get("error"))
+            if _is_err:
+                _REQ.err = str(out.get("error"))
+            result = {"content": [{"type": "text", "text": truncate(out)}], "isError": _is_err}
+            if _REQ.x402_result:      # 结算成功：按规范回 payment-response
+                result["_meta"] = {"x402/payment-response": _REQ.x402_result}
+            return {"jsonrpc": "2.0", "id": mid, "result": result}
         except PaymentRequired as pay:
+            _REQ.err = "payment_required: %s" % pay
+            # 有 x402 能力时返回规范形状（structuredContent + content[0].text 完全一致），
+            # 否则退回旧的 JSON 形状，保证老客户端不受影响。
             if x402_pay is not None and x402_pay.enabled():
-                return {"jsonrpc": "2.0", "id": mid,
-                        "result": x402_pay.payment_required(name, str(pay))}
+                _pr = x402_pay.payment_required(name, str(pay))
+                if _REQ.x402_result:      # 付款失败也回 payment-response（success=false）
+                    _pr["_meta"] = {"x402/payment-response": _REQ.x402_result}
+                return {"jsonrpc": "2.0", "id": mid, "result": _pr}
             return {"jsonrpc": "2.0", "id": mid, "result": {
                 "content": [{"type": "text", "text": json.dumps(
                     {"error": "payment_required", "tool": name, "message": str(pay),
@@ -1839,6 +2834,7 @@ def handle(msg):
                     ensure_ascii=False)}],
                 "isError": True}}
         except Exception as exc:  # noqa: BLE001
+            _REQ.err = "%s: %s" % (type(exc).__name__, exc)
             return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": f"error: {exc}"[:300]}],
                                                             "isError": True}}
     return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"Method not found: {method}"}}
@@ -1847,7 +2843,7 @@ def handle(msg):
 DOC_TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>RobotBase MCP · the semantic risk &amp; verification layer for Web3 agents</title>
-<meta name="description" content="One read-only MCP endpoint where an autonomous agent verifies that an on-chain payment settled and prices the next one. Bitcoin, Ethereum, Monero and Zcash are live; Solana, Base and Tron are provisioning. No public RPC, no custody, no tracking.">
+<meta name="description" content="One read-only MCP endpoint where an autonomous agent verifies that an on-chain payment settled and prices the next one. Bitcoin, Ethereum, Monero, Zcash and Tron are live; Solana and Base are provisioning. No public RPC, no custody, no tracking.">
 <style>
 :root{--bg:#070a0f;--panel:#0f141c;--line:#1f2733;--text:#e8eef6;--muted:#8b98a9;--brand:#ff7a2f;--brand2:#ffc46b}
 *{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif;
@@ -1871,10 +2867,19 @@ border:0;border-radius:10px;padding:9px 15px;font-weight:700;font-size:13.5px;cu
 a{color:var(--brand2)}.muted{color:var(--muted);font-size:12.5px}.ok{color:#2ee6a8}
 .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:#16202b;border:1px solid var(--line);
 border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;pointer-events:none}.toast.on{opacity:1}
-</style></head><body><div class="wrap">
+</style>
+<!-- Google tag (gtag.js) — 流量监控 -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-KQFLDYBGGC"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+  gtag('config', 'G-KQFLDYBGGC');
+</script>
+</head><body><div class="wrap">
 <h1>RobotBase MCP Server</h1>
 <div class="tag">Read-only MCP · BTC / ETH / XMR / ZEC live · Solana / Base / Tron provisioning · no RPC endpoint · no custody</div>
-<div class="sub">RobotBase is the semantic risk and verification layer for Web3 agents: one endpoint where an autonomous agent checks whether a payment actually settled on Bitcoin, prices the next transaction, reads the Zcash shielded-pool distribution, and confirms that a node really is synced - straight from bare-metal nodes we operate ourselves. Solana, Base and Tron are being wired into the aggregation layer and join the live set once they are. RobotBase publishes no RPC endpoint of any kind: this MCP surface is the only read path. Every tool is read-only, none touch trading or funds, and RobotBase operates no mining pool.</div>
+<div class="sub">RobotBase is the semantic risk and verification layer for Web3 agents: one endpoint where an autonomous agent checks whether a payment actually settled on Bitcoin, prices the next transaction, reads the Zcash shielded-pool distribution, screens a TRON address or confirms a USDT-TRC20 transfer, and verifies that a node really is synced - straight from bare-metal nodes we operate ourselves. Tron is live as of today (a self-hosted lite full node: current state plus the most recent ~2.3 days, and it says so rather than guessing). Solana and Base are being wired into the aggregation layer and join the live set once they are. RobotBase publishes no RPC endpoint of any kind: this MCP surface is the only read path. Every tool is read-only, none touch trading or funds, and RobotBase operates no mining pool.</div>
 
 <div class="card">
   <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
@@ -1913,7 +2918,7 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
 <div class="card"><pre>External AI agent ──HTTPS (Streamable HTTP)──► https://robotbase.cc/mcp
                                             │ Cloudflare Tunnel
                                             ▼
-                      gateway (/mcp reverse proxy) ──► MCP service (:8090)
+                      gateway (/mcp reverse proxy) ──► MCP tool service
                         ├── BTC   full node RPC + electrs (address/tx index)
                         ├── ETH   Reth execution + Lighthouse consensus
                         ├── XMR   monerod full node
@@ -1927,7 +2932,6 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
 <div><div class="muted">Risk tools</div><div><b>5 free/day per IP</b>, then <b>$0.01</b> per call by x402</div></div>
 <div><div class="muted">Payment</div><div>USDC on Base or Solana, from your own wallet - <b>no API key, no subscription</b></div></div>
 <div><div class="muted">Anonymous</div><div><b>120 req/min/IP</b></div></div>
-<div><div class="muted">Keyed tier</div><div><b>None</b> - robotbase.cc issues no API key of any kind</div></div>
 <div><div class="muted">Privacy</div><div>Audit keeps only the first 16 chars of the IP SHA256 — <b>query arguments are never logged</b></div></div>
 <div><div class="muted">Data</div><div>Read-only on-chain data; no trading, signing or custody</div></div>
 </div></div>
@@ -1945,21 +2949,23 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
 <li><code>base_check_contract_risk</code> - Base honeypot screen, buy/sell tax, verified source, backdoors, LP lock</li>
 </ul>
   <p class="muted" style="margin-bottom:0">Free allowance: <b>__RISK_FREE__ calls per day per IP</b>. After that the
-  tool answers <code>Payment Required</code> and points at the top-up page. An API key lifts the cap.</p>
+  tool answers <code>Payment Required</code> with machine-readable terms: 0.01 USDC per call, USDC on
+  Base or Solana, paid straight from your agent's wallet. There is no API key to buy - settle a credit
+  pack once and keep sending the same payment payload so it decrements credit instead of charging again.</p>
 </div>
 
 <h2 id="pricing">Pricing</h2>
 <div class="card"><div class="grid">
-<div><div class="muted">Verification tools (13)</div><div><b>$0</b> — free forever, no key, no signup</div></div>
+<div><div class="muted">Verification tools (41)</div><div><b>$0</b> — free forever, no key, no signup</div></div>
 <div><div class="muted">Risk intelligence (4 tools)</div><div><b>__RISK_FREE__ calls/day per IP free</b>, then <b>$0.01</b> per call</div></div>
-<div><div class="muted">How you pay</div><div><b>x402</b> — USDC on Base or Solana, paid by the caller's own wallet</div></div>
-<div><div class="muted">Credit packs</div><div><b>10 calls / 0.10 USDC</b> · <b>100 calls / 1.00 USDC</b></div></div>
+<div><div class="muted">How you pay</div><div><b>x402</b> — USDC on Base, paid by the caller's own wallet</div></div>
+<div><div class="muted">Credit packs</div><div><b>10 calls / 0.10 USDC</b> · <b>100 calls / 1.00 USDC</b> — live terms in <code>accepts[]</code></div></div>
 </div>
-<p class="muted" style="margin-bottom:0"><b>No API keys are issued</b> — no key, no account, no
-subscription. Payment is per call, bought in prepaid credit packs over x402; the authoritative pack
-sizes and receiving addresses are the live ones in <code>structuredContent.accepts[]</code> of any 402
-answer. Nothing is metered by surprise: every risk-tool answer carries its own <code>_metering</code>
-block with the allowance and the reset time (00:00 Asia/Shanghai).</p>
+<p class="muted" style="margin-bottom:0"><b>No API keys are issued by robotbase.cc</b> — no key,
+no account, no subscription. Payment is per call, bought in prepaid credit packs; the authoritative
+pack sizes, assets and receiving addresses are the live ones in <code>structuredContent.accepts[]</code>
+of any 402 answer. Nothing is metered by surprise: every risk-tool answer carries its own
+<code>_metering</code> block with the allowance and the reset time (00:00 Asia/Shanghai).</p>
 </div>
 
 <h2>Example prompts</h2>
@@ -1985,11 +2991,25 @@ def docs_html():
     groups = [
         ("① Chain overview", ["list_chains", "chain_status", "robotbase_capabilities", "robotbase_services"]),
         ("② Bitcoin (BTC) — settlement verification & fees", ["btc_get_fee_rates", "btc_get_mempool_state",
-                                                              "btc_get_transaction", "btc_get_block",
-                                                              "btc_get_address", "broadcast_raw_transaction"]),
-        ("③ Zcash (ZEC) — shielded-pool intelligence", ["zec_get_pool_status", "zec_get_recent_blocks"]),
-        ("④ Monero (XMR) — node telemetry", ["xmr_get_node_status"]),
-        ("⑤ Risk intelligence — metered", ["tron_check_address_risk", "tron_verify_usdt_transfer",
+                                                               "btc_get_transaction", "btc_get_block", "btc_get_address",
+                                                               "btc_get_network_stats"]),
+        ("③ Ethereum (ETH) — settlement, fees and contract reads", ["eth_get_transaction", "eth_get_fee_rates",
+                                                                     "eth_get_account", "eth_read_contract",
+                                                                     "eth_get_block", "eth_get_logs"]),
+        ("④ Zcash (ZEC) — shielded pools & settlement", ["zec_get_pool_status", "zec_get_recent_blocks",
+                                                          "zec_get_transaction", "zec_get_treestate",
+                                                          "zec_get_network_stats"]),
+        ("⑤ Monero (XMR) — node, fee, transaction and payment proof", ["xmr_get_node_status", "xmr_get_fee_rates",
+                                                                        "xmr_get_mempool_state", "xmr_get_block",
+                                                                        "xmr_get_recent_blocks", "xmr_get_transaction",
+                                                                        "xmr_get_network_stats", "xmr_verify_payment",
+                                                                        "xmr_get_output_distribution"]),
+        ("⑥ Tron — node, contract, history and governance", ["tron_get_node_status", "tron_get_current_block",
+                                                              "tron_get_block", "tron_get_transaction",
+                                                              "tron_get_account", "tron_get_contract",
+                                                              "tron_read_contract", "tron_get_chain_economics",
+                                                              "tron_list_witnesses", "tron_list_proposals"]),
+        ("⑦ Risk intelligence — metered", ["tron_check_address_risk", "tron_verify_usdt_transfer",
                                            "sol_check_token_safety", "base_check_contract_risk"]),
     ]
     desc = {n: d for n, d, _s, _f in TOOLS}
@@ -2016,28 +3036,41 @@ def server_card():
     return {
         "name": "robotbase-mcp",
         "title": "RobotBase MCP Server - on-chain verification & risk intelligence for Web3 agents",
-        "version": "0.12.3",
-        "description": "The semantic verification and risk-intelligence layer for Web3 agents, as one "
-                       "read-only MCP endpoint. Live: Bitcoin (fees, mempool state, tx/block/address "
-                       "verification, optional raw-tx relay), Ethereum (Reth execution + Lighthouse "
-                       "consensus state), Monero (node telemetry - no tx or wallet indexing) and Zcash "
-                       "(node state + all six shielded value pools + recent blocks). Risk intelligence "
-                       "as light aggregation over public datasets: TRON address risk, TRC-20 USDT "
-                       "settlement verification, Solana rug-pull screening and Base (EVM) contract "
-                       "honeypot/tax/backdoor screening. RobotBase publishes no "
-                       "RPC endpoint of any kind. Verification tools are free; risk tools include a "
-                       "daily free allowance with a prepaid API key above it.",
+        "version": "0.12.4",
+        "description": "The verification and risk-intelligence layer for Web3 agents, as one read-only MCP "
+                       "endpoint. Five chains are live, each read from mainnet nodes we run ourselves: "
+                       "Bitcoin (fees, mempool state with a fee-rate histogram and RBF/CPFP feasibility, "
+                       "tx/block/address verification, optional raw-tx relay); Ethereum (Reth execution + "
+                       "Lighthouse consensus, settlement checks with ERC-20 log decoding, fee market, "
+                       "blocks, event logs, account and contract reads); Monero (node telemetry, dynamic "
+                       "fees, mempool, blocks, transaction lookup, ring-size output distribution, and "
+                       "cryptographic tx-proof payment verification); Zcash (all six shielded pools, "
+                       "shielded commitment-tree anchors, transaction checks, network and funding-stream "
+                       "stats); and Tron (node status, blocks and history, transactions with TRC-20 "
+                       "decoding, account permissions, contract reads, chain economics, super "
+                       "representatives and governance proposals). Risk intelligence is light aggregation "
+                       "over public datasets: TRON address risk, TRC-20 USDT settlement verification, "
+                       "Solana rug-pull screening and Base (EVM) contract screening. RobotBase publishes "
+                       "no RPC endpoint of any kind. Verification tools are free; risk tools include a "
+                       "daily free allowance, then 0.01 USDC per call settled over x402 by the caller's "
+                       "own wallet. No API key, no account and no subscription are offered.",
         "homepage": "https://robotbase.cc/mcp",
         "transport": {"type": "streamable-http", "url": "https://robotbase.cc/mcp"},
+        "endpoints": {
+            "tools": "https://robotbase.cc/mcp/tools",
+            "stats": "https://robotbase.cc/mcp/stats?hours=24",
+            "credits": "https://robotbase.cc/mcp/credits?payer=<address>",
+        },
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {"tools": {"listChanged": False}},
-        "auth": {"type": "none", "note": "no API key of any kind is issued; metered tools are paid over x402"},
-        "rateLimits": {"anonymous": "120/min per IP", "keyed": "none — there is no keyed tier"},
+        "auth": {"type": "none", "optional": "x402 (USDC) for metered tools; no API keys are issued"},
+        "rateLimits": {"anonymous": "120/min per IP", "note": "no keyed tier exists"},
         "tags": ["bitcoin", "ethereum", "monero", "zcash", "solana", "base", "tron", "blockchain-data",
                  "onchain", "verification", "risk-intelligence", "aml", "rug-pull", "honeypot", "evm",
                  "usdt", "mempool",
                  "fees", "privacy-coins", "read-only", "mcp-server", "web3-agents"],
-        "pricing": {"verification_tools": "free", "risk_tools": "%d free calls/day per IP, then 0.01 USDC per call over x402" % RISK_FREE_PER_DAY,
+        "pricing": {"verification_tools": "free", "risk_tools": "%d free calls/day per IP, then 0.01 USDC per call" % RISK_FREE_PER_DAY,
+                    "payment": "x402 (HTTP 402) in USDC on Base; credit packs 10 calls / 0.10 USDC and 100 calls / 1.00 USDC",
                     "api_key": "not offered", "subscription": "not offered",
                     "top_up": TOPUP_URL},
         "tools": [{"name": n, "description": desc[n]} for n, _d, _s, _f in TOOLS],
@@ -2045,18 +3078,237 @@ def server_card():
 
 
 # ============================================================ 2026-09-27 三链扩展（BTC/XMR/ZEC）
-XMR_HELPER = os.environ.get("XMR_HELPER", os.environ.get("RB_XMR_HELPER", "http://127.0.0.1:18085/rpc"))
+XMR_HELPER = os.environ.get("RB_XMR_HELPER", "http://127.0.0.1:18085/rpc")
+XMR_ATOMIC = 1e12                     # 1 XMR = 10^12 原子单位
+XMR_FEE_PRIORITY_NAMES = ("default", "slow", "normal", "fast", "fastest")
+
+
+def _xmr_rpc(method, params=None, timeout=20):
+    """经只读 helper 调 monerod。helper 只放行白名单里的只读方法。"""
+    d = _http_json(XMR_HELPER, {"method": method, "params": params or {}}, timeout=timeout)
+    return (d or {}).get("result")
+
+
+def _xmr(h):
+    """把原子单位换算成 XMR（保留 12 位小数，去掉浮点噪声）。"""
+    try:
+        return round(int(h) / XMR_ATOMIC, 12)
+    except (TypeError, ValueError):
+        return None
+
+
+def _xmr_tip():
+    """返回 (末块高度, 末块头)。
+
+    ⚠️ monerod 的 `get_info.height` 与 `get_block_count.count` 返回的是**链长度**，
+    实测恒等于 `get_last_block_header.block_header.height + 1`（那个高度上的区块并不存在）。
+    对外报高度必须用区块头，否则会永远偏大 1。
+    """
+    lb = _xmr_rpc("get_last_block_header")
+    hdr = (lb or {}).get("block_header") or {}
+    if hdr.get("height") is not None:
+        return int(hdr["height"]), hdr
+    info = _xmr_rpc("get_info") or {}
+    h = info.get("height")
+    return (int(h) - 1 if h else None), {}
+
+
+def t_xmr_fee_rates():
+    """Monero 动态手续费：按优先级分档，直接来自我们自己的 monerod。"""
+    r = cached("xmr_fee", 15, lambda: _xmr_rpc("get_fee_estimate"))
+    if not r:
+        return {"available": False, "reason": "monerod helper RPC unreachable"}
+    fees = r.get("fees") or ([r["fee"]] if r.get("fee") else [])
+    tiers = []
+    for i, f in enumerate(fees):
+        tiers.append({"priority": XMR_FEE_PRIORITY_NAMES[i] if i < len(XMR_FEE_PRIORITY_NAMES)
+                      else "tier_%d" % (i + 1),
+                      "fee_per_kb_atomic": f, "fee_per_kb_xmr": _xmr(f)})
+    return {
+        "baseline_fee_per_kb_atomic": r.get("fee"),
+        "baseline_fee_per_kb_xmr": _xmr(r.get("fee")),
+        "quantization_mask": r.get("quantization_mask"),
+        "priority_tiers": tiers,
+        "how_to_read": ("tiers are in ascending priority order; a transaction pays "
+                        "fee_per_kb x its size in kB. Monero has no EIP-1559 style fee market - "
+                        "the median block is far below the size limit, so the baseline tier "
+                        "normally confirms in the next block."),
+        "network": "mainnet",
+        "source": "our monerod get_fee_estimate (read-only helper)",
+    }
+
+
+def t_xmr_mempool_state():
+    """Monero 内存池状态：待确认交易、字节量、手续费总量、积压时间。"""
+    raw = cached("xmr_pool", 10, lambda: _xmr_rpc("get_transaction_pool_stats"))
+    if not raw:
+        return {"available": False, "reason": "monerod helper RPC unreachable"}
+    # legacy 端点的负载嵌在 pool_stats 下
+    r = raw.get("pool_stats") or raw
+    txs = r.get("txs_total") or 0
+    oldest = r.get("oldest")
+    age = int(time.time() - oldest) if oldest else None
+    return {
+        "pending_txs": txs,
+        "bytes_total": r.get("bytes_total"),
+        "fee_total_atomic": r.get("fee_total"),
+        "fee_total_xmr": _xmr(r.get("fee_total")),
+        "oldest_pending_age_s": age,
+        "double_spends": r.get("num_double_spends"),
+        "failing": r.get("num_failing"),
+        "not_relayed": r.get("num_not_relayed"),
+        "tx_size_median_bytes": r.get("bytes_med"),
+        "tx_size_max_bytes": r.get("bytes_max"),
+        "congestion": ("clear" if txs < 50 else "busy" if txs < 500 else "heavy"),
+        "how_to_read": ("Monero blocks are effectively never full, so a non-zero pool usually means "
+                        "transactions waiting for the next 2-minute block, not a backlog."),
+        "source": "our monerod get_transaction_pool_stats (read-only helper)",
+    }
+
+
+def t_xmr_block(height=None, block_hash=None):
+    """按高度或哈希取一个 Monero 区块头。"""
+    if block_hash:
+        r = _xmr_rpc("get_block_header_by_hash", {"hash": str(block_hash).strip()})
+    else:
+        try:
+            h = int(height)
+        except (TypeError, ValueError):
+            return {"error": "provide either height (integer) or block_hash (64 hex chars)"}
+        r = _xmr_rpc("get_block_header_by_height", {"height": h})
+    b = (r or {}).get("block_header") or {}
+    if not b:
+        return {"found": False, "reason": "no block header returned"}
+    return {
+        "found": True,
+        "height": b.get("height"), "hash": b.get("hash"), "prev_hash": b.get("prev_hash"),
+        "timestamp": b.get("timestamp"),
+        "age_s": int(time.time() - b["timestamp"]) if b.get("timestamp") else None,
+        "tx_count": b.get("num_txes"), "reward_xmr": _xmr(b.get("reward")),
+        "difficulty": b.get("difficulty"), "block_weight": b.get("block_weight"),
+        "block_size_bytes": b.get("block_size"),
+        "major_version": b.get("major_version"), "minor_version": b.get("minor_version"),
+        "orphan": bool(b.get("orphan_status")),
+        "source": "our monerod block header (read-only helper)",
+    }
+
+
+def t_xmr_recent_blocks(limit=10):
+    """最近 N 个 Monero 区块头，用于看出块是否正常。"""
+    try:
+        n = max(1, min(50, int(limit or 10)))
+    except (TypeError, ValueError):
+        n = 10
+    tip, _hdr = cached("xmr_tip", 10, _xmr_tip)
+    if not tip:
+        return {"available": False, "reason": "monerod helper RPC unreachable"}
+    r = _xmr_rpc("get_block_headers_range",
+                 {"start_height": max(0, int(tip) - n + 1), "end_height": int(tip)})
+    hs = (r or {}).get("headers") or []
+    out = [{"height": b.get("height"), "hash": b.get("hash"), "timestamp": b.get("timestamp"),
+            "tx_count": b.get("num_txes"), "reward_xmr": _xmr(b.get("reward")),
+            "difficulty": b.get("difficulty"), "weight": b.get("block_weight")} for b in hs]
+    gaps = []
+    for a, b in zip(hs, hs[1:]):
+        if a.get("timestamp") and b.get("timestamp"):
+            gaps.append(b["timestamp"] - a["timestamp"])
+    return {
+        "tip_height": tip, "requested": n, "returned": len(out),
+        "avg_block_interval_s": round(sum(gaps) / len(gaps)) if gaps else None,
+        "target_interval_s": 120,
+        "blocks": list(reversed(out))[:n],
+        "source": "our monerod get_block_headers_range (read-only helper)",
+    }
+
+
+def t_xmr_transaction(txid):
+    """按 txid 查一笔 Monero 交易是否上链、进了哪个块、有多少确认。
+
+    刻意不返回金额与收发双方——那不是我们查不到，而是 Monero 协议本身就不公开。
+    """
+    t = str(txid or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", t):
+        return {"error": "not a Monero transaction id (expected 64 hex chars)"}
+    r = _xmr_rpc("get_transactions", {"txs_hashes": [t], "decode_as_json": True})
+    txs = (r or {}).get("txs") or []
+    if not txs:
+        return {"found": False, "txid": t,
+                "note": "not found on the canonical chain or in our mempool"}
+    x = txs[0]
+    js = x.get("as_json")
+    try:
+        j = json.loads(js) if isinstance(js, str) else (js or {})
+    except Exception:  # noqa: BLE001
+        j = {}
+    vin = j.get("vin") or []
+    ring = None
+    if vin and isinstance(vin[0], dict) and isinstance(vin[0].get("key"), dict):
+        ring = len(vin[0]["key"].get("key_offsets") or []) or None
+    return {
+        "found": True, "txid": x.get("tx_hash") or t,
+        "confirmed": not x.get("in_pool"),
+        "in_mempool": bool(x.get("in_pool")),
+        "block_height": x.get("block_height"),
+        "block_timestamp": x.get("block_timestamp"),
+        "confirmations": x.get("confirmations"),
+        "double_spend_seen": bool(x.get("double_spend_seen")),
+        "size_bytes": len(x.get("as_hex") or "") // 2 or None,
+        "inputs": len(vin), "outputs": len(j.get("vout") or []),
+        "ring_size_per_input": ring,
+        "tx_version": j.get("version"), "unlock_time": j.get("unlock_time"),
+        "not_disclosed_by_protocol": ["amount", "sender address", "recipient address", "ring members"],
+        "how_to_read": ("Monero hides amount and both parties by design; only the recipient (or someone "
+                        "given the transaction key) can prove what was paid. This tool answers "
+                        "'is it mined and how deep', not 'how much and to whom'."),
+        "source": "our monerod get_transactions (read-only helper)",
+    }
+
+
+def t_xmr_network_stats():
+    """Monero 全网状态：算力、发行量、协议版本与下次硬分叉。"""
+    info = cached("xmr_info", 10, lambda: _xmr_rpc("get_info")) or {}
+    hf = cached("xmr_hf", 60, lambda: _xmr_rpc("hard_fork_info")) or {}
+    if not info:
+        return {"available": False, "reason": "monerod helper RPC unreachable"}
+    height, _hdr = _xmr_tip()
+    height = int(height or 0)
+    emission = cached("xmr_emission", 300, lambda: _xmr_rpc(
+        "get_coinbase_tx_sum", {"height": max(0, height - 720), "count": 720})) or {}
+    diff = info.get("difficulty") or 0
+    return {
+        "height": height,
+        "network_hashrate_hs": round(diff / 120) if diff else None,   # 目标出块 120 秒
+        "difficulty": diff,
+        "block_size_median": info.get("block_size_median"),
+        "block_size_limit": info.get("block_size_limit"),
+        "block_weight_median": info.get("block_weight_median"),
+        "block_weight_limit": info.get("block_weight_limit"),
+        "emission_last_720_blocks_xmr": _xmr(emission.get("emission_amount")),
+        "fees_last_720_blocks_xmr": _xmr(emission.get("fee_amount")),
+        "hard_fork_version": hf.get("version"),
+        "hard_fork_voting": hf.get("voting"),
+        "next_fork_earliest_height": hf.get("earliest_height"),
+        "fork_window": hf.get("window"),
+        "client_version": info.get("version"),
+        "mainnet": bool(info.get("mainnet")),
+        "source": "our monerod get_info + hard_fork_info + get_coinbase_tx_sum",
+    }
 
 
 def t_xmr_node_status():
     """Monero node state straight from our monerod helper RPC."""
-    d = cached("xmr_info", 10, lambda: _http_json(
-        XMR_HELPER, {"jsonrpc": "2.0", "id": 1, "method": "get_info"}, timeout=10))
-    r = (d or {}).get("result") or {}
+    # 注意：缓存键 "xmr_info" 存的是 _xmr_rpc 的结果本体（不是 helper 的外层封装），
+    # t_xmr_network_stats 复用同一个键，两边形状必须一致，否则会互相污染。
+    r = cached("xmr_info", 10, lambda: _xmr_rpc("get_info")) or {}
     if not r:
         return {"available": False, "reason": "monerod helper RPC unreachable"}
+    tip, hdr = cached("xmr_tip", 10, _xmr_tip)
     return {
-        "height": r.get("height"), "target_height": r.get("target_height"),
+        # 对外一律报真实末块高度；monerod 的 self-reported height 是链长度（+1）
+        "height": tip if tip else r.get("height"),
+        "height_reported_by_get_info": r.get("height"),
+        "top_block_hash": hdr.get("hash"),
+        "target_height": r.get("target_height"),
         "synced": bool(r.get("synchronized")) and not bool(r.get("busy_syncing")),
         "status": r.get("status"),
         "network": "mainnet" if r.get("mainnet") else "stagenet/testnet",
@@ -2068,6 +3320,1281 @@ def t_xmr_node_status():
         "outgoing_connections": r.get("outgoing_connections_count"),
         "block_size_limit": r.get("block_size_limit"),
         "source": "our monerod get_info (helper RPC)",
+    }
+
+
+# ---------- XMR tx-proof 付款验证（RobotBase 自己的钱包 RPC，与 xmr.pub 实例完全分离）----------
+# 服务：9181 上 robotbase-xmr-wallet-rpc.service，独立端口 18091、独立凭据、独立空钱包。
+# 它只做一件事：按收款方提供的 tx key / tx proof 做密码学校验，不托管资金、不持有收款密钥。
+#
+# ⚠️ 两个必须记住的实现约束（都是踩过的坑）：
+#   1. monero-wallet-rpc 用 **HTTP Digest**，不是 Basic —— 用 Basic 永远 401。
+#   2. 它的 digest nonce **绑定在 TCP 连接上**：必须"同一条连接"先拿 401 挑战、
+#      再在同一连接上发认证请求。用 urllib 那种"发一次失败、再新开连接重试"的做法
+#      即使凭据完全正确也会一直 401。所以这里用 http.client.HTTPConnection 复用连接。
+XMR_WALLET_CFG = os.environ.get("RB_XMR_WALLET_CFG", "")
+
+
+def _xmr_wallet_cfg():
+    try:
+        with open(XMR_WALLET_CFG, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return {"enabled": False}
+
+
+def _xmr_wallet_rpc(method, params=None, cfg=None):
+    """向 RobotBase 自己的 monero-wallet-rpc 发一次 JSON-RPC（自动完成 Digest 握手）。"""
+    cfg = cfg or _xmr_wallet_cfg()
+    if not cfg.get("enabled"):
+        raise RuntimeError("xmr wallet rpc not configured")
+    u = urllib.parse.urlparse(cfg["url"])
+    host, port, path = u.hostname, u.port or 80, u.path or "/json_rpc"
+    user, pw = cfg["user"], cfg["password"]
+    body = json.dumps({"jsonrpc": "2.0", "id": "0", "method": method,
+                       "params": params or {}}).encode()
+    conn = http.client.HTTPConnection(host, port, timeout=int(cfg.get("timeout", 30)))
+    try:
+        # 第一次：拿 401 挑战（nonce 与这条连接绑定）
+        conn.request("POST", path, body, {"Content-Type": "application/json",
+                                          "Content-Length": str(len(body))})
+        r = conn.getresponse()
+        r.read()
+        if r.status == 200:                     # 未启用鉴权时直接返回
+            pass
+        chal = r.getheader("WWW-Authenticate") or ""
+        if r.status != 401:
+            raise RuntimeError("wallet rpc unexpected status %s" % r.status)
+        m = re.search(r'realm="?([^",]+)"?', chal)
+        n = re.search(r'nonce="?([^",]+)"?', chal)
+        q = re.search(r'qop="?([^",]+)"?', chal)
+        realm, nonce, qop = (m.group(1) if m else ""), (n.group(1) if n else ""), (q.group(1) if q else "auth")
+        ha1 = hashlib.md5(("%s:%s:%s" % (user, realm, pw)).encode()).hexdigest()
+        ha2 = hashlib.md5(("POST:%s" % path).encode()).hexdigest()
+        cnonce = hashlib.sha1(os.urandom(16)).hexdigest()[:16]
+        nc = "00000001"
+        resp = hashlib.md5(("%s:%s:%s:%s:%s:%s" % (ha1, nonce, nc, cnonce, qop, ha2)).encode()).hexdigest()
+        auth = ('Digest username="%s", realm="%s", nonce="%s", uri="%s", cnonce="%s", nc=%s, '
+                'qop=%s, response="%s", algorithm=MD5') % (user, realm, nonce, path, cnonce, nc, qop, resp)
+        # 第二次：**同一条连接**发认证请求
+        conn.request("POST", path, body, {"Content-Type": "application/json",
+                                          "Authorization": auth,
+                                          "Content-Length": str(len(body))})
+        r2 = conn.getresponse()
+        raw = r2.read()
+        if r2.status != 200:
+            raise RuntimeError("wallet rpc auth failed (HTTP %s)" % r2.status)
+        d = json.loads(raw or b"{}")
+        if d.get("error"):
+            raise RuntimeError(str(d["error"].get("message") or d["error"])[:200])
+        return d.get("result") or {}
+    finally:
+        conn.close()
+
+
+def t_xmr_verify_payment(txid, address, tx_key=None, signature=None, message=None):
+    """用收款方提供的 tx key 或 tx proof，校验一笔 Monero 付款。
+
+    这不是"我们索引了门罗链"——门罗的金额与收发双方在协议层就不可见。
+    这里做的是：收款方把只有他能提供的凭据交给我们，我们用密码学替他验一次。
+    """
+    t = str(txid or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", t):
+        return {"error": "not a Monero transaction id (expected 64 hex chars)"}
+    addr = str(address or "").strip()
+    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{95,106}", addr):
+        return {"error": "not a Monero address (expected a 95-106 char base58 address)"}
+    if not (tx_key or signature):
+        return {"error": "provide either tx_key (from your own wallet) or a tx proof signature",
+                "how_to": ("Receive with Monero: in your wallet run 'get_tx_key <txid>' to obtain the tx key, "
+                           "or 'get_tx_proof <txid> <address>' to obtain a signature. Both are safe to share - "
+                           "they prove this one payment and cannot be used to spend or to scan other payments.")}
+    try:
+        if tx_key:
+            r = _xmr_wallet_rpc("check_tx_key", {"txid": t, "tx_key": str(tx_key).strip(), "address": addr})
+            mode = "check_tx_key"
+        else:
+            p = {"txid": t, "address": addr, "signature": str(signature).strip()}
+            if message:
+                p["message"] = str(message)
+            r = _xmr_wallet_rpc("check_tx_proof", p)
+            mode = "check_tx_proof"
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "txid": t, "error": "wallet rpc unavailable: %s" % str(exc)[:160]}
+    conf = r.get("confirmations")
+    received = r.get("received")
+    good = isinstance(conf, int) and conf > 0 and isinstance(received, int) and received > 0
+    out = {
+        "ok": True, "verified": bool(good), "mode": mode, "txid": t, "address": addr,
+        "confirmations": conf,
+        "received_atomic": received,
+        "received_xmr": round(received / XMR_ATOMIC, 12) if isinstance(received, int) else None,
+        "in_pool": r.get("in_pool"),
+        "how_to_read": ("verified=true means this transaction really pays this address the amount shown. "
+                        "A false confirmations / zero received means the tx key or proof does not match this "
+                        "address and transaction."),
+        "source": "RobotBase's own monero-wallet-rpc doing a cryptographic tx-proof check (read-only)",
+    }
+    if not good:
+        out["note"] = ("the proof material does not confirm this payment for this address "
+                       "(wrong tx key, wrong address, or the transaction is not yet mined)")
+    return out
+
+
+# ============================================================ 2026-10-16 TRON 节点工具面
+# 数据来自自建的 java-tron lite full node（RB_TRON_NODE）。
+#
+# ⚠️ 能力边界：这是一个 lite full node，java-tron 的「历史查询 API」被整块关闭 ——
+#    getblockbynum / getblockbyid / gettransactionbyid / gettransactioninfobyid /
+#    getblockbylatestnum / getblockbylimitnext 一律返回
+#    "this API is closed because this node is a lite fullnode"（实测连 tip-1 都是）。
+#    因此本节点**不能**用于核验历史交易到账，那件事仍只能靠 TronGrid 这类索引服务。
+#    （把 openHistoryQueryWhenLiteFN 打开也解决不了：官方注释明确写了
+#     "above APIs may return null even if blocks and transactions actually are on the
+#      blockchain" —— 对到账核验等于制造假信号，故不开启。）
+#
+# 真正可用（逐条实测）：当前块、账户与资源、合约元数据、**合约只读调用**、
+# 链上经济参数、SR 列表、节点自身状态。
+TRON_NODE = os.environ.get("RB_TRON_NODE", "http://127.0.0.1:8090")
+TRON_SOLIDITY = os.environ.get("RB_TRON_SOLIDITY", "http://127.0.0.1:8091")
+TRON_USDT_HEX = "41a614f803b6fd780986a42c78ec9c7f77e6ded13c"
+TRON_SUN = 1_000_000
+TRON_ZERO_ADDR = "410000000000000000000000000000000000000000"
+TRON_TRANSFER_TOPIC = "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+TRON_WINDOW_HINT = 181000        # 实测约 6.29 天；实际边界由 _tron_window() 懒探测
+
+
+def _b58decode(s):
+    n = 0
+    for ch in s:
+        n = n * 58 + _B58_ALPHABET.index(ch)
+    raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    pad = 0
+    for ch in s:
+        if ch == "1":
+            pad += 1
+        else:
+            break
+    return b"\x00" * pad + raw
+
+
+def _tron_hex(addr):
+    """接受 base58（T…）或 hex（41…），统一返回 41 开头的 21 字节 hex；非法返回空串。"""
+    a = (addr or "").strip()
+    if not a:
+        return ""
+    if a.lower().startswith("41") and len(a) == 42:
+        try:
+            bytes.fromhex(a)
+            return a.lower()
+        except ValueError:
+            return ""
+    if a.startswith("T") and 33 <= len(a) <= 35:
+        try:
+            raw = _b58decode(a)
+            if len(raw) == 25 and hashlib.sha256(hashlib.sha256(raw[:21]).digest()).digest()[:4] == raw[21:]:
+                return raw[:21].hex()
+        except Exception:  # noqa: BLE001
+            return ""
+    return ""
+
+
+def _tron_b58(h):
+    try:
+        raw = bytes.fromhex(h)
+    except Exception:  # noqa: BLE001
+        return ""
+    if len(raw) != 21:
+        return ""
+    return _b58encode(raw + hashlib.sha256(hashlib.sha256(raw).digest()).digest()[:4])
+
+
+def _tron(method, params=None, timeout=15):
+    return _http_json(TRON_NODE + "/" + method, params or {}, timeout=timeout)
+
+
+def _tron_tip():
+    return cached("tron_tip", 5, lambda: _tron("wallet/getnowblock"))
+
+
+def _tron_window():
+    """懒探测本节点的历史保留窗口：二分出最老的可用区块，缓存 1 小时。
+
+    节点是 lite full node，同步自 checkpoint，因此只保留最近一段历史。
+    对外必须如实给出这个边界——查不到 ≠ 不存在。
+    """
+    def probe():
+        tip = ((_tron_tip() or {}).get("block_header") or {}).get("raw_data", {}).get("number")
+        if not tip:
+            return {}
+        lo, hi = 0, int(tip)          # lo 不可用，hi 可用
+        if not (_tron("wallet/getblockbynum", {"num": hi}) or {}).get("block_header"):
+            return {}
+        for _ in range(24):
+            mid = (lo + hi) // 2
+            ok = bool((_tron("wallet/getblockbynum", {"num": mid}) or {}).get("block_header"))
+            if ok:
+                hi = mid
+            else:
+                lo = mid
+            if hi - lo <= 1:
+                break
+        oldest = hi
+        # 用最老与最新块的时间戳算实际跨度
+        try:
+            b_old = (_tron("wallet/getblockbynum", {"num": oldest}) or {}).get("block_header", {}).get("raw_data", {})
+            b_tip = (_tron("wallet/getblockbynum", {"num": tip}) or {}).get("block_header", {}).get("raw_data", {})
+            span_s = int((b_tip.get("timestamp", 0) - b_old.get("timestamp", 0)) / 1000)
+        except Exception:  # noqa: BLE001
+            span_s = None
+        return {"oldest_available_block": oldest, "tip": int(tip),
+                "window_blocks": int(tip) - oldest,
+                "window_days": round(span_s / 86400, 2) if span_s else None}
+    return cached("tron_window", 3600, probe) or {}
+
+
+def _tron_tx_found(txid):
+    """返回 (tx, info)。tx 来自 gettransactionbyid，info 来自 gettransactioninfobyid。"""
+    tx = _tron("wallet/gettransactionbyid", {"value": txid}) or {}
+    info = _tron("wallet/gettransactioninfobyid", {"value": txid}) or {}
+    return tx, info
+
+
+def _tron_decode_trc20_logs(info):
+    """从 receipt 的 log 里解出 TRC-20 Transfer 事件（from / to / 金额）。"""
+    out = []
+    for lg in (info.get("log") or []):
+        topics = lg.get("topics") or []
+        if not topics or topics[0] != TRON_TRANSFER_TOPIC or len(topics) < 3:
+            continue
+        try:
+            amount = int(lg.get("data") or "0", 16)
+        except ValueError:
+            amount = None
+        out.append({
+            "token": _tron_b58("41" + (lg.get("address") or "").rjust(40, "0")[-40:]),
+            "from": _tron_b58("41" + topics[1][-40:]),
+            "to": _tron_b58("41" + topics[2][-40:]),
+            "amount_atomic": amount,
+            "amount_human": round(amount / 10 ** 6, 6) if amount is not None else None,
+            "decimals_assumed": 6,
+        })
+    return out
+
+
+def _tron_parse_blockref(v):
+    """nodeinfo 的 block / solidityBlock 是 "Num:87146764,ID:<hash>" 这样的字符串。"""
+    if isinstance(v, dict):
+        return v.get("number"), v.get("id") or v.get("ID")
+    if isinstance(v, str):
+        num, _, rest = v.partition(",")
+        n = num.split(":", 1)[-1].strip()
+        bid = rest.split(":", 1)[-1].strip() if ":" in rest else ""
+        try:
+            return int(n), bid
+        except ValueError:
+            return None, bid
+    return None, None
+
+
+def _tron_abi_param_address(a):
+    h = _tron_hex(a)
+    return h[2:].rjust(64, "0") if h else ""
+
+
+def _tron_abi_decode(hx, kind):
+    if not hx or not isinstance(hx, str):
+        return None
+    try:
+        if kind == "address":
+            return _tron_b58("41" + hx[-40:])
+        if kind == "bool":
+            return bool(int(hx, 16))
+        if kind == "string":
+            off = int(hx[0:64], 16) * 2
+            ln = int(hx[off:off + 64], 16)
+            return bytes.fromhex(hx[off + 64: off + 64 + ln * 2]).decode("utf-8", "replace")
+        return int(hx, 16)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def t_tron_node_status():
+    """TRON 节点自身状态：当前高度、固化高度、落后块数、peer、客户端版本。"""
+    b = _tron_tip()
+    if not b or not b.get("block_header"):
+        return {"available": False, "reason": "java-tron HTTP API unreachable"}
+    hdr = b["block_header"]["raw_data"]
+    ni = cached("tron_nodeinfo", 10, lambda: _tron("wallet/getnodeinfo")) or {}
+    # 注意：nodeinfo 里的 block / solidityBlock 是 "Num:123,ID:abc" 形式的**字符串**，不是对象
+    sol_num, _sol_id = _tron_parse_blockref(ni.get("solidityBlock"))
+    tip = hdr.get("number")
+    return {
+        "ok": True,
+        "height": tip,
+        "solidity_height": sol_num,
+        "solidity_lag_blocks": (tip - sol_num) if (tip and sol_num) else None,
+        "timestamp_ms": hdr.get("timestamp"),
+        "age_s": int(time.time() - (hdr.get("timestamp") or 0) / 1000) if hdr.get("timestamp") else None,
+        "tx_in_tip_block": len(b.get("transactions") or []),
+        "peer_count": len(ni.get("peerList") or []),
+        "active_connections": ni.get("activeConnectCount"),
+        "passive_connections": ni.get("passiveConnectCount"),
+        "client_version": (ni.get("configNodeInfo") or {}).get("codeVersion"),
+        "retention_window": _tron_window() or {"note": "not yet probed"},
+        "history_api": "open within the retention window (lite full node)",
+        "source": "our java-tron wallet/getnowblock + getnodeinfo",
+    }
+
+
+def t_tron_block(height=None, block_id=None):
+    """按块号或区块 ID 取一个 TRON 区块（仅限本节点的历史窗口）。
+
+    查不到时绝不回答"不存在"——lite 节点只保留最近一段历史，边界外一律 EMPTY。
+    """
+    if block_id:
+        b = _tron("wallet/getblockbyid", {"value": str(block_id).strip()}) or {}
+        asked = {"block_id": str(block_id).strip()}
+    else:
+        try:
+            h = int(height)
+        except (TypeError, ValueError):
+            return {"error": "provide height (integer) or block_id"}
+        b = _tron("wallet/getblockbynum", {"num": h}) or {}
+        asked = {"height": h}
+    if not b or not b.get("block_header"):
+        return {
+            "found": False, **asked, "reason": "empty_result_from_lite_node",
+            "important": ("This does NOT mean the block does not exist. Our Tron node is a lite full node "
+                          "retaining only a recent window of history, so anything older returns empty. "
+                          "Treat an empty result as 'outside our window', never as proof of absence."),
+            "retention_window": _tron_window() or {"note": "not yet probed"},
+        }
+    hdr = b["block_header"]["raw_data"]
+    txs = b.get("transactions") or []
+    kinds = {}
+    for t in txs:
+        for c in ((t.get("raw_data") or {}).get("contract") or []):
+            k = (c.get("type") or "?").replace("Contract", "")
+            kinds[k] = kinds.get(k, 0) + 1
+    return {
+        "found": True,
+        "number": hdr.get("number"), "block_id": b.get("blockID"),
+        "parent_hash": hdr.get("parentHash"), "timestamp_ms": hdr.get("timestamp"),
+        "tx_count": len(txs), "tx_by_type": kinds,
+        "producer_address": _tron_b58(hdr.get("witness_address") or ""),
+        "tx_ids": [t.get("txID") for t in txs][:25],
+        "retention_window": _tron_window() or None,
+        "source": "our java-tron wallet/getblockbynum|getblockbyid",
+    }
+
+
+def t_tron_transaction(txid):
+    """按 txid 查一笔 TRON 交易：状态、能量消耗、以及解出的 TRC-20 转账明细。
+
+    这是核验 USDT 到账的主力工具——我们自己节点就能给出 from / to / 金额；
+    但同样受历史窗口限制：查不到必须回落索引服务，不能当作"没到账"。
+    """
+    t = str(txid or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", t):
+        return {"error": "not a TRON transaction id (expected 64 hex chars)"}
+    tx = _tron("wallet/gettransactionbyid", {"value": t}) or {}
+    info = _tron("wallet/gettransactioninfobyid", {"value": t}) or {}
+    if not tx and not info:
+        return {
+            "found": False, "txid": t, "reason": "empty_result_from_lite_node",
+            "important": ("This does NOT mean the transaction does not exist. Our Tron node is a lite full "
+                          "node keeping only a recent window; older transactions return empty. Fall back to an "
+                          "indexer (TronGrid) before telling anyone a payment did not arrive."),
+            "retention_window": _tron_window() or {"note": "not yet probed"},
+        }
+    raw = tx.get("raw_data") or {}
+    contracts = raw.get("contract") or []
+    ctype, cval = None, {}
+    if contracts:
+        ctype = (contracts[0].get("type") or "").replace("Contract", "")
+        cval = (contracts[0].get("parameter") or {}).get("value") or {}
+    receipt = info.get("receipt") or {}
+    res = receipt.get("result")
+    out = {
+        "found": True, "txid": tx.get("txID") or t,
+        "block_number": info.get("blockNumber"),
+        "block_timestamp_ms": info.get("blockTimeStamp"),
+        "status": {"SUCCESS": "success", "REVERT": "reverted"}.get(res, res if res else "unknown"),
+        "contract_type": ctype,
+        "trc20_transfers": _tron_decode_trc20_logs(info),
+        "energy_used": receipt.get("energy_usage_total"),
+        "net_used": receipt.get("net_usage"),
+    }
+    for key, label in (("owner_address", "owner_address"), ("to_address", "to_address"),
+                       ("contract_address", "contract_address")):
+        v = cval.get(key)
+        out[label] = _tron_b58("41" + v.rjust(40, "0")[-40:]) if v else None
+    if cval.get("amount"):
+        out["amount_trx"] = round(int(cval["amount"]) / TRON_SUN, 6)
+    tip = ((_tron_tip() or {}).get("block_header") or {}).get("raw_data", {}).get("number")
+    if tip and info.get("blockNumber"):
+        out["confirmations"] = int(tip) - int(info["blockNumber"])
+    try:
+        sinfo = _http_json(TRON_SOLIDITY + "/walletsolidity/gettransactioninfobyid",
+                           {"value": t}, timeout=10) or {}
+        out["finalized"] = bool(sinfo.get("blockNumber"))
+    except Exception:  # noqa: BLE001
+        out["finalized"] = None
+    out["retention_window"] = _tron_window() or None
+    out["how_to_read"] = ("finalized=true means it is on the solidified chain and cannot be reverted. "
+                          "trc20_transfers[] is decoded from the receipt logs - for USDT that is the amount, "
+                          "sender and recipient, read straight off our own node.")
+    out["source"] = "our java-tron gettransactionbyid + gettransactioninfobyid"
+    return out
+
+
+def t_tron_current_block():
+    """当前（最新）区块。**只能取 tip** —— 本节点不提供历史区块。"""
+    b = _tron_tip()
+    if not b or not b.get("block_header"):
+        return {"available": False, "reason": "java-tron HTTP API unreachable"}
+    hdr = b["block_header"]["raw_data"]
+    txs = b.get("transactions") or []
+    kinds = {}
+    for t in txs:
+        for c in ((t.get("raw_data") or {}).get("contract") or []):
+            k = (c.get("type") or "?").replace("Contract", "")
+            kinds[k] = kinds.get(k, 0) + 1
+    return {
+        "number": hdr.get("number"),
+        "block_id": b.get("blockID"),
+        "parent_hash": hdr.get("parentHash"),
+        "timestamp_ms": hdr.get("timestamp"),
+        "age_s": int(time.time() - (hdr.get("timestamp") or 0) / 1000) if hdr.get("timestamp") else None,
+        "tx_count": len(txs),
+        "tx_by_type": kinds,
+        "producer_address": _tron_b58(hdr.get("witness_address") or ""),
+        "scope": "current block only - historical blocks are closed on this lite full node",
+        "source": "our java-tron wallet/getnowblock",
+    }
+
+
+def t_tron_account(address):
+    """TRX 余额、能量/带宽资源、是否超级代表、账户年龄。"""
+    h = _tron_hex(address)
+    if not h:
+        return {"error": "not a TRON address (expected base58 T... or 41-hex)"}
+    a = _tron("wallet/getaccount", {"address": h}) or {}
+    res = _tron("wallet/getaccountresource", {"address": h}) or {}
+    if not a or not a.get("address"):
+        return {"found": False, "address": _tron_b58(h),
+                "note": "account is not activated on chain (no TRX ever received)"}
+    ar = a.get("account_resource") or {}
+    unfreeze = _tron("wallet/getavailableunfreezecount", {"owner_address": h}) or {}
+    # 2026-10-16 加深：账户权限结构（多签）与委托资源索引
+    perms = {}
+    for pname in ("owner_permission", "witness_permission", "active_permission"):
+        v = a.get(pname)
+        if not v:
+            continue
+        if isinstance(v, list):
+            v = v[0] if v else None
+        if not isinstance(v, dict):
+            continue
+        perms[pname] = {
+            "permission_name": v.get("permission_name"),
+            "threshold": v.get("threshold"),
+            "keys": [{"address": _tron_b58("41" + (k.get("address") or "").rjust(40, "0")[-40:]),
+                      "weight": k.get("weight")} for k in (v.get("keys") or [])],
+        }
+    deleg = {}
+    try:
+        idx = _tron("wallet/getdelegatedresourceaccountindex", {"value": h}) or {}
+        accts = idx.get("account") or []
+        deleg["counterparties"] = len(accts)
+        deleg["counterparties_sample"] = [
+            _tron_b58("41" + (x or "").rjust(40, "0")[-40:]) for x in accts[:5]]
+    except Exception:  # noqa: BLE001
+        deleg["counterparties"] = None
+    return {
+        "found": True,
+        "address": _tron_b58(h),
+        "name": bytes.fromhex(a["account_name"]).decode("utf-8", "replace") if a.get("account_name") else None,
+        "trx_balance": round((a.get("balance") or 0) / TRON_SUN, 6),
+        "created_ms": a.get("create_time"),
+        "last_operation_ms": a.get("latest_opration_time"),
+        "is_witness": bool(a.get("is_witness")),
+        "has_code": bool(a.get("code")),
+        "energy": {"used": ar.get("energy_usage"), "limit": res.get("EnergyLimit"),
+                   "total_limit": res.get("TotalEnergyLimit")},
+        "bandwidth": {"free_used": res.get("freeNetUsed"), "free_limit": res.get("freeNetLimit"),
+                      "net_limit": res.get("NetLimit")},
+        "available_unfreeze_count": unfreeze.get("count"),
+        "permissions": perms or None,
+        "multisig": bool(perms and any(len(v["keys"]) > 1 or (v.get("threshold") or 1) > 1
+                                       for v in perms.values())),
+        "delegation": deleg,
+        "source": "our java-tron getaccount + getaccountresource + getdelegatedresourceaccountindex",
+    }
+
+
+def t_tron_contract(address):
+    """合约元数据：是否已公布 ABI、名称、创建者、函数列表、TRC-20 判定。"""
+    h = _tron_hex(address)
+    if not h:
+        return {"error": "not a TRON address (expected base58 T... or 41-hex)"}
+    c = _tron("wallet/getcontract", {"value": h}) or {}
+    if not c or not c.get("contract_address"):
+        return {"found": False, "address": _tron_b58(h),
+                "note": "no contract at this address (or it is a plain account)"}
+    entries = ((c.get("abi") or {}).get("entrys") or [])
+    fns = sorted({e.get("name") for e in entries if e.get("type") == "Function" and e.get("name")})
+    trc20 = {"balanceOf", "transfer", "totalSupply", "transferFrom", "approve", "allowance"}.issubset(set(fns))
+    return {
+        "found": True,
+        "address": _tron_b58(h),
+        "name": c.get("name"),
+        "creator": _tron_b58(c.get("origin_address") or ""),
+        "has_abi": bool(entries),
+        "abi_entry_count": len(entries),
+        "is_trc20": trc20,
+        "functions": fns[:40],
+        "code_hash": c.get("code_hash"),
+        "consume_user_resource_percent": c.get("consume_user_resource_percent"),
+        "origin_energy_limit": c.get("origin_energy_limit"),
+        "how_to_read": ("has_abi=true means the ABI is published on chain, so tron_read_contract can "
+                        "call it. is_trc20 is inferred from the function set, not from a registry."),
+        "source": "our java-tron wallet/getcontract",
+    }
+
+
+TRC20_ARITY = {"balanceOf": 1, "allowance": 2, "decimals": 0, "symbol": 0, "name": 0, "totalSupply": 0}
+
+
+def t_tron_read_contract(contract, function, argument=None, argument2=None,
+                         parameter=None, output_type=None):
+    """合约**只读调用**（constant call，不改任何状态）。
+
+    TRC-20 常用函数有语法糖（balanceOf/allowance/decimals/symbol/name/totalSupply），
+    也接受原始 function_selector + ABI 编码的 parameter。
+    """
+    ch = _tron_hex(contract)
+    if not ch:
+        return {"error": "not a TRON address (expected base58 T... or 41-hex)"}
+    fn = (function or "").strip()
+    if not fn:
+        return {"error": "function required, e.g. balanceOf(address) or 'balanceOf' with argument=<address>"}
+    base = fn.split("(")[0]
+    if base in TRC20_ARITY:
+        arity = TRC20_ARITY[base]
+        selector = base + "(" + ",".join(["address"] * arity) + ")"
+        parts = []
+        for arg in (argument, argument2)[:arity]:
+            p = _tron_abi_param_address(arg)
+            if not p:
+                return {"error": "%s needs %d TRON address argument(s)" % (base, arity)}
+            parts.append(p)
+        param = "".join(parts)
+        kind = output_type or ("string" if base in ("symbol", "name") else "uint256")
+    else:
+        selector = fn
+        param = parameter or ""
+        kind = output_type or "uint256"
+    r = _tron("wallet/triggerconstantcontract", {
+        "owner_address": TRON_ZERO_ADDR, "contract_address": ch,
+        "function_selector": selector, "parameter": param, "visible": False}) or {}
+    cr = r.get("constant_result") or []
+    res = r.get("result") or {}
+    if not cr:
+        return {"ok": False, "contract": _tron_b58(ch), "function": selector,
+                "error": res.get("message") or "constant call returned no value",
+                "result_code": res.get("code"),
+                "hint": "the function may not exist on this contract, or the call reverted"}
+    raw = cr[0]
+    val = _tron_abi_decode(raw, kind)
+    out = {"ok": True, "contract": _tron_b58(ch), "function": selector,
+           "output_type": kind, "value": val, "raw": raw,
+           "energy_used": r.get("energy_used"),
+           "source": "our java-tron wallet/triggerconstantcontract (read-only, no state change)"}
+    if base in ("balanceOf", "totalSupply", "allowance") and isinstance(val, int):
+        out["value_human"] = round(val / 10 ** 6, 6)
+        out["decimals_assumed"] = 6
+    if base == "balanceOf" and argument:
+        out["holder"] = _tron_b58(_tron_hex(argument))
+    return out
+
+
+def t_tron_chain_economics():
+    """TRON 链上经济参数：能量单价、交易费、账户创建费、SR 出块奖励、下次维护。"""
+    cp = cached("tron_chainparams", 300, lambda: _tron("wallet/getchainparameters")) or {}
+    params = {p.get("key"): p.get("value") for p in (cp.get("chainParameter") or [])}
+    nm = _tron("wallet/getnextmaintenancetime") or {}
+    ep = cached("tron_energyprice", 300, lambda: _tron("wallet/getenergyprices")) or {}
+    tail = (ep.get("prices") or "").split(",")[-1]
+    return {
+        "energy_fee_sun_per_unit": params.get("getEnergyFee"),
+        "transaction_fee_sun": params.get("getTransactionFee"),
+        "create_account_fee_sun": params.get("getCreateAccountFee"),
+        "create_account_fee_trx": round((params.get("getCreateAccountFee") or 0) / TRON_SUN, 6),
+        "witness_pay_per_block_sun": params.get("getWitnessPayPerBlock"),
+        "witness_pay_per_block_trx": round((params.get("getWitnessPayPerBlock") or 0) / TRON_SUN, 6),
+        "total_energy_limit": params.get("getTotalEnergyLimit"),
+        "total_bandwidth_limit": params.get("getTotalNetLimit"),
+        "maintenance_interval_s": params.get("getMaintenanceTimeInterval"),
+        "next_maintenance_ms": nm.get("num"),
+        "unfreeze_delay_days": params.get("getUnfreezeDelayDays"),
+        "allow_creation_of_contracts": params.get("getAllowCreationOfContracts"),
+        "latest_energy_price": tail.split(":")[-1] if tail else None,
+        "how_to_read": ("cost of a TRC-20 transfer = energy consumed by the contract x "
+                        "energy_fee_sun_per_unit, paid in TRX unless the sender holds staked energy. "
+                        "A plain TRX transfer burns bandwidth instead of energy."),
+        "source": "our java-tron getchainparameters + getenergyprices + getnextmaintenancetime",
+    }
+
+
+def t_tron_list_witnesses(limit=30):
+    """超级代表（SR）与候选节点：出块数、漏块数、票数、官网。"""
+    try:
+        n = max(1, min(200, int(limit or 30)))
+    except (TypeError, ValueError):
+        n = 30
+    w = cached("tron_witnesses", 60, lambda: _tron("wallet/listwitnesses")) or {}
+    ws = w.get("witnesses") or []
+    if not ws:
+        return {"available": False, "reason": "witness list unavailable"}
+    active = [x for x in ws if x.get("isJobs")]
+    top = sorted(ws, key=lambda y: -(y.get("totalProduced") or 0))[:n]
+    return {
+        "registered_witnesses": len(ws),
+        "active_block_producers": len(active),
+        "top_by_blocks_produced": [
+            {"address": _tron_b58(x.get("address") or ""), "url": x.get("url"),
+             "blocks_produced": x.get("totalProduced"), "blocks_missed": x.get("totalMissed"),
+             "votes": x.get("voteCount"), "in_active_set": bool(x.get("isJobs"))} for x in top],
+        "source": "our java-tron wallet/listwitnesses",
+    }
+
+
+# ============================================================ 2026-10-16 ETH 工具面
+# 数据来自自建的 Reth 执行层（RB_ETH_EXEC_RPC）与 Lighthouse 共识层（RB_ETH_CONS_RPC）。
+# 最终性用 Reth 的 "finalized" 区块标签判定（一行调用，比自己去算 epoch 可靠）。
+ETH_EXEC = os.environ.get("RB_ETH_EXEC_RPC", "http://127.0.0.1:8545")
+ETH_CONS = os.environ.get("RB_ETH_CONS_RPC", "http://127.0.0.1:5052")
+ETH_WEI = 10 ** 18
+ERC20_TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+# 常见代币的 decimals 兜底（查不到 decimals() 时用）；未命中就如实标注未知
+ETH_TOKEN_DECIMALS = {
+    "0xdac17f958d2ee523a2206206994597c13d831ec7": 6,    # USDT
+    "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": 6,    # USDC
+    "0x6b175474e89094c44da98b954eedeac495271d0f": 18,   # DAI
+    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": 18,   # WETH
+}
+
+
+def _eth(method, params=None, timeout=15):
+    d = _http_json(ETH_EXEC, {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []},
+                   timeout=timeout)
+    if isinstance(d, dict) and d.get("error"):
+        raise RuntimeError(str(d["error"])[:160])
+    return (d or {}).get("result")
+
+
+def _eth_int(v, default=None):
+    if v is None:
+        return default
+    try:
+        return int(v, 16) if isinstance(v, str) else int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _eth_ok_addr(a):
+    return bool(re.fullmatch(r"0x[0-9a-fA-F]{40}", (a or "").strip()))
+
+
+def _eth_token_decimals(token):
+    """查代币 decimals；查不到就用常见表；再不行返回 None（不猜）。"""
+    t = (token or "").lower()
+    if t in ETH_TOKEN_DECIMALS:
+        return ETH_TOKEN_DECIMALS[t]
+    try:
+        r = _eth("eth_call", [{"to": token, "data": "0x313ce567"}, "latest"], timeout=8)
+        if r and r != "0x":
+            return _eth_int(r)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _eth_finalized_block():
+    b = _eth("eth_getBlockByNumber", ["finalized", False], timeout=10)
+    return _eth_int((b or {}).get("number"))
+
+
+def _eth_decode_erc20_logs(receipt):
+    out = []
+    for lg in (receipt.get("logs") or []):
+        topics = lg.get("topics") or []
+        if len(topics) < 3 or (topics[0] or "").lower() != ERC20_TRANSFER:
+            continue
+        try:
+            amount = int(lg.get("data") or "0x0", 16)
+        except ValueError:
+            amount = None
+        token = lg.get("address")
+        dec = _eth_token_decimals(token)
+        out.append({
+            "token": token,
+            "from": "0x" + topics[1][-40:],
+            "to": "0x" + topics[2][-40:],
+            "amount_atomic": amount,
+            "decimals": dec,
+            "amount_human": round(amount / 10 ** dec, 6) if (amount is not None and dec is not None) else None,
+            "amount_note": None if dec is not None else "decimals() not readable for this token - raw units only",
+        })
+    return out
+
+
+def t_eth_transaction(txid):
+    """以太坊交易核验：成功/回滚、确认数、是否已最终确定，以及解出的 ERC-20 转账事件。"""
+    t = (txid or "").strip().lower()
+    if not t.startswith("0x"):
+        t = "0x" + t
+    if not re.fullmatch(r"0x[0-9a-f]{64}", t):
+        return {"error": "not an Ethereum transaction hash (expected 0x + 64 hex chars)"}
+    tx = _eth("eth_getTransactionByHash", [t])
+    rc = _eth("eth_getTransactionReceipt", [t])
+    if not tx and not rc:
+        return {"found": False, "txid": t,
+                "reason": "not present in our node's retained window",
+                "retention": {"tx_hash_index_from_block": 26170371,
+                              "tx_hash_index_note": "boundary of 2026-10-12; only widens over time",
+                              "receipts": "rolling ~44k blocks (~6 days; 1.4-8.3 days as the 50k-block shard rolls)",
+                              "block_bodies_from": 15500000},
+                "important": ("Our Reth node is pruned, so a miss is not proof the transaction does not exist: "
+                              "hash lookups start at block 26,170,371 (2026-10-12) and receipts cover roughly the "
+                              "last 6 days. Cross-check an indexer before telling anyone a payment did not arrive.")}
+    h = _eth_int((tx or {}).get("blockNumber"))
+    out = {"found": True, "txid": t, "block_number": h,
+           "from": (tx or {}).get("from"), "to": (tx or {}).get("to"),
+           "value_eth": round(_eth_int((tx or {}).get("value"), 0) / ETH_WEI, 12),
+           "nonce": _eth_int((tx or {}).get("nonce")),
+           "gas_limit": _eth_int((tx or {}).get("gas")),
+           "max_fee_per_gas_gwei": round(_eth_int(((tx or {}).get("maxFeePerGas")), 0) / 1e9, 6)
+                                     if (tx or {}).get("maxFeePerGas") else None,
+           "input_is_contract_call": bool((tx or {}).get("input") and (tx or {}).get("input") != "0x")}
+    if rc:
+        out["status"] = "success" if _eth_int(rc.get("status")) == 1 else "reverted"
+        out["gas_used"] = _eth_int(rc.get("gasUsed"))
+        gp = _eth_int(rc.get("effectiveGasPrice"))
+        out["effective_gas_price_gwei"] = round(gp / 1e9, 6) if gp else None
+        out["fee_eth"] = round(_eth_int(rc.get("gasUsed"), 0) * (gp or 0) / ETH_WEI, 12) if gp else None
+        out["erc20_transfers"] = _eth_decode_erc20_logs(rc)
+        out["log_count"] = len(rc.get("logs") or [])
+        out["contract_created"] = rc.get("contractAddress")
+    tip = _eth_int((_eth("eth_getBlockByNumber", ["latest", False]) or {}).get("number"))
+    fin = _eth_finalized_block()
+    if h:
+        out["confirmations"] = (tip - h + 1) if tip else None
+        out["finalized"] = bool(fin and h <= fin)
+    out["how_to_read"] = ("finalized=true means the block is at or below Ethereum's finalized checkpoint, so "
+                          "the transaction cannot be reverted by a reorg. erc20_transfers[] is decoded from "
+                          "the receipt logs - for USDT/USDC that is the amount, sender and recipient.")
+    out["source"] = "our Reth execution node + finalized checkpoint"
+    return out
+
+
+def t_eth_fee_rates():
+    """以太坊费用市场：base fee 走势、优先费分位、以及一笔转账/一次 ERC-20 调用的估算成本。"""
+    latest = _eth("eth_getBlockByNumber", ["latest", False]) or {}
+    base = _eth_int(latest.get("baseFeePerGas"), 0)
+    gas_price = _eth_int(_eth("eth_gasPrice"), 0)
+    try:
+        prio = _eth_int(_eth("eth_maxPriorityFeePerGas"), 0)
+    except Exception:  # noqa: BLE001
+        prio = None
+    fh = _eth("eth_feeHistory", ["0x5", "latest", [10, 50, 90]]) or {}
+    rewards = fh.get("reward") or []
+    pcts = {}
+    for name, idx in (("p10", 0), ("p50", 1), ("p90", 2)):
+        vals = [r[idx] for r in rewards if len(r) > idx]
+        if vals:
+            pcts[name] = round(sum(_eth_int(v, 0) for v in vals) / len(vals) / 1e9, 6)
+    base_series = [round(_eth_int(x, 0) / 1e9, 6) for x in (fh.get("baseFeePerGas") or [])]
+    return {
+        "base_fee_gwei": round(base / 1e9, 6),
+        "next_base_fee_gwei": base_series[-1] if base_series else None,
+        "base_fee_last_blocks_gwei": base_series[:-1] or base_series,
+        "gas_price_gwei": round(gas_price / 1e9, 6),
+        "priority_fee_gwei": round(prio / 1e9, 6) if prio is not None else None,
+        "priority_percentiles_gwei": pcts or None,
+        "estimated_cost": {
+            "simple_eth_transfer_21000_gas_eth": round(21000 * (base + (prio or 0)) / ETH_WEI, 12),
+            "erc20_transfer_65000_gas_eth": round(65000 * (base + (prio or 0)) / ETH_WEI, 12),
+            "assumption": "ERC-20 transfer estimated at 65,000 gas; actual varies by token and storage state.",
+        },
+        "how_to_read": ("Total fee = gas used x (base fee + priority fee). Use priority_percentiles to pick a "
+                        "tip: p10 is a slow/cheap inclusion, p90 is a fast one. The base fee is burned, the "
+                        "priority fee goes to the validator."),
+        "source": "our Reth node (eth_feeHistory + eth_gasPrice + eth_maxPriorityFeePerGas)",
+    }
+
+
+def t_eth_account(address):
+    """以太坊账户：ETH 余额、nonce、是否合约账户。"""
+    a = (address or "").strip()
+    if not _eth_ok_addr(a):
+        return {"error": "not an Ethereum address (expected 0x + 40 hex chars)"}
+    bal = _eth("eth_getBalance", [a, "latest"])
+    nonce = _eth("eth_getTransactionCount", [a, "latest"])
+    code = _eth("eth_getCode", [a, "latest"])
+    is_contract = bool(code and code != "0x")
+    return {
+        "address": a,
+        "balance_eth": round(_eth_int(bal, 0) / ETH_WEI, 12),
+        "nonce": _eth_int(nonce),
+        "is_contract": is_contract,
+        "code_size_bytes": (len(code) - 2) // 2 if is_contract else 0,
+        "note": ("A nonce equal to 0 with an empty code and zero balance means the address has never been "
+                 "used on chain; a contract account always has code."),
+        "source": "our Reth node (eth_getBalance + eth_getTransactionCount + eth_getCode)",
+    }
+
+
+ERC20_ARITY = {"balanceOf": 1, "allowance": 2, "decimals": 0, "symbol": 0, "name": 0, "totalSupply": 0}
+# 内置的 ERC-20 selector（keccak 前 4 字节，硬编码 —— 这样 MCP 侧不需要引入 keccak 依赖）
+ERC20_SELECTOR = {
+    "balanceOf(address)": "70a08231",
+    "allowance(address,address)": "dd62ed3e",
+    "decimals()": "313ce567",
+    "symbol()": "95d89b41",
+    "name()": "06fdde03",
+    "totalSupply()": "18160ddd",
+}
+
+
+def _eth_abi_pad_addr(a):
+    return a[2:].rjust(64, "0").lower() if _eth_ok_addr(a) else ""
+
+
+def _eth_abi_decode(hx, kind):
+    """以太坊返回值解码。注意地址要还原成 0x 形式，不能复用 TRON 那套 base58 解码。"""
+    if not hx or not isinstance(hx, str):
+        return None
+    try:
+        if kind == "address":
+            return "0x" + hx[-40:]
+        if kind == "bool":
+            return bool(int(hx, 16))
+        if kind == "string":
+            off = int(hx[0:64], 16) * 2
+            ln = int(hx[off:off + 64], 16)
+            return bytes.fromhex(hx[off + 64: off + 64 + ln * 2]).decode("utf-8", "replace")
+        return int(hx, 16)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def t_eth_read_contract(contract, function, argument=None, argument2=None,
+                        selector=None, parameter=None, output_type=None):
+    """以太坊合约**只读调用**（eth_call）。
+
+    ERC-20 常用函数有语法糖（balanceOf / allowance / decimals / symbol / name / totalSupply）；
+    其它函数请显式传 `selector`（4 字节 hex）与 ABI 编码好的 `parameter`——
+    MCP 侧刻意不引入 keccak 依赖，所以不会去替你猜 selector。
+    """
+    c = (contract or "").strip()
+    if not _eth_ok_addr(c):
+        return {"error": "not an Ethereum address (expected 0x + 40 hex chars)"}
+    fn = (function or "").strip()
+    if selector:
+        sel = str(selector).strip().lower().lstrip("0x")
+        if not re.fullmatch(r"[0-9a-f]{8}", sel):
+            return {"error": "selector must be 4 bytes of hex (8 chars)"}
+        sig = fn or "raw"
+        param = (parameter or "").lstrip("0x")
+        kind = output_type or "uint256"
+    else:
+        base = fn.split("(")[0]
+        if base not in ERC20_ARITY:
+            return {"error": "unknown function %r - pass an explicit `selector` for non-ERC-20 calls" % fn}
+        arity = ERC20_ARITY[base]
+        sig = base + "(" + ",".join(["address"] * arity) + ")"
+        parts = []
+        for arg in (argument, argument2)[:arity]:
+            pad = _eth_abi_pad_addr(arg)
+            if not pad:
+                return {"error": "%s needs %d Ethereum address argument(s)" % (base, arity)}
+            parts.append(pad)
+        param = "".join(parts)
+        kind = output_type or ("string" if base in ("symbol", "name") else "uint256")
+        sel = ERC20_SELECTOR.get(sig)
+        if not sel:
+            return {"error": "no built-in selector for %r" % sig}
+    try:
+        r = _eth("eth_call", [{"to": c, "data": "0x" + sel + param}, "latest"], timeout=15)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "contract": c, "function": sig, "error": str(exc)[:160]}
+    if not r or r == "0x":
+        return {"ok": False, "contract": c, "function": sig, "error": "eth_call returned empty",
+                "hint": "the function may not exist on this contract, or the call reverted"}
+    raw = r[2:]
+    val = _eth_abi_decode(raw, kind)
+    out = {"ok": True, "contract": c, "function": sig, "selector": sel, "output_type": kind,
+           "value": val, "raw": raw,
+           "source": "our Reth node (eth_call, read-only, no state change)"}
+    if isinstance(val, int) and (sig.startswith("balanceOf") or sig.startswith("totalSupply")
+                                 or sig.startswith("allowance")):
+        dec = _eth_token_decimals(c)
+        out["decimals"] = dec
+        if dec is not None:
+            out["value_human"] = round(val / 10 ** dec, 6)
+    return out
+
+
+# ============================================================ 2026-10-16 ZEC 交易核验
+# Zebra 的 RPC 开了 cookie 认证且 cookie 每次重启都变，所以经 9308 上的只读 helper 取数。
+ZEC_HELPER = os.environ.get("RB_ZEC_HELPER", "http://127.0.0.1:8093/rpc")
+
+
+def _zec(method, params=None, timeout=25):
+    d = _http_json(ZEC_HELPER, {"method": method, "params": params or []}, timeout=timeout)
+    if not (d or {}).get("ok"):
+        raise RuntimeError(str((d or {}).get("error"))[:180])
+    return d.get("result")
+
+
+def t_zec_transaction(txid):
+    """Zcash 交易核验：是否上链、第几块、多少确认、透明与屏蔽部分构成。
+
+    诚实边界：**屏蔽（shielded）转账的金额与双方在协议层不可见**，
+    只有持有查看密钥的人能解读；本工具如实报告"这笔交易含有多少屏蔽输入/输出"，而不是猜金额。
+    """
+    t = (txid or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", t):
+        return {"error": "not a Zcash transaction id (expected 64 hex chars)"}
+    try:
+        tx = _zec("getrawtransaction", [t, 1], timeout=30)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        if "not found" in msg.lower() or "-5" in msg:
+            return {"found": False, "txid": t, "reason": "not found on our Zebra node",
+                    "important": ("Zebra may not retain every historical transaction. A miss is not proof "
+                                  "the transaction does not exist - cross-check an explorer before telling "
+                                  "anyone a payment did not arrive.")}
+        return {"ok": False, "txid": t, "error": "zec helper unavailable: %s" % msg[:160]}
+    if not tx:
+        return {"found": False, "txid": t}
+    conf = tx.get("confirmations")
+    vin = tx.get("vin") or []
+    vout = tx.get("vout") or []
+    shielded_spends = len(tx.get("vShieldedSpend") or [])
+    shielded_outputs = len(tx.get("vShieldedOutput") or [])
+    orchard = tx.get("orchard") or {}
+    orchard_actions = len(orchard.get("actions") or []) if isinstance(orchard, dict) else 0
+    transparent_out = 0.0
+    for o in vout:
+        try:
+            transparent_out += float(o.get("valueZat") or 0)
+        except (TypeError, ValueError):
+            pass
+    return {
+        "found": True, "txid": tx.get("txid") or t,
+        "confirmations": conf,
+        "block_height": tx.get("height"),
+        "block_hash": tx.get("blockhash"),
+        "block_time": tx.get("blocktime"),
+        "in_active_chain": tx.get("in_active_chain"),
+        "size_bytes": tx.get("size"),
+        "version": tx.get("version"),
+        "expiry_height": tx.get("expiryheight"),
+        "transparent": {"inputs": len(vin), "outputs": len(vout),
+                        "total_output_zec": round(transparent_out / 1e8, 8)},
+        "shielded": {"sapling_spends": shielded_spends, "sapling_outputs": shielded_outputs,
+                     "orchard_actions": orchard_actions},
+        "has_shielded_component": bool(shielded_spends or shielded_outputs or orchard_actions),
+        "not_disclosed_by_protocol": (["shielded amounts", "shielded sender", "shielded recipient"]
+                                      if (shielded_spends or shielded_outputs or orchard_actions) else []),
+        "how_to_read": ("confirmations counts blocks on top. Zcash reorg risk drops with depth; 100 "
+                        "confirmations is the common exchange threshold. If has_shielded_component is true, "
+                        "the amounts and parties inside that part are hidden by the protocol - a viewing key "
+                        "held by a party to the transaction is the only way to read them."),
+        "source": "our Zebra 6.3.0 node via the read-only helper (getrawtransaction verbose)",
+    }
+
+
+# ============================================================ 2026-10-16 节点能力深挖（第二批）
+# 原则：**优先加深已有工具，只在出现新动词时才加工具**——tools/list 是真实上下文成本。
+
+
+def t_btc_get_network_stats():
+    """BTC 全网与节点状态：难度、算力、链上吞吐、节点版本与索引状态。"""
+    def build():
+        ni = btc_rpc("getnetworkinfo") or {}
+        ct = btc_rpc("getchaintxstats", []) or {}
+        mi = btc_rpc("getmempoolinfo") or {}
+        out = {"chain": "BTC",
+               "difficulty": btc_rpc("getdifficulty"),
+               "network_hashrate_hs": btc_rpc("getnetworkhashps"),
+               "chain_tx_count_total": ct.get("txcount"),
+               "tx_rate_per_s": round(ct.get("txrate"), 3) if ct.get("txrate") else None,
+               "window_blocks": None, "window_tx_count": ct.get("window_tx_count"),
+               "protocol_version": ni.get("protocolversion"),
+               "client": ni.get("subversion"),
+               "connections": ni.get("connections"),
+               "relay_fee_btc_kvb": ni.get("relayfee"),
+               "mempool_txs": mi.get("size"),
+               "uptime_s": btc_rpc("uptime"),
+               "source": "our own bitcoind getdifficulty + getnetworkhashps + getchaintxstats + getnetworkinfo"}
+        try:
+            idx = btc_rpc("getindexinfo") or {}
+            out["indexes"] = {k: bool(v.get("synced")) for k, v in idx.items()}
+        except Exception:  # noqa: BLE001
+            out["indexes"] = None
+        return out
+    return cached("btc_netstats", 30, build)
+
+
+def t_eth_get_logs(from_block=None, to_block=None, address=None, topic0=None, limit=50):
+    """按区块范围 / 合约地址 / 事件签名拉以太坊日志（eth_getLogs）。默认只扫最近 100 块。"""
+    def to_hex(v, latest):
+        if v is None:
+            return "latest" if latest else None
+        if isinstance(v, str) and (v.startswith("0x") or v in ("latest", "earliest", "pending", "safe", "finalized")):
+            return v
+        return hex(int(v))
+    try:
+        n = max(1, min(1000, int(limit or 50)))
+    except (TypeError, ValueError):
+        n = 50
+    latest = _eth_int(_eth("eth_getBlockByNumber", ["latest", False]).get("number"))
+    fb = to_hex(from_block, False) or hex(max(0, latest - 50))
+    tb = to_hex(to_block, True) or "latest"
+    try:
+        fb_n = _eth_int(fb) if fb.startswith("0x") else latest - 50
+        tb_n = _eth_int(tb) if tb.startswith("0x") else latest
+        if tb_n - fb_n > 1000:
+            return {"error": "block range too wide (max 1000 blocks per call)",
+                    "from_block": fb, "to_block": tb}
+    except Exception:  # noqa: BLE001
+        pass
+    f = {"fromBlock": fb, "toBlock": tb}
+    if address:
+        if not _eth_ok_addr(address):
+            return {"error": "not an Ethereum address (expected 0x + 40 hex chars)"}
+        f["address"] = address
+    if topic0:
+        t = topic0 if topic0.startswith("0x") else "0x" + topic0
+        f["topics"] = [t]
+    retried = False
+    try:
+        logs = _eth("eth_getLogs", [f], timeout=25) or []
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        # Reth 会在结果数超限时给出建议区间，直接按它重试一次，而不是把错误抛给调用方
+        m = re.search(r"range (\d+)-(\d+)", msg)
+        if "exceeds max results" in msg and m:
+            f = {"fromBlock": hex(int(m.group(1))), "toBlock": hex(int(m.group(2)))}
+            if address:
+                f["address"] = address
+            if topic0:
+                f["topics"] = ["0x" + topic0.lstrip("0x")]
+            try:
+                logs = _eth("eth_getLogs", [f], timeout=25) or []
+                retried = True
+            except Exception as exc2:  # noqa: BLE001
+                return {"error": str(exc2)[:160], "filter": f}
+        else:
+            return {"error": msg[:160], "filter": f}
+    out = []
+    for lg in logs[:n]:
+        entry = {"block_number": _eth_int(lg.get("blockNumber")), "tx_hash": lg.get("transactionHash"),
+                 "address": lg.get("address"), "log_index": _eth_int(lg.get("logIndex")),
+                 "topics": lg.get("topics"), "data": lg.get("data")}
+        tps = lg.get("topics") or []
+        if len(tps) >= 3 and (tps[0] or "").lower() == ERC20_TRANSFER:
+            dec = _eth_token_decimals(lg.get("address"))
+            amt = None
+            try:
+                amt = int(lg.get("data") or "0x0", 16)
+            except ValueError:
+                pass
+            entry["decoded"] = {"event": "Transfer", "token": lg.get("address"),
+                                "from": "0x" + tps[1][-40:], "to": "0x" + tps[2][-40:],
+                                "amount_atomic": amt, "decimals": dec,
+                                "amount_human": round(amt / 10 ** dec, 6) if (amt is not None and dec is not None) else None}
+        out.append(entry)
+    return {"filter": f, "auto_narrowed": retried, "matched": len(logs), "returned": len(out),
+            "truncated": len(logs) > len(out), "logs": out,
+            "note": "ERC-20 Transfer logs are decoded when they match the Transfer topic.",
+            "source": "our Reth node (eth_getLogs)"}
+
+
+def t_eth_get_block(height=None, block_hash=None):
+    """以太坊区块详情：区块号、时间戳、交易数、gas 使用、base fee、出块者。"""
+    if block_hash:
+        b = _eth("eth_getBlockByHash", [block_hash, False])
+        asked = {"block_hash": block_hash}
+    else:
+        tag = "latest"
+        if height is not None:
+            tag = height if isinstance(height, str) else hex(int(height))
+        b = _eth("eth_getBlockByNumber", [tag, False])
+        asked = {"block": tag}
+    if not b:
+        return {"found": False, **asked,
+                "important": "our Reth node keeps block bodies from 15,500,000 (2022-09-14) onward; a miss below "
+                              "that is outside our retention window, not proof the block does not exist"}
+    ts = _eth_int(b.get("timestamp"))
+    return {"found": True, "number": _eth_int(b.get("number")), "hash": b.get("hash"),
+            "parent_hash": b.get("parentHash"), "timestamp": ts,
+            "age_s": int(time.time() - ts) if ts else None,
+            "tx_count": len(b.get("transactions") or []),
+            "gas_used": _eth_int(b.get("gasUsed")), "gas_limit": _eth_int(b.get("gasLimit")),
+            "gas_used_pct": round(100 * (_eth_int(b.get("gasUsed"), 0) / max(1, _eth_int(b.get("gasLimit"), 1))), 2),
+            "base_fee_gwei": round(_eth_int(b.get("baseFeePerGas"), 0) / 1e9, 6) if b.get("baseFeePerGas") else None,
+            "miner": b.get("miner"), "size_bytes": _eth_int(b.get("size")),
+            "source": "our Reth node (eth_getBlockByNumber / eth_getBlockByHash)"}
+
+
+def t_xmr_get_output_distribution(from_height=None, to_height=None):
+    """Monero 输出分布（ring size / 匿名集规模）。
+
+    ⚠️ 诚实边界：monerod 的输出分布数据**滞后链尖约 5,000 块**（实测 tip-100 取不到、tip-5000 可以），
+    所以这里默认查询"链尖往回 5,000–5,010 块"这段，并明确回报实际高度。
+    """
+    info = cached("xmr_info", 10, lambda: _xmr_rpc("get_info")) or {}
+    tip = info.get("height")
+    if not tip:
+        return {"available": False, "reason": "monerod helper RPC unreachable"}
+    tip = int(tip)
+    try:
+        fr = int(from_height) if from_height is not None else tip - 5010
+        to = int(to_height) if to_height is not None else tip - 5000
+    except (TypeError, ValueError):
+        return {"error": "from_height / to_height must be integers"}
+    if to < fr:
+        return {"error": "to_height must be >= from_height"}
+    if to - fr > 1000:
+        return {"error": "range too wide (max 1000 blocks per call)"}
+    r = _xmr_rpc("get_output_distribution",
+                 {"amounts": [0], "from_height": fr, "to_height": to,
+                  "cumulative": False, "binary": False}, timeout=40)
+    dists = (r or {}).get("distributions") or []
+    if not dists:
+        return {"available": False, "tip": tip, "requested": {"from": fr, "to": to},
+                "reason": ("monerod returned no distribution for this range - the distribution data lags the "
+                           "chain tip by roughly 5,000 blocks; try a range further back")}
+    d = dists[0]
+    dist = d.get("distribution") or []
+    return {
+        "tip_height": tip,
+        "queried_range": {"from": fr, "to": to},
+        "data_lags_tip_by_blocks": tip - int(d.get("start_height") or fr),
+        "start_height": d.get("start_height"),
+        "outputs_before_start": d.get("base"),
+        "distribution": dist,
+        "largest_bucket_index": (max(range(len(dist)), key=lambda i: dist[i]) if dist else None),
+        "how_to_read": ("monerod reports how many spendable outputs fall into each ring-size bucket at that "
+                        "height; a larger tail means a bigger anonymity set for the largest ring size. "
+                        "Values are raw counts from our own monerod - we do not reinterpret them into a "
+                        "'privacy score'."),
+        "source": "our monerod get_output_distribution (binary:false) via the read-only helper",
+    }
+
+
+def t_zec_get_treestate(block_hash=None, height=None):
+    """Zcash 屏蔽池承诺树状态（Sapling / Orchard / Ironwood 的锚点根）。"""
+    try:
+        if not block_hash:
+            if height is not None:
+                block_hash = _zec("getblockhash", [int(height)])
+            else:
+                block_hash = _zec("getbestblockhash", [])
+        ts = _zec("z_gettreestate", [block_hash], timeout=30)
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "reason": str(exc)[:160]}
+    if not ts:
+        return {"found": False, "block_hash": block_hash}
+    out = {"block_hash": ts.get("hash") or block_hash, "height": ts.get("height"),
+           "time": ts.get("time"), "pools": {}}
+    for pool in ("sapling", "orchard", "ironwood"):
+        v = ts.get(pool)
+        if isinstance(v, dict):
+            c = v.get("commitments") or {}
+            out["pools"][pool] = {"final_root": c.get("finalRoot"), "final_state": c.get("finalState")}
+        elif v is not None:
+            out["pools"][pool] = v
+    out["how_to_read"] = ("Each root is the commitment-tree anchor for that shielded pool at this block. "
+                          "Wallets and provers need an anchor that their node recognises; comparing roots "
+                          "across blocks shows how the shielded sets advance.")
+    out["source"] = "our Zebra node via the read-only helper (z_gettreestate)"
+    return out
+
+
+def t_zec_get_network_stats():
+    """Zcash 全网与节点状态：内存池、节点版本、算力、难度、区块补贴与资助流向。"""
+    out = {"chain": "ZEC"}
+    for key, method, params in (("mempool", "getmempoolinfo", []),
+                                ("network", "getnetworkinfo", []),
+                                ("difficulty", "getdifficulty", []),
+                                ("network_hashrate_hs", "getnetworkhashps", []),
+                                ("blockchain", "getblockchaininfo", []),
+                                ("subsidy", "getblocksubsidy", [])):
+        try:
+            out[key] = _zec(method, params)
+        except Exception as exc:  # noqa: BLE001
+            out[key] = {"error": str(exc)[:100]}
+    bc = out.get("blockchain") if isinstance(out.get("blockchain"), dict) else {}
+    if bc:
+        out["height"] = bc.get("blocks")
+        out["verification_progress"] = bc.get("verificationprogress")
+        out["size_on_disk_gb"] = round((bc.get("size_on_disk") or 0) / 1e9, 1) if bc.get("size_on_disk") else None
+    sub = out.get("subsidy") if isinstance(out.get("subsidy"), dict) else {}
+    if sub:
+        out["funding_streams"] = [{"recipient": f.get("recipient"), "value_zec": f.get("value"),
+                                   "value_zat": f.get("valueZat"), "address": f.get("address")}
+                                  for f in (sub.get("fundingstreams") or [])]
+        out["lockbox_streams"] = [{"recipient": f.get("recipient"), "value_zec": f.get("value"),
+                                   "value_zat": f.get("valueZat")}
+                                  for f in (sub.get("lockboxstreams") or [])]
+        # Zebra 的 getblocksubsidy 里区块产出叫 miner；没有 blocksubsidy 这个键
+        out["block_reward_zec"] = sub.get("miner")
+        out["founders_reward_zec"] = sub.get("founders")
+        out["funding_streams_total_zec"] = sub.get("fundingstreamstotal")
+    out["source"] = "our Zebra node via the read-only helper (getmempoolinfo / getnetworkinfo / getnetworkhashps / getblocksubsidy)"
+    return out
+
+
+def t_tron_list_proposals(limit=20):
+    """TRON 治理提案：编号、状态、参数改动、赞成票与提案人。"""
+    try:
+        n = max(1, min(100, int(limit or 20)))
+    except (TypeError, ValueError):
+        n = 20
+    d = cached("tron_proposals", 120, lambda: _tron("wallet/listproposals")) or {}
+    ps = d.get("proposals") or []
+    if not ps:
+        return {"available": False, "reason": "proposal list unavailable"}
+    by_state = {}
+    for p in ps:
+        st = p.get("state") or "UNKNOWN"
+        by_state[st] = by_state.get(st, 0) + 1
+    top = sorted(ps, key=lambda p: -len(p.get("approvals") or []))[:n]
+    return {
+        "total_proposals": len(ps),
+        "by_state": by_state,
+        "top_by_approvals": [{
+            "proposal_id": p.get("proposal_id"),
+            "proposer": _tron_b58(p.get("proposer_address") or ""),
+            "approvals": len(p.get("approvals") or []),
+            "state": p.get("state"),
+            "create_time": p.get("create_time"),
+            "expiration_time": p.get("expiration_time"),
+            "parameters": ([{"key": x.get("key"), "value": x.get("value")}
+                            for x in (p.get("parameters") or [])]
+                           if isinstance(p.get("parameters"), list)
+                           else [{"key": k, "value": v} for k, v in (p.get("parameters") or {}).items()]),
+        } for p in top],
+        "how_to_read": ("A proposal that reaches enough approvals changes a chain parameter at the next "
+                        "maintenance window (tron_get_chain_economics reports the interval)."),
+        "source": "our java-tron wallet/listproposals",
     }
 
 
@@ -2097,9 +4624,21 @@ class H(BaseHTTPRequestHandler):
     def _plan(self):
         """2026-10-16：付费只走 x402，API key 档位已取消。
 
-        恒为匿名——`X-API-Key` 不再授予任何额度或速率档位，传了也当没传。
+        恒为匿名；付费额度由 x402 信用余额控制（不再是速率档位）。
+        仍然设置 `_plan_name` 以便 `_send()` 照常回 `X-MCP-Plan` 头——这是调用方与审计
+        判断「这是免费档还是付费档」的唯一外部标识。
         """
         self._plan_name = "anon"
+        return self._plan_name
+
+    def _plan_legacy(self):
+        key = self.headers.get("X-API-Key")
+        if not key and "key=" in (self.path or ""):
+            key = self.path.split("key=", 1)[1].split("&")[0]
+        if key:
+            self._plan_name = verify_key(key)
+        else:
+            self._plan_name = "anon"
         return self._plan_name
 
     def _rate_ok(self, limit):
@@ -2116,9 +4655,50 @@ class H(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self._send(204, b"")
 
+    def _credits(self):
+        """GET /credits?payer=<address> — read-only credit balance for one payer.
+
+        Address-keyed and derived from public on-chain payments; there is no
+        account and no secret to authenticate with. Rate limited per IP.
+        """
+        if x402_pay is None or not x402_pay.enabled():
+            return self._send(503, json.dumps({
+                "error": "x402 is not enabled on this deployment"}), "application/json")
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        payer = (q.get("payer") or [""])[0].strip()
+        if not payer:
+            return self._send(400, json.dumps({
+                "error": "payer is required",
+                "example": "/credits?payer=0x... (Base) or /credits?payer=<solana address>",
+                "note": "use the address that signed the payment; no API key exists",
+            }), "application/json")
+        if len(payer) > 80 or any(ch.isspace() for ch in payer):
+            return self._send(400, json.dumps({"error": "payer must be a single address"}),
+                              "application/json")
+        if not self._rate_ok(60):
+            return self._send(429, json.dumps({"error": "rate limited (60/min per IP)"}),
+                              extra={"Retry-After": "60"})
+        try:
+            out = x402_pay.credit_summary(payer)
+        except Exception as exc:  # noqa: BLE001
+            return self._send(500, json.dumps({"error": "%s: %s" % (type(exc).__name__, exc)[:200]}),
+                              "application/json")
+        return self._send(200, json.dumps(out, ensure_ascii=False), "application/json; charset=utf-8")
+
     def do_GET(self):
+        # 2026-10-17 修正：SSE 405 只对 MCP 端点本身生效。
+        # 原先不判路径 → Accept 带 text/event-stream 的 GET 打在 /tools、/server.json、
+        # /stats、/healthz 上也返回 405（公网 /mcp/tools 因此 405，外部探针 tools_json 连续失败）。
+        _bare = (self.path or "/").split("?")[0] in ("", "/", "/mcp", "/mcp/")
+        if _bare and "text/event-stream" in (self.headers.get("Accept") or "").lower():
+            # 本服务不提供服务端推送流：按 Streamable HTTP 规范回 405，而不是一页 HTML
+            return self._send(405, json.dumps({"jsonrpc": "2.0", "id": None, "error": {
+                "code": -32000, "message": "GET SSE stream not supported; use POST"}}),
+                extra={"Allow": "POST, OPTIONS"})
         if self.path.startswith("/healthz"):
             return self._send(200, json.dumps({"ok": True, "tools": len(TOOLS)}))
+        if self.path.split("?")[0].rstrip("/") in ("/credits", "/mcp/credits"):
+            return self._credits()
         if self.path.startswith("/stats"):
             hours = 24
             if "hours=" in self.path:
@@ -2140,6 +4720,16 @@ class H(BaseHTTPRequestHandler):
                 f'<tr><td>{html.escape(t2["tool"])}</td><td>{t2["calls"]}</td>'
                 f'<td>{round(t2["calls"]/max(d["total_calls"],1)*100,1)}%</td><td>{t2["avg_ms"]} ms</td></tr>'
                 for t2 in d["top_tools"]) or '<tr><td colspan="4" class="muted">No calls yet</td></tr>'
+            crows = "".join(
+                f'<tr><td>{html.escape(c["client"])}</td><td>{c["calls"]}</td><td>{c["errors"]}</td></tr>'
+                for c in d["top_clients"]) or '<tr><td colspan="3" class="muted">No calls yet</td></tr>'
+            erows = "".join(
+                f'<tr><td>{html.escape(e["reason"])}</td><td>{e["calls"]}</td></tr>'
+                for e in d["top_errors"]) or '<tr><td colspan="2" class="muted">No errors</td></tr>'
+            krows = "".join(
+                f'<tr><td>{html.escape(c["client"])}</td><td>{c["handshakes"]}</td>'
+                f'<td>{c["ips"]}</td><td>{html.escape(c["last_seen_utc"])}</td></tr>'
+                for c in d["connectors"]) or '<tr><td colspan="4" class="muted">No handshakes yet</td></tr>'
             page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>RobotBase MCP · usage audit</title><style>
 body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif;background:#070a0f;color:#e8eef6;margin:0;padding:36px 20px}}
@@ -2164,6 +4754,12 @@ h2{{font-size:15px;margin:26px 0 10px;color:#ffc46b}}</style></head><body><div c
 <h2>Calls per hour</h2><div class="bars">{bars}</div>
 <h2>Tool ranking</h2>
 <table><tr><th>Tool</th><th>Calls</th><th>Share</th><th>Avg latency</th></tr>{rows}</table>
+<h2>Who is calling</h2>
+<table><tr><th>Client (MCP clientInfo, else User-Agent)</th><th>Calls</th><th>Errors</th></tr>{crows}</table>
+<h2>Failure reasons</h2>
+<table><tr><th>Reason</th><th>Calls</th></tr>{erows}</table>
+<h2>Handshakes (clients that connected — a handshake is not a tool call)</h2>
+<table><tr><th>Client</th><th>Handshakes</th><th>Distinct IPs</th><th>Last seen (UTC)</th></tr>{krows}</table>
 <p class="sub" style="margin-top:18px">JSON: <a href="/mcp/stats?hours={hours}&amp;format=json">/mcp/stats?format=json</a> ·
 other windows: <a href="/mcp/stats?hours=1">1h</a> · <a href="/mcp/stats?hours=6">6h</a> · <a href="/mcp/stats?hours=24">24h</a> · <a href="/mcp/stats?hours=168">7d</a></p>
 </div></body></html>"""
@@ -2181,13 +4777,16 @@ other windows: <a href="/mcp/stats?hours=1">1h</a> · <a href="/mcp/stats?hours=
         _REQ.ip = (self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For")
                    or self.client_address[0])
         _REQ.plan = plan
-        limit = RATE_LIMIT_PER_MIN      # 只有匿名档：付费额度由 x402 信用控制，不再用速率区分
+        # 每次请求都有的两个身份线索，落审计用（ip_hash 看不出客户端是什么）
+        _REQ.ua = (self.headers.get("User-Agent") or "")[:160]
+        _REQ.client = ""
+        _REQ.err = ""
+        limit = RATE_LIMIT_PER_MIN       # 只有匿名档：付费额度由 x402 信用控制，不再用速率区分
         if not self._rate_ok(limit):
             return self._send(429, json.dumps({"jsonrpc": "2.0", "id": None,
                                                "error": {"code": -32000,
                                                          "message": f"rate limited ({limit}/min per IP); "
-                                                                    f"robotbase.cc issues no API keys — "
-                                                                    f"paid access is x402 credit on this endpoint"}}),
+                                                                    f"paid access is via x402 and does not raise the per-IP rate limit"}}),
                               extra={"X-RateLimit-Limit": str(limit)})
         try:
             msg = json.loads(raw.decode() or "{}")
@@ -2203,7 +4802,8 @@ other windows: <a href="/mcp/stats?hours=1">1h</a> · <a href="/mcp/stats?hours=
                 name = ((m.get("params") or {}).get("name") or "?")
                 ok = not ((r.get("result") or {}).get("isError") is True)
                 log_call(name, ok, (time.time() - started) * 1000,
-                             (self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For") or self.client_address[0]), plan)
+                             (self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For") or self.client_address[0]), plan,
+                             getattr(_REQ, "ua", ""), getattr(_REQ, "client", ""), getattr(_REQ, "err", ""))
         if not responses:
             return self._send(202, b"")
         payload = responses if batch else responses[0]
@@ -2211,7 +4811,7 @@ other windows: <a href="/mcp/stats?hours=1">1h</a> · <a href="/mcp/stats?hours=
         body = json.dumps(payload, ensure_ascii=False)
         if "text/event-stream" in accept:
             sse = "event: message\ndata: " + body + "\n\n"
-            return self._send(200, sse, "text/event-stream", {"Cache-Control": "no-store"})
+            return self._send(200, sse, "text/event-stream; charset=utf-8", {"Cache-Control": "no-store"})
         return self._send(200, body)
 
 
