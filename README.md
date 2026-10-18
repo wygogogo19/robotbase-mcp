@@ -6,7 +6,7 @@
 
 Live today: **Bitcoin · Ethereum · Monero · Zcash**. Provisioning: **Solana · Base · Tron**.
 
-[![Tools](https://img.shields.io/badge/tools-45-brightgreen)](https://robotbase.cc/mcp/tools)
+[![Tools](https://img.shields.io/badge/tools-51-brightgreen)](https://robotbase.cc/mcp/tools)
 [![Protocol](https://img.shields.io/badge/MCP-2025--06--18-blue)](https://modelcontextprotocol.io)
 [![Transport](https://img.shields.io/badge/transport-streamable--http-orange)](https://robotbase.cc/mcp)
 [![Glama](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp/badges/score.svg)](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp)
@@ -22,7 +22,7 @@ Listed in the **official MCP Registry** as `io.github.wygogogo19/robotbase-mcp` 
 
 An autonomous agent handling crypto has exactly two blocking questions: **did this payment actually settle**, and **what will the next one cost**. Ask an LLM those today and it has nowhere reliable to look — the MCP ecosystem is rich in wrappers around hosted indexers and thin on self-run infrastructure.
 
-This server answers both with **45 strictly read-only tools** (41 free verification tools + 4 metered risk tools) backed by our own full nodes and local indexes: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, a full Monero surface (`xmr_get_fee_rates`, `xmr_get_transaction`, `xmr_verify_payment`, …) read straight off our own monerod, an Ethereum surface (`eth_get_transaction`, `eth_get_fee_rates`, `eth_read_contract`) on our own Reth node, and a Tron surface (`tron_read_contract`, `tron_get_transaction`) on our own java-tron node.
+This server answers both with **51 strictly read-only tools** (47 free verification tools + 4 metered risk tools) backed by our own full nodes and local indexes: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, a full Monero surface (`xmr_get_fee_rates`, `xmr_get_transaction`, `xmr_verify_payment`, …) read straight off our own monerod, an Ethereum surface (`eth_get_transaction`, `eth_get_fee_rates`, `eth_read_contract`) on our own Reth node, and a Tron surface (`tron_read_contract`, `tron_get_transaction`) on our own java-tron node.
 
 ## Pricing
 
@@ -68,7 +68,7 @@ export RB_X402_LEDGER_DB=./x402_credit.db
 python3 server.py
 ```
 
-With those unset, the server runs the free tier only. This repo now ships the **same 45-tool surface** as the hosted endpoint — the only difference is where the per-chain backends point (your `RB_*` variables instead of ours).
+With those unset, the server runs the free tier only. This repo now ships the **same 51-tool surface** as the hosted endpoint — the only difference is where the per-chain backends point (your `RB_*` variables instead of ours).
 
 Check a payer's balance without spending a call:
 
@@ -98,7 +98,7 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
        "params":{"name":"btc_get_fee_rates","arguments":{}}}'
 ```
 
-## Tools (45)
+## Tools (51)
 
 | Tool | What it does | Typical question |
 |---|---|---|
@@ -154,6 +154,14 @@ Four tools answer what a free block explorer cannot. They are aggregation over p
 | `tron_verify_usdt_transfer(txid, expected_to?, expected_amount_usdt?)` | USDT settlement check: finalized on the solidity chain, confirmations, amount, sender, recipient, matched against what you expect. Reads **our own Tron node** inside its ~6 day window (sub-second, no third party) and falls back to TronGrid for older transactions — `source` says which answered, and a local miss is never reported as "not found" | "Did this USDT payment land, irreversibly, for the right amount?" |
 | `sol_check_token_safety(mint)` | Solana rug screen: mint authority, freeze authority, liquidity-lock percentage, top-10 concentration, transfer fee / hook | "Is this token a rug before my agent buys it?" |
 | `base_check_contract_risk(contract)` | Base (EVM) screen: honeypot / cannot-sell, buy & sell tax, verified source, upgradeable proxy, hidden owner, balance-rewrite, pausable transfers, mintable supply, selfdestruct, blacklist, LP lock, top-10 concentration | "Can this Base token be sold, and what does the exit cost?" |
+| `base_get_balance(address, contract?)` | Native ETH plus optional ERC-20 balance at the current Base block | "Can this wallet pay gas, and how much USDC does it hold?" |
+| `base_get_transaction(txid)` | Status, block, confirmations, from/to, value, gas used, fee and log count | "Did this Base payment actually succeed?" |
+| `base_read_contract(contract, function, …)` | `eth_call` with ERC-20 sugar, or an explicit selector + ABI parameter | "What does this Base contract return right now?" |
+| `sol_get_balance(address, mint?)` | Native SOL in lamports/sol plus optional SPL token balance | "How much SOL and USDC does this Solana wallet hold?" |
+| `sol_get_transaction(signature)` | Slot, success, error, fee, account count, logs and balance deltas | "Did this Solana transaction land and succeed?" |
+| `sol_get_account(address)` | Owner program, lamports, executable flag, parsed data type and space | "What is this Solana account?" |
+
+**Base and Solana are not self-hosted.** Their tools call an external JSON-RPC provider (configurable with `RB_BASE_RPC` / `RB_SOLANA_RPC`, with comma-separated fallbacks) and every response carries a `source` field that says so.
 
 Each one returns `risk_level`, a 0-100 `safety_score`, the verbatim upstream flags it was derived from, a `not_covered` list and a disclaimer — it relays public labels and **forms no legal opinion**. Issuer-backed tokens (regulated stablecoins) are read as issuer control rather than as a rug signal, and that decision is stated in the response.
 

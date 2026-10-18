@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """RobotBase MCP Server — one read-only surface for an eight-chain roster.
 
-2026-10-15：对外只保留这一个 MCP，不再提供任何 RPC 端点。名册只用三态：
-live（BTC/ETH/XMR/ZEC/TRON 今天可查）、provisioning（Base/Solana 正在接入）、
-planned（按需储备）。TRON 2026-10-15 从 provisioning 升为 live —— 它背后是
+2026-10-18：对外只保留这一个 MCP，不再提供任何 RPC 端点。名册七条链全部 live：
+BTC/ETH/XMR/ZEC/TRON 由自建节点回答，Base/Solana 走外部 RPC（不做本地节点）。
+TRON 2026-10-15 从 provisioning 升为 live —— 它背后是
 自建的 java-tron lite full node，只覆盖最近 65,536 块（约 2.3 天）与最新状态，
 超出窗口的查询会被明确拒绝。修剪与保留窗口是节点的属性，能力矩阵工具
 （robotbase_capabilities）如实对外说明边界。
@@ -28,7 +28,7 @@ except Exception:            # noqa: BLE001
 PORT = int(os.environ.get("RB_PORT", "8090"))
 BIND = os.environ.get("RB_BIND", "127.0.0.1")
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "robotbase-mcp", "version": "0.12.4", "title": "RobotBase MCP — on-chain verification & risk intelligence for Web3 agents"}
+SERVER_INFO = {"name": "robotbase-mcp", "version": "0.12.5", "title": "RobotBase MCP — on-chain verification & risk intelligence for Web3 agents"}
 BTC_ENV = os.environ.get("RB_BTC_ENV", "")
 ZEC_BASE = os.environ.get("RB_ZEC_BASE", "http://127.0.0.1:8080")
 HOME_BASE = os.environ.get("RB_HOME_BASE", "http://127.0.0.1:8081")
@@ -161,7 +161,8 @@ def t_list_chains():
                     "height": n.get("height"),
                     "state": n.get("state") or c.get("state")})
     if not out:                                  # 网关不可达时退回静态名册
-        out = [{"chain": c, "tier": "live" if c in CHAINS else "provisioning"} for c in ROSTER_CHAINS]
+        out = [{"chain": c, "tier": "live" if (c in CHAINS or c in ("base", "sol")) else "provisioning"}
+               for c in ROSTER_CHAINS]
     return {"chains": out, "updated_utc": d.get("updated_utc"),
             "note": "tier=live answers queries today; provisioning chains are still being wired into the "
                     "aggregation layer, and planned chains have no node at all. Neither is served yet."}
@@ -206,6 +207,22 @@ def t_chain_status(chain):
         n = (cached("nodes", 10, lambda: _http_json(HOME_BASE + "/api/nodes")).get("nodes") or {}).get("tron") or {}
         return {k: n.get(k) for k in ("ok", "synced", "height", "solidity", "peers", "client",
                                       "lag_s", "progress", "state")}
+    if chain in ("base", "sol"):
+        # 这两条链没有本地节点：状态直接问外部 RPC，并如实标注 access=external。
+        try:
+            if chain == "base":
+                head = _hexint(_base_rpc("eth_blockNumber", []))
+                return {"chain": "base", "ok": head is not None, "synced": True, "tier": "live",
+                        "access": "external RPC", "client": "external Base JSON-RPC",
+                        "block": head, "state": "external RPC"}
+            slot = _sol_rpc("getSlot", [{"commitment": "confirmed"}])
+            return {"chain": "sol", "ok": slot is not None, "synced": True, "tier": "live",
+                    "access": "external RPC", "client": "external Solana JSON-RPC",
+                    "slot": slot, "state": "external RPC"}
+        except Exception as exc:  # noqa: BLE001
+            return {"chain": chain, "ok": False, "synced": False, "tier": "live",
+                    "access": "external RPC", "state": "unreachable",
+                    "error": "%s: %s" % (type(exc).__name__, str(exc)[:140])}
     if chain in ROSTER_CHAINS:                   # 名册里有，但今天还不提供服务（provisioning / planned）
         spec = next((c for c in _roster() if c.get("id") == chain), None) or {}
         return {"chain": chain, "served": False, "tier": spec.get("tier", "unknown"),
@@ -2128,6 +2145,301 @@ def t_base_check_contract_risk(contract):
     return out
 
 
+# ==================== 2026-10-18: Base / Solana via external RPC ====================
+# 用户决定：这两条链短期不做本地节点，读路径全部走外部 RPC（可用 RB_* 覆盖）。
+# 这些工具只读，响应里明确写 source，不冒充自有节点。
+BASE_RPC_URL = os.environ.get("RB_BASE_RPC", "https://base-rpc.publicnode.com")
+SOLANA_RPC_URL = os.environ.get("RB_SOLANA_RPC", "https://solana-rpc.publicnode.com")
+BASE_RPC_FALLBACKS = [u.strip() for u in os.environ.get(
+    "RB_BASE_RPC_FALLBACKS", "https://base-rpc.publicnode.com,https://base.drpc.org").split(",") if u.strip()]
+SOL_RPC_FALLBACKS = [u.strip() for u in os.environ.get(
+    "RB_SOLANA_RPC_FALLBACKS", "https://solana-rpc.publicnode.com").split(",") if u.strip()]
+
+
+def _rpc(url, method, params, timeout=15, fallbacks=()):
+    """JSON-RPC with retry + endpoint fallback.
+
+    Public endpoints rate-limit aggressively (403/429). A JSON-RPC error is a real
+    answer and is raised immediately; transport/HTTP failures move to the next URL.
+    """
+    urls = [url] + [u for u in fallbacks if u and u != url]
+    last = None
+    for u in urls:
+        for attempt in range(2):
+            try:
+                body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+                req = urllib.request.Request(u, data=json.dumps(body).encode(),
+                                             headers={"content-type": "application/json",
+                                                      "user-agent": "robotbase-mcp/1"})
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    d = json.loads(r.read() or b"{}")
+                if d.get("error"):
+                    raise RuntimeError(str((d["error"] or {}).get("message") or d["error"])[:160])
+                return d.get("result")
+            except RuntimeError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                time.sleep(0.4 * (attempt + 1))
+    raise last if last else RuntimeError("rpc failed")
+
+
+def _base_rpc(method, params, timeout=15):
+    return _rpc(BASE_RPC_URL, method, params, timeout, BASE_RPC_FALLBACKS)
+
+
+def _sol_rpc(method, params, timeout=15):
+    return _rpc(SOLANA_RPC_URL, method, params, timeout, SOL_RPC_FALLBACKS)
+
+
+def _rpc_source(url):
+    """Human-readable source that never leaks a private relay address."""
+    host = urllib.parse.urlparse(url).hostname or ""
+    try:
+        if ipaddress.ip_address(host).is_private or ipaddress.ip_address(host).is_loopback:
+            return "external RPC via managed gateway"
+    except ValueError:
+        pass
+    return "external RPC " + (urllib.parse.urlparse(url).netloc or url)
+
+
+def _hexint(v):
+    try:
+        return int(str(v), 16)
+    except (TypeError, ValueError):
+        return None
+
+
+def t_base_get_balance(address, contract=None):
+    """Base 地址余额：原生 ETH，可选再读一个 ERC-20 的余额。走外部 RPC。"""
+    a = (address or "").strip()
+    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", a):
+        return {"address": a, "chain": "BASE", "checked": False,
+                "error": "not an EVM address (0x + 40 hex)", "_no_charge": True}
+    out = {"address": a.lower(), "chain": "BASE", "chain_id": BASE_CHAIN_ID, "checked": True,
+           "source": _rpc_source(BASE_RPC_URL)}
+    try:
+        wei = _hexint(_base_rpc("eth_getBalance", [a, "latest"]))
+        out["block"] = _hexint(_base_rpc("eth_blockNumber", []))
+    except Exception as exc:  # noqa: BLE001
+        return {"address": a, "chain": "BASE", "checked": False,
+                "error": "%s: %s" % (type(exc).__name__, str(exc)[:120])}
+    out["native_balance_wei"] = str(wei)
+    out["native_balance_eth"] = round(wei / 1e18, 18) if wei is not None else None
+    c = (contract or "").strip()
+    if c:
+        if not re.fullmatch(r"0x[0-9a-fA-F]{40}", c):
+            out["token_error"] = "contract must be 0x + 40 hex"
+            return out
+        try:
+            raw = _base_rpc("eth_call",
+                       [{"to": c, "data": "0x70a08231" + _eth_abi_pad_addr(a)}, "latest"])
+            val = _hexint(raw)
+            dec = _hexint(_base_rpc("eth_call",
+                               [{"to": c, "data": "0x313ce567"}, "latest"])) or 0
+            out["token"] = {"contract": c.lower(), "balance_raw": str(val), "decimals": dec,
+                            "balance": (val / (10 ** dec)) if val is not None and dec else None}
+        except Exception as exc:  # noqa: BLE001
+            out["token_error"] = "%s: %s" % (type(exc).__name__, str(exc)[:120])
+    return out
+
+
+def t_base_get_transaction(txid):
+    """Base 交易核验：是否上链、成功与否、区块、金额、手续费。走外部 RPC。"""
+    h = (txid or "").strip()
+    if not re.fullmatch(r"0x[0-9a-fA-F]{64}", h):
+        return {"txid": h, "chain": "BASE", "found": False,
+                "error": "not an EVM transaction hash (0x + 64 hex)", "_no_charge": True}
+    try:
+        tx = _base_rpc("eth_getTransactionByHash", [h])
+        rc = _base_rpc("eth_getTransactionReceipt", [h])
+        head = _hexint(_base_rpc("eth_blockNumber", []))
+    except Exception as exc:  # noqa: BLE001
+        return {"txid": h, "chain": "BASE", "found": False,
+                "error": "%s: %s" % (type(exc).__name__, str(exc)[:120])}
+    if not tx and not rc:
+        return {"txid": h, "chain": "BASE", "found": False,
+                "reason": "not found on this RPC (mempool, other chain, or typo)",
+                "source": _rpc_source(BASE_RPC_URL)}
+    block = _hexint((tx or rc or {}).get("blockNumber"))
+    gas_used = _hexint((rc or {}).get("gasUsed"))
+    price = _hexint((rc or {}).get("effectiveGasPrice") or (tx or {}).get("gasPrice"))
+    value = _hexint((tx or {}).get("value"))
+    status = _hexint((rc or {}).get("status"))
+    return {
+        "txid": h, "chain": "BASE", "found": True, "checked": True,
+        "status": ("success" if status == 1 else "failed" if status == 0 else "pending"),
+        "block": block,
+        "confirmations": (head - block + 1) if (head is not None and block is not None) else None,
+        "from": (tx or {}).get("from"), "to": (tx or {}).get("to"),
+        "value_wei": str(value), "value_eth": round(value / 1e18, 18) if value is not None else None,
+        "gas_used": gas_used, "fee_wei": str(gas_used * price) if gas_used and price else None,
+        "logs": len((rc or {}).get("logs") or []),
+        "contract_created": (rc or {}).get("contractAddress"),
+        "source": _rpc_source(BASE_RPC_URL),
+    }
+
+
+def t_base_read_contract(contract, function, argument=None, selector=None, parameter=None,
+                         output_type=None):
+    """Base 合约只读调用（eth_call），沿用与 eth_read_contract 相同的 selector 规则。"""
+    c = (contract or "").strip()
+    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", c):
+        return {"error": "not a Base contract address (0x + 40 hex)", "_no_charge": True}
+    fn = (function or "").strip()
+    if selector:
+        sel = str(selector).strip().lower().lstrip("0x")
+        if not re.fullmatch(r"[0-9a-f]{8}", sel):
+            return {"error": "selector must be 4 bytes of hex (8 chars)", "_no_charge": True}
+        sig = fn or "raw"
+        param = (parameter or "").lstrip("0x")
+        kind = output_type or "uint256"
+    else:
+        base = fn.split("(")[0]
+        if base not in ERC20_ARITY:
+            return {"error": "unknown function %r - pass an explicit `selector`" % fn,
+                    "known": sorted(ERC20_ARITY), "_no_charge": True}
+        arity = ERC20_ARITY[base]
+        sig = base + "(" + ",".join(["address"] * arity) + ")"
+        parts = []
+        for arg in (argument,):
+            if arity and not _eth_abi_pad_addr(arg):
+                return {"error": "%s needs an address argument" % base, "_no_charge": True}
+            if arity:
+                parts.append(_eth_abi_pad_addr(arg))
+        param = "".join(parts)
+        kind = output_type or ("string" if base in ("symbol", "name") else "uint256")
+        sel = ERC20_SELECTOR.get(sig)
+        if not sel:
+            return {"error": "no built-in selector for %r" % sig, "_no_charge": True}
+    try:
+        r = _base_rpc("eth_call", [{"to": c, "data": "0x" + sel + param}, "latest"])
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "contract": c, "function": sig,
+                "error": "%s: %s" % (type(exc).__name__, str(exc)[:140])}
+    if not r or r == "0x":
+        return {"ok": False, "contract": c, "function": sig, "error": "eth_call returned empty",
+                "hint": "the function may not exist, or the call reverted"}
+    raw = r[2:]
+    val = _eth_abi_decode(raw, kind)
+    out = {"ok": True, "contract": c, "function": sig, "selector": sel, "output_type": kind,
+           "value": val, "raw": raw, "source": _rpc_source(BASE_RPC_URL)}
+    if isinstance(val, int) and (sig.startswith("balanceOf") or sig.startswith("totalSupply")
+                                 or sig.startswith("allowance")):
+        try:
+            dec = _hexint(_base_rpc("eth_call",
+                               [{"to": c, "data": "0x313ce567"}, "latest"]))
+            if dec is not None:
+                out["decimals"] = dec
+                out["value_human"] = round(val / 10 ** dec, 6)
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def t_sol_get_balance(address, mint=None):
+    """Solana 余额：原生 SOL，可选再读一个 SPL token（默认 USDC）。走外部 RPC。"""
+    a = (address or "").strip()
+    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", a):
+        return {"address": a, "chain": "SOL", "checked": False,
+                "error": "not a Solana address (base58, 32-44 chars)", "_no_charge": True}
+    try:
+        b = _sol_rpc("getBalance", [a, {"commitment": "confirmed"}])
+        slot = _sol_rpc("getSlot", [{"commitment": "confirmed"}])
+    except Exception as exc:  # noqa: BLE001
+        return {"address": a, "chain": "SOL", "checked": False,
+                "error": "%s: %s" % (type(exc).__name__, str(exc)[:120])}
+    lamports = int((b or {}).get("value") or 0)
+    out = {"address": a, "chain": "SOL", "checked": True, "slot": slot,
+           "lamports": lamports, "sol": round(lamports / 1e9, 9),
+           "source": _rpc_source(SOLANA_RPC_URL)}
+    if mint:
+        try:
+            r = _sol_rpc("getTokenAccountsByOwner",
+                     [a, {"mint": mint}, {"encoding": "jsonParsed", "commitment": "confirmed"}])
+            total = 0.0
+            for acc in (r or {}).get("value", []):
+                amt = (((acc.get("account") or {}).get("data") or {}).get("parsed") or {}) \
+                    .get("info", {}).get("tokenAmount") or {}
+                total += float(amt.get("uiAmountString") or 0)
+            out["token"] = {"mint": mint, "balance": total,
+                            "accounts": len((r or {}).get("value", []))}
+        except Exception as exc:  # noqa: BLE001
+            out["token_error"] = "%s: %s" % (type(exc).__name__, str(exc)[:120])
+    return out
+
+
+def t_sol_get_transaction(signature):
+    """Solana 交易核验：slot、状态、手续费、余额变化与日志数。走外部 RPC。"""
+    sig = (signature or "").strip()
+    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{60,100}", sig):
+        return {"signature": sig, "chain": "SOL", "found": False,
+                "error": "not a Solana transaction signature (base58)", "_no_charge": True}
+    try:
+        r = _sol_rpc("getTransaction",
+                 [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0,
+                        "commitment": "confirmed"}])
+    except Exception as exc:  # noqa: BLE001
+        return {"signature": sig, "chain": "SOL", "found": False,
+                "error": "%s: %s" % (type(exc).__name__, str(exc)[:120])}
+    if not r:
+        return {"signature": sig, "chain": "SOL", "found": False,
+                "reason": "not found at confirmed commitment (old, dropped, or typo)",
+                "source": _rpc_source(SOLANA_RPC_URL)}
+    meta = r.get("meta") or {}
+    msg = ((r.get("transaction") or {}).get("message") or {})
+    keys = msg.get("accountKeys") or []
+    pre = meta.get("preBalances") or []
+    post = meta.get("postBalances") or []
+    deltas = [{"account": (k.get("pubkey") if isinstance(k, dict) else str(k)),
+               "delta_lamports": (post[i] - pre[i]) if i < len(post) and i < len(pre) else None}
+              for i, k in enumerate(keys[:12])]
+    return {
+        "signature": sig, "chain": "SOL", "found": True,
+        "slot": r.get("slot"), "block_time": r.get("blockTime"),
+        "success": meta.get("err") is None,
+        "error": meta.get("err"),
+        "fee_lamports": meta.get("fee"), "fee_sol": round((meta.get("fee") or 0) / 1e9, 9),
+        "accounts": len(keys), "logs": len(meta.get("logMessages") or []),
+        "balance_changes": deltas,
+        "source": _rpc_source(SOLANA_RPC_URL),
+    }
+
+
+def t_sol_get_account(address):
+    """Solana 账户信息：owner、lamports、是否可执行、数据大小/类型。走外部 RPC。"""
+    a = (address or "").strip()
+    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", a):
+        return {"address": a, "chain": "SOL", "found": False,
+                "error": "not a Solana address (base58)", "_no_charge": True}
+    try:
+        r = _sol_rpc("getAccountInfo",
+                 [a, {"encoding": "jsonParsed", "commitment": "confirmed"}])
+    except Exception as exc:  # noqa: BLE001
+        return {"address": a, "chain": "SOL", "found": False,
+                "error": "%s: %s" % (type(exc).__name__, str(exc)[:120])}
+    v = (r or {}).get("value")
+    if not v:
+        return {"address": a, "chain": "SOL", "found": False,
+                "reason": "account does not exist or has no lamports",
+                "source": _rpc_source(SOLANA_RPC_URL)}
+    data = v.get("data")
+    if isinstance(data, dict):
+        dtype = data.get("parsed", {}).get("type") if isinstance(data.get("parsed"), dict) else None
+        space = data.get("space")
+    else:
+        dtype = None
+        space = None
+    return {
+        "address": a, "chain": "SOL", "found": True, "checked": True,
+        "owner": v.get("owner"), "lamports": v.get("lamports"),
+        "sol": round((v.get("lamports") or 0) / 1e9, 9),
+        "executable": v.get("executable"), "rent_epoch": v.get("rentEpoch"),
+        "data_type": dtype, "data_space": space,
+        "source": _rpc_source(SOLANA_RPC_URL),
+    }
+
+
 TOOLS = [    ("list_chains",
      "List every chain on the RobotBase roster with its state. "
      "When to use: the user asks which chains are supported, which nodes are online, or where to start. "
@@ -2595,9 +2907,76 @@ TOOLS = [    ("list_chains",
      {"type": "object", "properties": {
          "contract": {"type": "string", "description": "Base ERC-20 / contract address (0x + 40 hex). Preferred name."},
          "address": {"type": "string", "description": "Alias for `contract` - accepted so a generic agent can pass `address`."}},
-      "anyOf": [{"required": ["contract"]}, {"required": ["address"]}],
+     "anyOf": [{"required": ["contract"]}, {"required": ["address"]}],
       "additionalProperties": False},
      lambda a: t_base_check_contract_risk(_arg(a, "contract", "address", "token_address", "token"))),
+    ("base_get_balance",
+     "Base balance lookup: native ETH for an address, optionally plus one ERC-20 balance. "
+     "When to use: a Base agent needs to know whether a wallet can pay gas, or how much of a token it holds. "
+     "Data source: external Base JSON-RPC (no self-hosted Base node). "
+     "Returns: native_balance_wei / native_balance_eth, current block, and for a token contract "
+     "balance_raw / decimals / balance. "
+     "Free: no metering.",
+     {"type": "object", "properties": {
+         "address": {"type": "string", "description": "Base address (0x + 40 hex)"},
+         "contract": {"type": "string", "description": "Optional ERC-20 contract to read balanceOf"}},
+      "required": ["address"], "additionalProperties": False},
+     lambda a: t_base_get_balance(a.get("address"), a.get("contract"))),
+    ("base_get_transaction",
+     "Base transaction verification: did it land, did it succeed, how many confirmations, what did it cost. "
+     "When to use: an agent or merchant must confirm a Base payment before releasing value. "
+     "Data source: external Base JSON-RPC (no self-hosted Base node). "
+     "Returns: found, status (success|failed|pending), block, confirmations, from, to, value, "
+     "gas_used, fee_wei, logs, contract_created. "
+     "Free: no metering.",
+     {"type": "object", "properties": {"txid": {"type": "string",
+                                                "description": "Base transaction hash (0x + 64 hex)"}},
+      "required": ["txid"], "additionalProperties": False},
+     lambda a: t_base_get_transaction(a.get("txid"))),
+    ("base_read_contract",
+     "Base contract read-only call (eth_call) with ERC-20 sugar: balanceOf / allowance / decimals / "
+     "symbol / name / totalSupply. For any other function pass an explicit 4-byte selector and "
+     "ABI-encoded parameter. Data source: external Base JSON-RPC. No state change.",
+     {"type": "object", "properties": {
+         "contract": {"type": "string", "description": "Base contract (0x + 40 hex)"},
+         "function": {"type": "string", "description": "ERC-20 function name, e.g. balanceOf"},
+         "argument": {"type": "string", "description": "Address argument for balanceOf/allowance"},
+         "selector": {"type": "string", "description": "Optional 4-byte selector (8 hex) for non-ERC20 calls"},
+         "parameter": {"type": "string", "description": "ABI-encoded parameter when selector is given"},
+         "output_type": {"type": "string", "description": "uint256 | string | bool | address"}},
+      "required": ["contract", "function"], "additionalProperties": False},
+     lambda a: t_base_read_contract(a.get("contract"), a.get("function"), a.get("argument"),
+                                    a.get("selector"), a.get("parameter"), a.get("output_type"))),
+    ("sol_get_balance",
+     "Solana balance lookup: native SOL in lamports, optionally plus one SPL token balance "
+     "(pass the mint, e.g. USDC EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v). "
+     "Data source: external Solana JSON-RPC (no self-hosted Solana node). "
+     "Returns: lamports, sol, current slot, and token balance/accounts when a mint is given. "
+     "Free: no metering.",
+     {"type": "object", "properties": {
+         "address": {"type": "string", "description": "Solana address (base58)"},
+         "mint": {"type": "string", "description": "Optional SPL token mint to read"}},
+      "required": ["address"], "additionalProperties": False},
+     lambda a: t_sol_get_balance(a.get("address"), a.get("mint"))),
+    ("sol_get_transaction",
+     "Solana transaction verification by signature: slot, success, fee, balance changes. "
+     "When to use: confirm a Solana payment or program call before releasing value. "
+     "Data source: external Solana JSON-RPC (no self-hosted Solana node). "
+     "Returns: found, slot, block_time, success, error, fee_lamports/fee_sol, accounts, logs, "
+     "and the first 12 account balance deltas. "
+     "Free: no metering.",
+     {"type": "object", "properties": {"signature": {"type": "string",
+                                                     "description": "Solana transaction signature (base58)"}},
+      "required": ["signature"], "additionalProperties": False},
+     lambda a: t_sol_get_transaction(a.get("signature"))),
+    ("sol_get_account",
+     "Solana account info: owner program, lamports, executable flag, parsed data type and space. "
+     "Data source: external Solana JSON-RPC (no self-hosted Solana node). "
+     "Returns found=false when the account does not exist. Free: no metering.",
+     {"type": "object", "properties": {"address": {"type": "string",
+                                                   "description": "Solana account address (base58)"}},
+      "required": ["address"], "additionalProperties": False},
+     lambda a: t_sol_get_account(a.get("address"))),
 ]
 
 
@@ -3036,7 +3415,7 @@ def server_card():
     return {
         "name": "robotbase-mcp",
         "title": "RobotBase MCP Server - on-chain verification & risk intelligence for Web3 agents",
-        "version": "0.12.4",
+        "version": "0.12.5",
         "description": "The verification and risk-intelligence layer for Web3 agents, as one read-only MCP "
                        "endpoint. Five chains are live, each read from mainnet nodes we run ourselves: "
                        "Bitcoin (fees, mempool state with a fee-rate histogram and RBF/CPFP feasibility, "
