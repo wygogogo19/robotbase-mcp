@@ -29,7 +29,7 @@ except Exception:            # noqa: BLE001
 PORT = int(os.environ.get("RB_PORT", "8090"))
 BIND = os.environ.get("RB_BIND", "127.0.0.1")
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "robotbase-mcp", "version": "0.22.0", "title": "RobotBase MCP — search, read, verify and pay from one read-only endpoint"}
+SERVER_INFO = {"name": "robotbase-mcp", "version": "0.25.2", "title": "RobotBase MCP — search, read, verify and pay from one read-only endpoint"}
 BTC_ENV = os.environ.get("RB_BTC_ENV", "")
 ZEC_BASE = os.environ.get("RB_ZEC_BASE", "http://127.0.0.1:8080")
 HOME_BASE = os.environ.get("RB_HOME_BASE", "http://127.0.0.1:8081")
@@ -131,9 +131,98 @@ def svc_status(chain):
                                   "initial_block_download", "connections", "mempool_txs", "size_on_disk_gb", "rpc_ok", "error")}
 
 
+def _jlen(obj):
+    try:
+        return len(json.dumps(obj, ensure_ascii=False, default=str))
+    except Exception:  # noqa: BLE001
+        return 10 ** 9
+
+
+_PRIORITY_KEYS = ("_x402", "_metering", "_no_charge", "_truncated", "_original_chars",
+                  "_truncated_note", "ok", "error", "reason", "tool")
+
+
+def _shrink_value(v, budget):
+    """Return a size-reduced copy of v that serialises to <= budget if possible."""
+    if _jlen(v) <= budget:
+        return v
+    if isinstance(v, list):
+        if not v:
+            return v
+        # keep the largest prefix that fits, at least one item
+        lo, hi = 1, len(v)
+        best = v[:1]
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if _jlen(v[:mid]) <= budget:
+                best = v[:mid]
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best
+    if isinstance(v, dict):
+        out = {}
+        remaining = budget
+        prio = [(k, val) for k, val in v.items() if k in _PRIORITY_KEYS]
+        rest = [(k, val) for k, val in v.items() if k not in _PRIORITY_KEYS]
+        items = prio + sorted(rest, key=lambda kv: _jlen(kv[1]))
+        for idx, (k, val) in enumerate(items):
+            if remaining <= 20:
+                break
+            cap = max(20, min(remaining - 20, 800)) if idx < len(prio) else max(20, remaining - _jlen(k) - 8)
+            got = _shrink_value(val, cap)
+            out[k] = got
+            remaining -= _jlen(k) + _jlen(got) + 6
+        return out
+    if isinstance(v, str):
+        if budget <= 24:
+            return v[:max(0, budget - 8)]
+        return v[:budget - 8] + "…"
+    return v
+
+
 def truncate(obj, limit=3800):
-    s = json.dumps(obj, ensure_ascii=False, default=str)
-    return s if len(s) <= limit else s[:limit] + '…(truncated)'
+    """Serialise to JSON and guarantee the returned string is *valid JSON*.
+
+    2026-10-19 fix (ported from the deployed v0.22.0, QA P1-1): the old implementation
+    cut the serialised string at `limit`, so any payload above the cap became
+    unparseable JSON. We now shrink lists/strings/dicts structurally and add explicit
+    truncation metadata instead of slicing the text.
+    """
+    try:
+        s = json.dumps(obj, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001
+        obj = {"result": str(obj)[:2000]}
+        s = json.dumps(obj, ensure_ascii=False)
+    if len(s) <= limit:
+        return s
+    original_chars = len(s)
+    budget = max(600, limit - 220)
+    shrunk = _shrink_value(obj, budget)
+    if isinstance(shrunk, dict):
+        shrunk = dict(shrunk)
+        shrunk["_truncated"] = True
+        shrunk["_truncated_note"] = ("response exceeded the %d-character transport cap; collections were "
+                                     "shortened. Increase limit/per-page arguments for more." % limit)
+        shrunk["_original_chars"] = original_chars
+    elif isinstance(shrunk, list):
+        shrunk = {"_truncated": True, "_truncated_note": "list shortened to fit the transport cap",
+                  "_original_chars": original_chars, "items": shrunk}
+    else:
+        shrunk = {"_truncated": True, "_truncated_note": "value shortened to fit the transport cap",
+                  "_original_chars": original_chars, "value": shrunk}
+    out = json.dumps(shrunk, ensure_ascii=False, default=str)
+    if len(out) > limit:      # last resort: still valid JSON, keep billing/metering keys
+        keep = {k: obj[k] for k in _PRIORITY_KEYS if k in obj and _jlen(obj[k]) < 900}
+        keep.update({"_truncated": True, "_original_chars": original_chars,
+                     "_truncated_note": "response exceeded the transport cap and was replaced",
+                     "_preview": out[:max(120, limit - 320)]})
+        out = json.dumps(keep, ensure_ascii=False, default=str)[:limit]
+        if not out.rstrip().endswith("}"):
+            out = json.dumps({"_truncated": True, "_original_chars": original_chars,
+                              "_truncated_note": "response exceeded the transport cap",
+                              "_preview": out[:max(120, limit - 200)]}, ensure_ascii=False)
+    return out
 
 
 # 2026-10-18：Base / Solana 的链上数据工具下线，名册收敛为五条链
@@ -142,6 +231,30 @@ def truncate(obj, limit=3800):
 # LTC/DOGE/KAS/RVN、TON 以及 Base/Solana 均已从名册下线。
 CHAINS = ("btc", "eth", "xmr", "zec", "tron")
 ROSTER_CHAINS = ("btc", "eth", "xmr", "zec", "tron")
+
+
+def _as_num(v):
+    """Coerce gateway-formatted strings ('#972,109', '8 peers') to numbers (ported P2-16)."""
+    if isinstance(v, bool) or v is None:
+        return v
+    if isinstance(v, (int, float)):
+        return v
+    if isinstance(v, str):
+        m = re.search(r"-?\d[\d,]*", v)
+        if m:
+            try:
+                return int(m.group(0).replace(",", ""))
+            except ValueError:
+                return v
+    return v
+
+
+def _nums(d, keys):
+    out = dict(d)
+    for k in keys:
+        if k in out:
+            out[k] = _as_num(out[k])
+    return out
 
 
 def t_list_chains():
@@ -154,7 +267,7 @@ def t_list_chains():
         n = nodes.get(cid) or {}
         out.append({"chain": cid, "tier": c.get("tier"),
                     "ok": bool(n.get("ok")), "synced": bool(n.get("synced")),
-                    "height": n.get("height"),
+                    "height": _as_num(n.get("height")),
                     "state": n.get("state") or c.get("state")})
     if not out:                                  # 网关不可达时退回静态名册
         out = [{"chain": c, "tier": "live"} for c in ROSTER_CHAINS]
@@ -185,23 +298,27 @@ def t_chain_status(chain):
     chain = (chain or "").lower()
     if chain == "btc":
         d = cached("btc_node", 10, lambda: _http_json("http://127.0.0.1:8600/api/node"))
-        return {k: d.get(k) for k in ("chain", "blocks", "headers", "verification_progress_pct", "initial_block_download",
-                                      "connections", "connections_out", "mempool_txs", "mempool_usage_mb",
-                                      "size_on_disk_gb", "version", "rpc_ok")}
+        return _nums({k: d.get(k) for k in ("chain", "blocks", "headers", "verification_progress_pct", "initial_block_download",
+                                            "connections", "connections_out", "mempool_txs", "mempool_usage_mb",
+                                            "size_on_disk_gb", "version", "rpc_ok")},
+                     ("blocks", "headers", "connections", "connections_out", "mempool_txs", "mempool_usage_mb"))
     if chain == "xmr":
         n = (cached("nodes", 10, lambda: _http_json(HOME_BASE + "/api/nodes")).get("nodes") or {}).get("xmr") or {}
-        return {k: n.get(k) for k in ("ok", "synced", "height", "txpool", "difficulty", "db",
-                                      "txc", "sync", "state")}
+        return _nums({k: n.get(k) for k in ("ok", "synced", "height", "txpool", "difficulty", "db",
+                                            "txc", "sync", "state")},
+                     ("height", "txpool", "difficulty", "db", "txc"))
     if chain == "zec":
         return svc_status(chain)
     if chain == "eth":
         n = (cached("nodes", 10, lambda: _http_json(HOME_BASE + "/api/nodes")).get("nodes") or {}).get("eth") or {}
-        return {k: n.get(k) for k in ("ok", "synced", "height", "peers", "exec", "cons", "slot",
-                                      "progress", "state")}
+        return _nums({k: n.get(k) for k in ("ok", "synced", "height", "peers", "exec", "cons", "slot",
+                                            "progress", "state")},
+                     ("height", "peers", "slot"))
     if chain == "tron":
         n = (cached("nodes", 10, lambda: _http_json(HOME_BASE + "/api/nodes")).get("nodes") or {}).get("tron") or {}
-        return {k: n.get(k) for k in ("ok", "synced", "height", "solidity", "peers", "client",
-                                      "lag_s", "progress", "state")}
+        return _nums({k: n.get(k) for k in ("ok", "synced", "height", "solidity", "peers", "client",
+                                            "lag_s", "progress", "state")},
+                     ("height", "solidity", "peers", "lag_s"))
     raise ValueError("chain must be one of: " + ", ".join(ROSTER_CHAINS))
 
 
@@ -517,13 +634,22 @@ def bech32_polymod(values):
     return chk
 
 
+BECH32M_CONST = 0x2BC830A3
+
+
 def bech32_decode(addr):
+    """Return (hrp, data, const). 2026-10-19: accept bech32 (1) and bech32m (BIP350)."""
     pos = addr.rfind("1")
+    if pos < 1 or pos + 7 > len(addr):
+        raise ValueError("bad bech32 address")
     hrp, data = addr[:pos], addr[pos + 1:]
     values = [CHARSET.find(c) for c in data]
-    if -1 in values or bech32_polymod([ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp] + values) != 1:
+    if -1 in values:
+        raise ValueError("bad bech32 character")
+    const = bech32_polymod([ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp] + values)
+    if const not in (1, BECH32M_CONST):
         raise ValueError("bad bech32 checksum")
-    return hrp, values[:-6]
+    return hrp, values[:-6], const
 
 
 def convertbits(data, frombits, tobits, pad=True):
@@ -541,12 +667,34 @@ def convertbits(data, frombits, tobits, pad=True):
     return ret
 
 
+def b58check_decode(s):
+    """Base58check: validate the 4-byte double-SHA256 checksum (ported P1-3).
+
+    The old code decoded base58 without checking the checksum, so a typo'd address
+    silently mapped to another script and could return plausible balances.
+    """
+    raw = b58decode(s)
+    if len(raw) < 5:
+        raise ValueError("bad base58 address length")
+    body, chk = raw[:-4], raw[-4:]
+    if hashlib.sha256(hashlib.sha256(body).digest()).digest()[:4] != chk:
+        raise ValueError("bad base58 checksum")
+    return body
+
+
 def address_to_script(addr):
     addr = addr.strip()
     if addr.lower().startswith("bc1"):
-        hrp, data = bech32_decode(addr.lower())
+        hrp, data, const = bech32_decode(addr.lower())
+        if hrp != "bc" or not data:
+            raise ValueError("not a Bitcoin mainnet bech32 address")
         witver = data[0]
         prog = bytes(convertbits(data[1:], 5, 8, False))
+        # BIP173: witness v0 uses bech32; BIP350: witness v1+ uses bech32m (ported P1-2)
+        if witver == 0 and const != 1:
+            raise ValueError("bad bech32 checksum (witness v0 must use bech32)")
+        if witver >= 1 and const != BECH32M_CONST:
+            raise ValueError("bad bech32m checksum (witness v1+ must use bech32m)")
         if witver == 0:
             if len(prog) == 20:
                 return b"\x00\x14" + prog
@@ -555,8 +703,8 @@ def address_to_script(addr):
         elif witver == 1 and len(prog) == 32:
             return b"\x51\x20" + prog
         raise ValueError("unsupported witness program")
-    raw = b58decode(addr)
-    if len(raw) != 25:
+    raw = b58check_decode(addr)
+    if len(raw) != 21:
         raise ValueError("bad base58 address length")
     ver, h160 = raw[0], raw[1:21]
     if ver == 0:
@@ -1351,14 +1499,19 @@ def _risk_precheck(name, args):
     a = args or {}
     if name == "tron_check_address_risk":
         v = (a.get("address") or "").strip()
-        if not re.fullmatch(r"T[1-9A-HJ-NP-Za-km-z]{33}", v):
+        if _tron_addr_normalize(v) is None:
             return {"address": v, "chain": "TRON", "checked": False,
-                    "error": "not a TRON base58 address (expected T + 33 chars)"}
+                    "error": "not a valid TRON address (base58 checksum failed; expected T + 33 chars "
+                             "or 41-hex)"}
     elif name == "tron_verify_usdt_transfer":
         v = (a.get("txid") or "").strip()
         if not re.fullmatch(r"[0-9a-fA-F]{64}", v):
             return {"txid": v, "chain": "TRON", "verified": False,
                     "error": "not a TRON transaction id (expected 64 hex chars)"}
+        et = (a.get("expected_to") or "").strip()
+        if et and _tron_addr_normalize(et) is None:
+            return {"txid": v, "chain": "TRON", "verified": False,
+                    "error": "expected_to is not a valid TRON address (base58 checksum failed)"}
     return None
 
 
@@ -1411,9 +1564,12 @@ _TRON_MED_FLAGS = ("gas_abuse", "fake_kyc", "fake_token", "malicious_mining_acti
 def t_tron_check_address_risk(address):
     """TRON 地址风控：司法/黑灰产标签 + 账户画像，给出安全评分。"""
     addr = (address or "").strip()
-    if not re.fullmatch(r"T[1-9A-HJ-NP-Za-km-z]{33}", addr):
-        return {"address": addr, "chain": "TRON", "error": "not a TRON base58 address (expected T + 33 chars)",
-                "checked": False, "_no_charge": True}
+    norm = _tron_addr_normalize(addr)
+    if norm is None:
+        return {"address": addr, "chain": "TRON",
+                "error": "not a valid TRON address (base58 checksum failed); no score was produced",
+                "checked": False, "safety_score": None, "_no_charge": True}
+    addr = norm
     out = {"address": addr, "chain": "TRON", "asset_scope": "TRX / TRC-20",
            "sources": ["GoPlus Labs address_security (tron)", "TronGrid /v1/accounts"]}
     account, flags = {}, {}
@@ -1429,6 +1585,16 @@ def t_tron_check_address_risk(address):
             if a.get("create_time"):
                 age_days = max(0, int((time.time() * 1000 - a["create_time"]) / 86400000))
                 account["age_days"] = age_days
+            if not account.get("is_contract"):
+                h = _tron_hex(addr)
+                if h:
+                    try:
+                        _ctr = _tron("wallet/getcontract", {"value": h}) or {}
+                        if _ctr.get("bytecode") or _ctr.get("code_hash") or _ctr.get("contract_address"):
+                            account["is_contract"] = True
+                            account["has_code"] = True
+                    except Exception:  # noqa: BLE001
+                        pass
         else:
             account = {"activated": False}
     except Exception as exc:  # noqa: BLE001
@@ -1451,10 +1617,14 @@ def t_tron_check_address_risk(address):
         out.update({"checked": True, "account": account, "flags_raw": flags or None,
                     "risk_level": "unknown", "safety_score": None,
                     "hit_flags": high + med,
+                    "scoring": "not scored: the account is not activated, so there is no history to judge",
+                    "not_covered": ["no transaction history for an unactivated account",
+                                    "counterparty graph depth (who paid whom) is not scored in this call"],
+                    "disclaimer": ("Labels come from the public GoPlus Labs dataset as fetched at call "
+                                   "time; RobotBase relays them verbatim, forms no legal opinion, and this "
+                                   "is not compliance advice."),
                     "note": "The address is not activated on TRON, so there is no transaction history "
                             "to judge. Not activated is not the same as clean."})
-        out["disclaimer"] = ("Labels come from the public GoPlus Labs dataset as fetched at call time; "
-                             "RobotBase relays them verbatim and forms no legal opinion.")
         return out
 
     score = 100
@@ -1719,8 +1889,15 @@ def _tron_usdt_verdict(out, expected_to, expected_amount_usdt):
             checks["amount_matches"] = abs(float(expected_amount_usdt) - (amount_raw or 0)) < 1e-6
         except (TypeError, ValueError):
             checks["amount_matches"] = False
+    # 2026-10-19 (ported QA P2-16): finality must not flip `verified` to false - the verdict
+    # below already says "confirmed but not yet finalized". Optional checks count only when asked.
+    required = ["status_success", "is_usdt_trc20", "is_transfer_call"]
+    if expected_to:
+        required.append("recipient_matches")
+    if expected_amount_usdt is not None:
+        required.append("amount_matches")
     out["checks"] = checks
-    out["verified"] = all(checks.values())
+    out["verified"] = all(checks[k] for k in required)
     if out["verified"] and finalized:
         out["verdict"] = "USDT arrived and is irreversible"
     elif out["verified"]:
@@ -1957,7 +2134,7 @@ TOOLS = [    ("list_chains",
      "Boundary: logs are read from receipts, which exist only for a rolling window (~6 days today, 1.4-8.3 days as "
      "the 50k-block static-file shard advances); older ranges are refused.",
      {"type": "object", "properties": {
-        "from_block": {"description": "Integer or hex or tag; defaults to 100 blocks back"},
+        "from_block": {"description": "Integer or hex or tag; defaults to 50 blocks back"},
         "to_block": {"description": "Integer or hex or tag; defaults to latest"},
         "address": {"type": "string", "description": "Optional contract address filter"},
         "topic0": {"type": "string", "description": "Optional event signature hash filter"},
@@ -1970,13 +2147,14 @@ TOOLS = [    ("list_chains",
      "own monerod. This is the anonymity-set side of Monero that free explorers rarely expose. "
      "When to use: reasoning about Monero privacy - how large the spendable-output set is at a given height. "
      "Do not use: to guess a 'privacy score' (we return raw counts only). "
-     "Boundary: monerod's distribution data lags the chain tip by roughly 5,000 blocks, so the default range "
-     "is 5,010 to 5,000 blocks back and the response states the real height and the lag. "
+     "Boundary: monerod's distribution data lags the chain tip by a node-dependent number of blocks "
+     "(~102 today, historically ~5,000); the default probes backwards until it finds a range with data, and "
+     "the response states the real tip, the queried range and the lag. "
      "Returns: tip_height, queried_range, data_lags_tip_by_blocks, start_height, outputs_before_start, "
      "distribution[] with the raw per-bucket counts.",
      {"type": "object", "properties": {
-        "from_height": {"type": "integer", "description": "Start height; defaults to tip-5010"},
-        "to_height": {"type": "integer", "description": "End height; defaults to tip-5000"}},
+        "from_height": {"type": "integer", "description": "Start height; defaults to a probed 10-block range (~tip-102 today)"},
+        "to_height": {"type": "integer", "description": "End height; defaults to the newest height that still has distribution data"}},
       "additionalProperties": False},
      lambda a: t_xmr_get_output_distribution(a.get("from_height"), a.get("to_height"))),
     ("zec_get_treestate",
@@ -2256,7 +2434,7 @@ WEB_SEARCH_TTL = _env_int("RB_WEB_SEARCH_TTL", 600)
 WEB_FETCH_TTL = _env_int("RB_WEB_FETCH_TTL", 1800)
 WEB_TRUNCATE = _env_int("RB_WEB_TRUNCATE", 12000)
 WEB_CACHE_MAX_MB = _env_int("RB_WEB_CACHE_MAX_MB", 100)
-WEB_UA = os.environ.get("RB_WEB_UA", "RobotBaseMCP/0.14 (+https://robotbase.cc/mcp)")
+WEB_UA = os.environ.get("RB_WEB_UA", "RobotBaseMCP/0.25.2 (+https://robotbase.cc/mcp)")
 WEB_RATE_PER_MIN = _env_int("RB_WEB_RATE_PER_MIN", 20)
 WEB_MAX_BYTES = 2 * 1024 * 1024          # 解压后正文上限 2 MB
 WEB_TIMEOUT_CONNECT = 5.0                # 建连上限
@@ -3293,7 +3471,9 @@ def _apply_fetch_view(base, max_chars, fmt, cached, started):
            "fetched_at": base.get("fetched_at"), "source": base.get("source"),
            "cached": cached, "took_ms": int((time.time() - started) * 1000)}
     # 整体响应（含 metering 前）控制在 WEB_TRUNCATE 内，保证 JSON 不被拦腰截断
-    budget = max(1000, WEB_TRUNCATE - 600)
+    # 2026-10-19 (ported QA P2-8): the old budget ignored max_chars, so 19k/20k requests were
+    # silently shrunk to 9.7k/8.2k by the 0.8 loop. Give content+envelope enough room.
+    budget = max(1000, max(WEB_TRUNCATE, int(max_chars) + 1500) - 600)
     while out["content"] and len(json.dumps(out, ensure_ascii=False)) > budget:
         out["content"] = out["content"][:int(len(out["content"]) * 0.8)]
         out["truncated"] = True
@@ -3309,7 +3489,8 @@ def t_web_fetch(url=None, max_chars=8000, format="markdown"):
         mc = int(max_chars)
     except (TypeError, ValueError):
         mc = 8000
-    mc = max(2000, min(20000, mc))
+    # 2026-10-19 (ported QA P2-8): the documented cap is 12,000 chars per call; apply it here too.
+    mc = max(2000, min(WEB_TRUNCATE, mc))
     fmt = "text" if str(format or "").strip().lower() == "text" else "markdown"
     if not u:
         return _fetch_error(u, "invalid_url", "url is required")
@@ -3363,6 +3544,12 @@ def t_web_fetch(url=None, max_chars=8000, format="markdown"):
                 return _fetch_error(u, "invalid_url", "URL rejected by the SSRF guard")
             if exc.code in ("unsupported_content_type", "too_large"):
                 return _fetch_error(u, exc.code, "the target returned an unsupported document")
+            # 2026-10-19 (ported QA P2-9): surface a target HTTP 4xx/5xx as http_<code>
+            # instead of silently retrying through the provider fallback.
+            _hd = re.search(r"HTTP\s+([45][0-9]{2})", str(getattr(exc, "detail", "") or ""))
+            if _hd and exc.code in ("blocked_by_site", "fetch_failed"):
+                return _fetch_error(u, "http_%s" % _hd.group(1),
+                                    "the target returned HTTP %s; no fallback was attempted" % _hd.group(1))
             direct_err = exc.code
         except Exception as exc:  # noqa: BLE001
             direct_err = ("timeout" if isinstance(exc, (socket.timeout, TimeoutError))
@@ -3503,14 +3690,40 @@ def _quota_preview(name):
 
 def _tool_output_limit(name):
     if name == "web_fetch":
-        return WEB_TRUNCATE
+        # room for 12,000 chars of content + metadata; the structural truncator keeps the
+        # JSON valid even if a caller asks for more (ported QA P2-8).
+        return max(WEB_TRUNCATE, 16000)
     if name == "web_search":
         return 4096
     return 3800
 
 
+def _schema_normalize(sch):
+    if isinstance(sch, dict) and sch.get("type") == "object" and "additionalProperties" not in sch:
+        sch = dict(sch)
+        sch["additionalProperties"] = False
+    return sch
+
+
+def _tool_meta(name, sch):
+    """Annotations + normalized schema for tools/list (ported QA P2-4)."""
+    open_world = (name.startswith("web_") or name.startswith("cyberlibrary_")
+                  or name in RISK_TOOLS)
+    return {
+        "title": name.replace("_", " ").title(),
+        "annotations": {"readOnlyHint": True, "destructiveHint": False,
+                        "idempotentHint": True, "openWorldHint": bool(open_world)},
+        "inputSchema": _schema_normalize(sch),
+    }
+
+
 def tools_list():
-    return [{"name": n, "description": d, "inputSchema": s} for n, d, s, _ in TOOLS]
+    out = []
+    for n, d, sch, _fn in TOOLS:
+        row = {"name": n, "description": d}
+        row.update(_tool_meta(n, sch))
+        out.append(row)
+    return out
 
 
 def call_tool(name, args):
@@ -3732,8 +3945,16 @@ def handle(msg):
                     verify_ledger.record(name, params.get('arguments') or {}, out)
                 except Exception:  # noqa: BLE001
                     pass
-            _is_err = bool(isinstance(out, dict) and out.get("error")
-                           and (name == "btc_get_address" or name in WEB_TOOLS))
+            # 2026-10-19 (ported QA P1-10): one consistent rule for every tool: a payload
+            # carrying `error` (or ok=false from a node/contract read) is an error.
+            _is_err = False
+            if isinstance(out, dict):
+                if out.get("error"):
+                    _is_err = True
+                if out.get("ok") is False:
+                    _is_err = True
+            elif isinstance(out, str) and out.strip().lower().startswith("error:"):
+                _is_err = True
             if _is_err:
                 _REQ.err = str(out.get("error"))
             result = {"content": [{"type": "text", "text": truncate(out, _tool_output_limit(name))}], "isError": _is_err}
@@ -3986,7 +4207,7 @@ def server_card():
     return {
         "name": "robotbase-mcp",
         "title": "RobotBase MCP Server - search, read, verify and pay from one read-only endpoint",
-        "version": "0.22.0",
+        "version": SERVER_INFO["version"],
         "description": "One read-only MCP endpoint for agents to search the web, read any page, verify "
                        "on-chain payments and pay per call - no API keys, no accounts, no custody. "
                        "Five chains are live, each read from mainnet nodes we run ourselves: "
@@ -4004,18 +4225,21 @@ def server_card():
                        "RobotBase publishes no RPC endpoint of any kind. Verification tools are free; "
                        "risk tools include a daily free allowance, then 0.01 USDC per call settled over "
                        "x402 by the caller's own wallet - x402 runs on Base or Solana as a payment rail "
-                       "only, and no Base or Solana chain data is served. Two high-frequency web "
-                       "tools are exposed on the same endpoint: web_search returns ranked web results "
-                       "(Serper primary with Tavily/Brave/cn.bing RSS fallbacks, cached up to 10 "
-                       "minutes) and web_fetch returns readable markdown/text of one public URL "
-                       "(robots.txt-respecting, SSRF-guarded, no login or paywall bypass, provider "
-                       "fallback for pages blocked from this node, capped at 12000 characters). Each "
-                       "has its own free daily allowance per IP (search 20, fetch 50) and is metered "
-                       "at 1 x402 credit per call. The hosted endpoint https://robotbase.cc/mcp adds "
-                       "five more web tools (web_screenshot, web_map, web_fetch_batch, web_feed, "
-                       "web_metadata) and fifteen CyberLibrary book tools, for 68 hosted tools in "
-                       "total; this repository is the 45-tool reference implementation. No API key, "
-                       "no account and no subscription are offered.",
+                       "only, and no Base or Solana chain data is served. Ten web tools are "
+                       "exposed on the hosted endpoint: web_search returns ranked web results "
+                       "(self-hosted SearXNG primary with Serper/Tavily/Brave/cn.bing RSS fallbacks, "
+                       "cached up to 10 minutes) and web_fetch returns readable markdown/text of one "
+                       "public URL with optional OCR (robots.txt-respecting, SSRF-guarded, no login "
+                       "or paywall bypass, provider fallback for pages blocked from this node, capped "
+                       "at 12000 characters); web_screenshot, web_map, web_fetch_batch, web_feed, "
+                       "web_metadata, web_crawl, web_extract and web_act add screenshots, URL "
+                       "discovery, batch reads, feeds, metadata, same-host crawling, structured "
+                       "extraction and limited browser interaction. Web tools share a free daily "
+                       "allowance per IP (search 20, fetch-family 50) and are metered from 1 to 3 "
+                       "x402 credits per call. The hosted endpoint adds sixteen CyberLibrary book "
+                       "tools, for 72 hosted tools in total; this repository is the 45-tool "
+                       "reference implementation. No API key, no account and no subscription are "
+                       "offered.",
         "homepage": "https://robotbase.cc/mcp",
         "transport": {"type": "streamable-http", "url": "https://robotbase.cc/mcp"},
         "endpoints": {
@@ -4387,7 +4611,17 @@ def t_xmr_verify_payment(txid, address, tx_key=None, signature=None, message=Non
             r = _xmr_wallet_rpc("check_tx_proof", p)
             mode = "check_tx_proof"
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "txid": t, "error": "wallet rpc unavailable: %s" % str(exc)[:160]}
+        msg = str(exc)
+        low = msg.lower()
+        # 2026-10-19 (ported QA P2-13): a rejected proof is not "wallet rpc unavailable".
+        if any(k in low for k in ("tx key", "tx_key", "signature", "proof", "wrong", "mismatch",
+                                  "invalid", "failed")):
+            return {"ok": False, "verified": False, "txid": t, "address": addr,
+                    "error": "proof_check_failed",
+                    "detail": msg[:200],
+                    "how_to_read": ("The transaction key / proof does not match this transaction and "
+                                    "address. Re-run get_tx_key / get_tx_proof for THIS txid and address.")}
+        return {"ok": False, "txid": t, "error": "wallet rpc unavailable: %s" % msg[:160]}
     conf = r.get("confirmations")
     received = r.get("received")
     good = isinstance(conf, int) and conf > 0 and isinstance(received, int) and received > 0
@@ -4428,7 +4662,7 @@ TRON_USDT_HEX = "41a614f803b6fd780986a42c78ec9c7f77e6ded13c"
 TRON_SUN = 1_000_000
 TRON_ZERO_ADDR = "410000000000000000000000000000000000000000"
 TRON_TRANSFER_TOPIC = "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-TRON_WINDOW_HINT = 181000        # 实测约 6.29 天；实际边界由 _tron_window() 懒探测
+TRON_WINDOW_HINT = 273000        # 2026-10-19 实测约 9.5 天；实际边界由 _tron_window() 懒探测
 
 
 def _b58decode(s):
@@ -4476,6 +4710,30 @@ def _tron_b58(h):
     return _b58encode(raw + hashlib.sha256(hashlib.sha256(raw).digest()).digest()[:4])
 
 
+def _tron_addr_normalize(addr):
+    """Return canonical base58 TRON address, or None if the address is invalid.
+
+    2026-10-19 (ported QA P0-1): risk scoring used a regex only, so a base58 string with
+    a broken checksum was scored `low / 100` and charged. We now verify the checksum
+    (and accept the 41-hex form used by node RPC).
+    """
+    a = (addr or "").strip()
+    if re.fullmatch(r"T[1-9A-HJ-NP-Za-km-z]{33}", a):
+        try:
+            raw = _b58decode(a)
+        except Exception:  # noqa: BLE001
+            return None
+        if len(raw) == 25 and hashlib.sha256(hashlib.sha256(raw[:21]).digest()).digest()[:4] == raw[21:]:
+            return a
+        return None
+    if re.fullmatch(r"(?:41)?[0-9a-fA-F]{40}", a):
+        hx = a.lower()
+        if not hx.startswith("41"):
+            hx = "41" + hx
+        return _tron_b58(hx)
+    return None
+
+
 def _tron(method, params=None, timeout=15):
     return _http_json(TRON_NODE + "/" + method, params or {}, timeout=timeout)
 
@@ -4517,7 +4775,7 @@ def _tron_window():
         return {"oldest_available_block": oldest, "tip": int(tip),
                 "window_blocks": int(tip) - oldest,
                 "window_days": round(span_s / 86400, 2) if span_s else None}
-    return cached("tron_window", 3600, probe) or {}
+    return cached("tron_window", 300, probe) or {}   # 2026-10-19: 5 min, was 1 h (stale tip)
 
 
 def _tron_tx_found(txid):
@@ -4701,7 +4959,8 @@ def t_tron_transaction(txid):
         out["amount_trx"] = round(int(cval["amount"]) / TRON_SUN, 6)
     tip = ((_tron_tip() or {}).get("block_header") or {}).get("raw_data", {}).get("number")
     if tip and info.get("blockNumber"):
-        out["confirmations"] = int(tip) - int(info["blockNumber"])
+        # 2026-10-19 (ported QA P2-16): the tip block counts as 1 confirmation (was off by one).
+        out["confirmations"] = int(tip) - int(info["blockNumber"]) + 1
     try:
         sinfo = _http_json(TRON_SOLIDITY + "/walletsolidity/gettransactioninfobyid",
                            {"value": t}, timeout=10) or {}
@@ -4754,6 +5013,15 @@ def t_tron_account(address):
                 "note": "account is not activated on chain (no TRX ever received)"}
     ar = a.get("account_resource") or {}
     unfreeze = _tron("wallet/getavailableunfreezecount", {"owner_address": h}) or {}
+    # 2026-10-19 (ported QA P1-8): java-tron `getaccount` omits `code`; contract accounts
+    # (e.g. USDT) were reported as has_code=false. Confirm via getcontract.
+    has_code = bool(a.get("code"))
+    if not has_code and (a.get("account_name") or a.get("balance")):
+        try:
+            ctr = _tron("wallet/getcontract", {"value": h}) or {}
+            has_code = bool(ctr.get("bytecode") or ctr.get("code_hash") or ctr.get("contract_address"))
+        except Exception:  # noqa: BLE001
+            pass
     # 2026-10-16 加深：账户权限结构（多签）与委托资源索引
     perms = {}
     for pname in ("owner_permission", "witness_permission", "active_permission"):
@@ -4787,7 +5055,8 @@ def t_tron_account(address):
         "created_ms": a.get("create_time"),
         "last_operation_ms": a.get("latest_opration_time"),
         "is_witness": bool(a.get("is_witness")),
-        "has_code": bool(a.get("code")),
+        "has_code": has_code,
+        "is_contract": has_code,
         "energy": {"used": ar.get("energy_usage"), "limit": res.get("EnergyLimit"),
                    "total_limit": res.get("TotalEnergyLimit")},
         "bandwidth": {"free_used": res.get("freeNetUsed"), "free_limit": res.get("freeNetLimit"),
@@ -4868,11 +5137,23 @@ def t_tron_read_contract(contract, function, argument=None, argument2=None,
         "function_selector": selector, "parameter": param, "visible": False}) or {}
     cr = r.get("constant_result") or []
     res = r.get("result") or {}
-    if not cr:
-        return {"ok": False, "contract": _tron_b58(ch), "function": selector,
-                "error": res.get("message") or "constant call returned no value",
+    msg_raw = res.get("message")
+    msg = ""
+    if msg_raw:
+        try:
+            msg = bytes.fromhex(str(msg_raw)).decode("utf-8", "replace")
+        except (ValueError, TypeError):
+            msg = str(msg_raw)
+    # 2026-10-19 (ported QA P1-7): java-tron sets result.result=true even when the call
+    # reverted and returns message="REVERT opcode executed" + empty constant_result.
+    reverted = ("REVERT" in msg.upper()) or (not cr) or (not str(cr[0] if cr else ""))
+    if reverted:
+        return {"ok": False, "revert": "REVERT" in msg.upper(), "contract": _tron_b58(ch),
+                "function": selector,
+                "error": msg or "constant call returned no value",
                 "result_code": res.get("code"),
-                "hint": "the function may not exist on this contract, or the call reverted"}
+                "hint": "the function may not exist on this contract, or the call reverted; "
+                        "ok:false means the value is not trustworthy"}
     raw = cr[0]
     val = _tron_abi_decode(raw, kind)
     out = {"ok": True, "contract": _tron_b58(ch), "function": selector,
@@ -5092,9 +5373,15 @@ def t_eth_fee_rates():
         "priority_fee_gwei": round(prio / 1e9, 6) if prio is not None else None,
         "priority_percentiles_gwei": pcts or None,
         "estimated_cost": {
-            "simple_eth_transfer_21000_gas_eth": round(21000 * (base + (prio or 0)) / ETH_WEI, 12),
-            "erc20_transfer_65000_gas_eth": round(65000 * (base + (prio or 0)) / ETH_WEI, 12),
-            "assumption": "ERC-20 transfer estimated at 65,000 gas; actual varies by token and storage state.",
+            # 2026-10-19 (ported QA P2-15): eth_maxPriorityFeePerGas returns 0 on an idle Reth
+            # node; use feeHistory percentiles so the estimate is not ~22x too low at p90.
+            "simple_eth_transfer_21000_gas_eth": round(
+                21000 * (base + ((pcts.get("p50") or 0) * 1e9)) / ETH_WEI, 12),
+            "erc20_transfer_65000_gas_eth": round(
+                65000 * (base + ((pcts.get("p90") or 0) * 1e9)) / ETH_WEI, 12),
+            "assumption": ("ETH transfer priced with the p50 tip, ERC-20 with the p90 tip; "
+                           "60,000-70,000 gas for an ERC-20 transfer depending on token/storage."),
+            "tip_used_gwei": {"simple": pcts.get("p50"), "erc20": pcts.get("p90")},
         },
         "how_to_read": ("Total fee = gas used x (base fee + priority fee). Use priority_percentiles to pick a "
                         "tip: p10 is a slow/cheap inclusion, p90 is a fast one. The base fee is burned, the "
@@ -5171,11 +5458,16 @@ def t_eth_read_contract(contract, function, argument=None, argument2=None,
         return {"error": "not an Ethereum address (expected 0x + 40 hex chars)"}
     fn = (function or "").strip()
     if selector:
-        sel = str(selector).strip().lower().lstrip("0x")
+        # 2026-10-19 (ported QA P1-5): `lstrip("0x")` strips a *character set*, not a prefix:
+        # a padded ABI parameter starting with 0x00… lost its padding and the call silently
+        # returned a wrong value (USDT balanceOf gave 0 instead of 291368219).
+        sel = re.sub(r"^0[xX]", "", str(selector).strip()).lower()
         if not re.fullmatch(r"[0-9a-f]{8}", sel):
             return {"error": "selector must be 4 bytes of hex (8 chars)"}
         sig = fn or "raw"
-        param = (parameter or "").lstrip("0x")
+        param = re.sub(r"^0[xX]", "", str(parameter or "").strip()).lower()
+        if not re.fullmatch(r"(?:[0-9a-f]{2})*", param):
+            return {"error": "parameter must be an even-length hex string without 0x prefix"}
         kind = output_type or "uint256"
     else:
         base = fn.split("(")[0]
@@ -5255,6 +5547,11 @@ def t_zec_transaction(txid):
     shielded_outputs = len(tx.get("vShieldedOutput") or [])
     orchard = tx.get("orchard") or {}
     orchard_actions = len(orchard.get("actions") or []) if isinstance(orchard, dict) else 0
+    # 2026-10-19 (ported QA P1-4): Ironwood is a first-class shielded pool since NU6; an
+    # Ironwood-only transaction used to be reported as "no shielded component".
+    ironwood = tx.get("ironwood") or {}
+    ironwood_actions = len(ironwood.get("actions") or []) if isinstance(ironwood, dict) else 0
+    ironwood_bal_zat = ironwood.get("valueBalanceZat") if isinstance(ironwood, dict) else None
     transparent_out = 0.0
     for o in vout:
         try:
@@ -5274,10 +5571,13 @@ def t_zec_transaction(txid):
         "transparent": {"inputs": len(vin), "outputs": len(vout),
                         "total_output_zec": round(transparent_out / 1e8, 8)},
         "shielded": {"sapling_spends": shielded_spends, "sapling_outputs": shielded_outputs,
-                     "orchard_actions": orchard_actions},
-        "has_shielded_component": bool(shielded_spends or shielded_outputs or orchard_actions),
+                     "orchard_actions": orchard_actions, "ironwood_actions": ironwood_actions,
+                     "ironwood_value_balance_zat": ironwood_bal_zat},
+        "has_shielded_component": bool(shielded_spends or shielded_outputs
+                                       or orchard_actions or ironwood_actions),
         "not_disclosed_by_protocol": (["shielded amounts", "shielded sender", "shielded recipient"]
-                                      if (shielded_spends or shielded_outputs or orchard_actions) else []),
+                                      if (shielded_spends or shielded_outputs or orchard_actions
+                                          or ironwood_actions) else []),
         "how_to_read": ("confirmations counts blocks on top. Zcash reorg risk drops with depth; 100 "
                         "confirmations is the common exchange threshold. If has_shielded_component is true, "
                         "the amounts and parties inside that part are hidden by the protocol - a viewing key "
@@ -5319,7 +5619,7 @@ def t_btc_get_network_stats():
 
 
 def t_eth_get_logs(from_block=None, to_block=None, address=None, topic0=None, limit=50):
-    """按区块范围 / 合约地址 / 事件签名拉以太坊日志（eth_getLogs）。默认只扫最近 100 块。"""
+    """按区块范围 / 合约地址 / 事件签名拉以太坊日志（eth_getLogs）。默认只扫最近 50 块。"""
     def to_hex(v, latest):
         if v is None:
             return "latest" if latest else None
@@ -5423,31 +5723,56 @@ def t_eth_get_block(height=None, block_hash=None):
 def t_xmr_get_output_distribution(from_height=None, to_height=None):
     """Monero 输出分布（ring size / 匿名集规模）。
 
-    ⚠️ 诚实边界：monerod 的输出分布数据**滞后链尖约 5,000 块**（实测 tip-100 取不到、tip-5000 可以），
-    所以这里默认查询"链尖往回 5,000–5,010 块"这段，并明确回报实际高度。
+    ⚠️ 诚实边界：monerod 的输出分布数据滞后链尖的块数**随节点版本变化**（2026-10-19 实测约 102 块，
+    历史上约 5,000 块），所以默认不从固定滞后量推算，而是从链尖往回探测到有数据的区间，
+    并明确回报真实链尖、查询区间与滞后块数。
     """
     info = cached("xmr_info", 10, lambda: _xmr_rpc("get_info")) or {}
-    tip = info.get("height")
+    # 2026-10-19 (ported QA P2-14): get_info.height is chain length (+1); use the real tip.
+    tip, _hdr = cached("xmr_tip", 10, _xmr_tip)
+    if not tip:
+        tip = int(info.get("height") or 0) - 1
     if not tip:
         return {"available": False, "reason": "monerod helper RPC unreachable"}
     tip = int(tip)
     try:
-        fr = int(from_height) if from_height is not None else tip - 5010
-        to = int(to_height) if to_height is not None else tip - 5000
+        fr = int(from_height) if from_height is not None else None
+        to = int(to_height) if to_height is not None else None
     except (TypeError, ValueError):
         return {"error": "from_height / to_height must be integers"}
-    if to < fr:
-        return {"error": "to_height must be >= from_height"}
-    if to - fr > 1000:
-        return {"error": "range too wide (max 1000 blocks per call)"}
-    r = _xmr_rpc("get_output_distribution",
-                 {"amounts": [0], "from_height": fr, "to_height": to,
-                  "cumulative": False, "binary": False}, timeout=40)
+    if fr is None or to is None:
+        # Probe backwards instead of hard-coding a lag: the daemon keeps a moving window.
+        r, fr, to = None, None, None
+        lag = 200
+        while lag <= 8000:
+            _to = tip - lag
+            try:
+                _r = _xmr_rpc("get_output_distribution",
+                              {"amounts": [0], "from_height": _to - 10, "to_height": _to,
+                               "cumulative": False, "binary": False}, timeout=40)
+            except Exception:  # noqa: BLE001
+                _r = None
+            dists = (_r or {}).get("distributions") or []
+            if dists and (dists[0].get("distribution") or []):
+                r, fr, to = _r, _to - 10, _to
+                break
+            lag *= 2
+        if r is None:
+            return {"available": False, "tip": tip,
+                    "reason": "monerod returned no output distribution in the last 8,000 blocks"}
+    else:
+        if to < fr:
+            return {"error": "to_height must be >= from_height"}
+        if to - fr > 1000:
+            return {"error": "range too wide (max 1000 blocks per call)"}
+        r = _xmr_rpc("get_output_distribution",
+                     {"amounts": [0], "from_height": fr, "to_height": to,
+                      "cumulative": False, "binary": False}, timeout=40)
     dists = (r or {}).get("distributions") or []
     if not dists:
         return {"available": False, "tip": tip, "requested": {"from": fr, "to": to},
                 "reason": ("monerod returned no distribution for this range - the distribution data lags the "
-                           "chain tip by roughly 5,000 blocks; try a range further back")}
+                           "chain tip; try a range further back")}
     d = dists[0]
     dist = d.get("distribution") or []
     return {
@@ -5579,6 +5904,7 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id, Accept")
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
         plan = getattr(self, "_plan_name", None)
         if plan:
             self.send_header("X-MCP-Plan", plan)
@@ -5609,7 +5935,7 @@ class H(BaseHTTPRequestHandler):
         return self._plan_name
 
     def _rate_ok(self, limit):
-        ip = (self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For") or self.client_address[0])
+        ip = self._request_ip()          # 2026-10-19: same trusted-IP rule as quota
         now = time.time()
         with _rl_lock:
             win = _rl.setdefault(ip, [])
@@ -5620,7 +5946,28 @@ class H(BaseHTTPRequestHandler):
         return True
 
     def do_OPTIONS(self):
-        self._send(204, b"")
+        # 2026-10-19 (ported QA P2-6): complete CORS preflight headers.
+        # _send() already sets Access-Control-Allow-Methods for every response; only the
+        # preflight-specific headers are added here (avoids a duplicate header).
+        self._send(204, b"", extra={"Access-Control-Max-Age": "86400",
+                                    "Allow": "POST, OPTIONS"})
+
+    def do_DELETE(self):
+        self._send(405, json.dumps({"jsonrpc": "2.0", "id": None,
+                                    "error": {"code": -32000, "message": "DELETE not supported"}}),
+                   extra={"Allow": "POST, OPTIONS"})
+
+    def do_PUT(self):
+        self._send(405, json.dumps({"jsonrpc": "2.0", "id": None,
+                                    "error": {"code": -32000, "message": "PUT not supported"}}),
+                   extra={"Allow": "POST, OPTIONS"})
+
+    def do_HEAD(self):
+        # headers only: a HEAD response must not carry a body
+        self.send_response(405)
+        self.send_header("Allow", "POST, OPTIONS")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _credits(self):
         """GET /credits?payer=<address> — read-only credit balance for one payer.
@@ -5659,11 +6006,14 @@ class H(BaseHTTPRequestHandler):
         _bare = (self.path or "/").split("?")[0] in ("", "/", "/mcp", "/mcp/")
         if _bare and "text/event-stream" in (self.headers.get("Accept") or "").lower():
             # 本服务不提供服务端推送流：按 Streamable HTTP 规范回 405，而不是一页 HTML
+            # 2026-10-19 (ported QA P1-13): mark the representation as Accept-dependent so caches
+            # (CF included) never serve the HTML landing page to an SSE client.
             return self._send(405, json.dumps({"jsonrpc": "2.0", "id": None, "error": {
                 "code": -32000, "message": "GET SSE stream not supported; use POST"}}),
-                extra={"Allow": "POST, OPTIONS"})
+                extra={"Allow": "POST, OPTIONS", "Vary": "Accept"})
         if self.path.startswith("/healthz"):
-            return self._send(200, json.dumps({"ok": True, "tools": len(TOOLS)}))
+            return self._send(200, json.dumps({"ok": True, "tools": len(TOOLS),
+                                              "version": SERVER_INFO["version"]}))
         if self.path.split("?")[0].rstrip("/") in ("/credits", "/mcp/credits"):
             return self._credits()
         if self.path.startswith("/stats"):
@@ -5735,14 +6085,34 @@ other windows: <a href="/mcp/stats?hours=1">1h</a> · <a href="/mcp/stats?hours=
             return self._send(200, json.dumps({"tools": tools_list()}, ensure_ascii=False))
         if self.path.startswith("/server.json") or self.path.startswith("/.well-known/mcp"):
             return self._send(200, json.dumps(server_card(), ensure_ascii=False))
-        return self._send(200, docs_html(), "text/html; charset=utf-8")
+        return self._send(200, docs_html(), "text/html; charset=utf-8", {"Vary": "Accept"})
+
+    def _request_ip(self):
+        """Trusted client IP. 2026-10-19 (ported QA P1-15): the gateway now sets X-Real-IP
+        from the socket peer for direct-origin clients and forwards the CF value for
+        tunnel traffic; X-Real-IP therefore wins over client-supplied headers."""
+        return (self.headers.get("X-Real-IP")
+                or self.headers.get("CF-Connecting-IP")
+                or (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+                or self.client_address[0])
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
+        if n > 1_048_576:                       # 2026-10-19 (ported QA P2-5): request body cap
+            return self._send(413, json.dumps({"jsonrpc": "2.0", "id": None,
+                                               "error": {"code": -32000, "message": "request body too large"}}))
         raw = self.rfile.read(n) if n else b"{}"
         plan = self._plan()
-        _REQ.ip = (self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For")
-                   or self.client_address[0])
+        path = urllib.parse.urlsplit(self.path or "/").path
+        if path not in ("", "/", "/mcp", "/mcp/"):
+            return self._send(404, json.dumps({"jsonrpc": "2.0", "id": None,
+                                               "error": {"code": -32000, "message": "not found"}}))
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype and ctype != "application/json":
+            return self._send(415, json.dumps({"jsonrpc": "2.0", "id": None,
+                                               "error": {"code": -32000,
+                                                         "message": "Content-Type must be application/json"}}))
+        _REQ.ip = self._request_ip()
         _REQ.plan = plan
         # 每次请求都有的两个身份线索，落审计用（ip_hash 看不出客户端是什么）
         _REQ.ua = (self.headers.get("User-Agent") or "")[:160]
@@ -5754,7 +6124,8 @@ other windows: <a href="/mcp/stats?hours=1">1h</a> · <a href="/mcp/stats?hours=
                                                "error": {"code": -32000,
                                                          "message": f"rate limited ({limit}/min per IP); "
                                                                     f"paid access is via x402 and does not raise the per-IP rate limit"}}),
-                              extra={"X-RateLimit-Limit": str(limit)})
+                              # 2026-10-19 (ported QA P2-3): actionable rate-limit metadata.
+                              extra={"X-RateLimit-Remaining": "0", "Retry-After": "60"})
         try:
             msg = json.loads(raw.decode() or "{}")
         except Exception:  # noqa: BLE001
@@ -5762,14 +6133,38 @@ other windows: <a href="/mcp/stats?hours=1">1h</a> · <a href="/mcp/stats?hours=
                                                "error": {"code": -32700, "message": "parse error"}}))
         batch = isinstance(msg, list)
         msgs = msg if batch else [msg]
+        if batch and (not msgs or len(msgs) > 50):
+            return self._send(400, json.dumps({"jsonrpc": "2.0", "id": None,
+                                               "error": {"code": -32600,
+                                                         "message": "Invalid Request: batch must contain 1-50 elements"}}))
         started = time.time()
-        responses = [r for r in (handle(m) for m in msgs) if r is not None]
+        responses = []
+        for _m in msgs:
+            if not isinstance(_m, dict):
+                responses.append({"jsonrpc": "2.0", "id": None,
+                                  "error": {"code": -32600,
+                                            "message": "Invalid Request: batch element must be an object"}})
+                continue
+            if _m.get("jsonrpc") not in (None, "2.0"):
+                responses.append({"jsonrpc": "2.0", "id": _m.get("id"),
+                                  "error": {"code": -32600, "message": "Invalid Request: jsonrpc must be 2.0"}})
+                continue
+            if not isinstance(_m.get("method"), str):
+                responses.append({"jsonrpc": "2.0", "id": _m.get("id"),
+                                  "error": {"code": -32600, "message": "Invalid Request: missing method"}})
+                continue
+            try:
+                _r = handle(_m)
+            except Exception as _exc:  # noqa: BLE001
+                _r = {"jsonrpc": "2.0", "id": _m.get("id"),
+                      "error": {"code": -32603, "message": "Internal error: %s" % type(_exc).__name__}}
+            if _r is not None:
+                responses.append(_r)
         for m, r in zip([x for x in msgs], responses or []):
             if isinstance(m, dict) and m.get("method") == "tools/call":
                 name = ((m.get("params") or {}).get("name") or "?")
                 ok = not ((r.get("result") or {}).get("isError") is True)
-                log_call(name, ok, (time.time() - started) * 1000,
-                             (self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For") or self.client_address[0]), plan,
+                log_call(name, ok, (time.time() - started) * 1000, self._request_ip(), plan,
                              getattr(_REQ, "ua", ""), getattr(_REQ, "client", ""), getattr(_REQ, "err", ""))
         if not responses:
             return self._send(202, b"")
@@ -5792,4 +6187,9 @@ if __name__ == "__main__":
             print("[x402] ledger ready; enabled=%s" % x402_pay.enabled(), flush=True)
         except Exception as exc:  # noqa: BLE001
             print("[x402] init failed: %s" % exc, flush=True)
-    ThreadingHTTPServer((BIND, PORT), H).serve_forever()
+    class _RBHTTPServer(ThreadingHTTPServer):
+        daemon_threads = True
+        request_queue_size = 256      # 2026-10-19 (ported QA P2-18): was 5 -> SYN-retransmit stalls
+        allow_reuse_address = True
+
+    _RBHTTPServer((BIND, PORT), H).serve_forever()

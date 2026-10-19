@@ -4,7 +4,7 @@
 
 **免鉴权 · 无追踪 · 只读** ｜ 自建裸金属全节点，对 Agent 暴露统一的「验证 + 风控」语义入口
 
-Hosted endpoint: **68 tools** — seven web tools (search, fetch, screenshot, map, batch, feed, metadata), on-chain verification & risk on **Bitcoin · Ethereum · Monero · Zcash · Tron**, and **15 CyberLibrary book tools**. This repository is the dependency-free reference implementation: **45 tools** (41 free verification + 2 risk + 2 web); the hosted endpoint additionally bundles 3 free XMR wallet/merchant tools, 15 CyberLibrary tools and 5 more web tools.
+Hosted endpoint: **72 tools** — ten web tools (search, fetch, screenshot, map, batch, feed, metadata, crawl, extract, act), on-chain verification & risk on **Bitcoin · Ethereum · Monero · Zcash · Tron**, and **16 CyberLibrary book tools**. This repository is the dependency-free reference implementation: **45 tools** (41 free verification + 2 risk + 2 web); the hosted endpoint additionally bundles 3 free XMR wallet/merchant tools, 16 CyberLibrary tools and 8 more web tools.
 
 > **Base and Solana data tools were retired on 2026-10-18.** The five-chain surface is Bitcoin, Ethereum, Monero, Zcash and Tron. x402 payments still settle in USDC on Base or Solana; that is a payment rail, not a data service.
 
@@ -73,7 +73,7 @@ export RB_X402_LEDGER_DB=./x402_credit.db
 python3 server.py
 ```
 
-With those unset, the server runs the free tier only. This repo ships the **45 chain/web tools** as a reference implementation — the only differences from the hosted endpoint are where the per-chain backends point (your `RB_*` variables instead of ours) and the hosted-only CyberLibrary bridge (15 book tools) and five additional web tools (screenshot, map, batch, feed, metadata), which are not included here.
+With those unset, the server runs the free tier only. This repo ships the **45 chain/web tools** as a reference implementation — the only differences from the hosted endpoint are where the per-chain backends point (your `RB_*` variables instead of ours) and the hosted-only CyberLibrary bridge (16 book tools) and eight additional web tools (screenshot, map, batch, feed, metadata, crawl, extract, act), which are not included here.
 
 Check a payer's balance without spending a call:
 
@@ -105,7 +105,7 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
 
 ## Tools (45 — reference implementation)
 
-> The hosted endpoint `https://robotbase.cc/mcp` has **68 tools**: these 45 plus 3 free XMR wallet/merchant tools, the 15 **CyberLibrary** book tools (`cyberlibrary_catalog_index`, `cyberlibrary_language_shard`, `cyberlibrary_book_meta`, `cyberlibrary_get_toc`, `cyberlibrary_get_chapter`, `cyberlibrary_get_markdown`, `cyberlibrary_cite`, `cyberlibrary_search_books`, `cyberlibrary_fulltext_search`, `cyberlibrary_service_info`, `cyberlibrary_get_chunks`, `cyberlibrary_verify_quote`, `cyberlibrary_search_passages`, `cyberlibrary_rag_context`, `cyberlibrary_semantic_search`) and five additional web tools (`web_screenshot`, `web_map`, `web_fetch_batch`, `web_feed`, `web_metadata`).
+> The hosted endpoint `https://robotbase.cc/mcp` has **72 tools**: these 45 plus 3 free XMR wallet/merchant tools, the 16 **CyberLibrary** book tools (`cyberlibrary_catalog_index`, `cyberlibrary_language_shard`, `cyberlibrary_book_meta`, `cyberlibrary_get_toc`, `cyberlibrary_get_chapter`, `cyberlibrary_get_markdown`, `cyberlibrary_cite`, `cyberlibrary_search_books`, `cyberlibrary_fulltext_search`, `cyberlibrary_service_info`, `cyberlibrary_get_chunks`, `cyberlibrary_verify_quote`, `cyberlibrary_search_passages`, `cyberlibrary_rag_context`, `cyberlibrary_semantic_search`, `cyberlibrary_search`) and eight additional web tools (`web_screenshot`, `web_map`, `web_fetch_batch`, `web_feed`, `web_metadata`, `web_crawl`, `web_extract`, `web_act`).
 
 | Tool | What it does | Typical question |
 |---|---|---|
@@ -271,7 +271,7 @@ export RB_WEB_SEARCH_FREE=20 RB_WEB_FETCH_FREE=50         # optional: per-IP fre
 export RB_WEB_SEARCH_GLOBAL=100 RB_WEB_FETCH_GLOBAL=200   # optional: site-wide free web caps
 export RB_WEB_DAILY_BUDGET_USD=5                          # optional: daily upstream spend breaker
 export RB_WEB_TRUNCATE=12000 RB_WEB_CACHE_MAX_MB=100      # optional: web_fetch cap / cache cap
-export RB_WEB_UA='RobotBaseMCP/0.14 (+https://robotbase.cc/mcp)'  # optional: crawler User-Agent
+export RB_WEB_UA='RobotBaseMCP/0.25.2 (+https://robotbase.cc/mcp)'  # optional: crawler User-Agent
 # optional paid tier — see examples/x402.env.example for the full list
 export RB_X402_ENABLED=1
 export RB_X402_FACILITATOR_URL=https://facilitator.example
@@ -282,6 +282,25 @@ python3 server.py
 ```
 
 See [`examples/`](./examples) for client configs, [`examples/env.example`](./examples/env.example) for the node variables and [`examples/x402.env.example`](./examples/x402.env.example) for the payment variables. Endpoints exposed by the server itself: `/` (docs), `/tools` (tool list JSON), `/server.json` (server card), `/stats` (usage audit), `/healthz`.
+
+## Reference implementation history
+
+- **2026-10-19 — v0.25.2**: hosted surface reaches 72 tools (10 web tools incl. `web_crawl`/`web_extract`/`web_act` and OCR; self-hosted SearXNG primary for `web_search`; 16 CyberLibrary tools). This release also ports the defect fixes that shipped in the hosted service (v0.22.0/v0.22.1) into this 45-tool reference implementation. Highlights: JSON-safe truncation (responses
+  over the transport cap stay **valid JSON** and carry `_truncated` / `_original_chars` metadata
+  instead of being sliced mid-object); bech32m/BIP350 witness-v1+ and base58check address
+  validation; Zcash **Ironwood** shielded-pool accounting; `eth_read_contract` raw selector and
+  ABI-parameter prefix handling (no more silent `lstrip("0x")` corruption); TRON contract-revert
+  detection, `has_code` via `getcontract`, USDT verdict finality split, confirmation off-by-one,
+  risk-address base58 checksum + 41-hex validation and unactivated-account coverage notes;
+  consistent `isError` for every tool; strict batch/HTTP handling (batch element validation,
+  405 for DELETE/PUT/HEAD, 413 body cap, 415 Content-Type, 404 path, complete CORS preflight,
+  trusted client IP via `X-Real-IP`, `Retry-After` on 429); tool `title` + annotations
+  (`readOnlyHint` etc.) and `additionalProperties` normalization in `tools/list`; `web_fetch`
+  `max_chars` cap/budget and HTTP 4xx passthrough instead of a silent provider fallback; dynamic
+  XMR output-distribution lag with the real chain tip; Monero proof-check error semantics; and
+  fee estimates priced from `eth_feeHistory` percentiles (p50 tip for a transfer, p90 for an
+  ERC-20 transfer) instead of a zero `eth_maxPriorityFeePerGas`. Version fields in `server.json`,
+  `mcp-registry.json` and `smithery.yaml` follow; `glama.json` carries no version field.
 
 ## License
 
