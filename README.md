@@ -1,14 +1,14 @@
 # RobotBase MCP Server
 
-**The semantic risk & verification layer for Web3 agents — one read-only MCP endpoint.**
+**One MCP endpoint for agents: search the web, read any page, verify on-chain payments, and pay per call — no API keys.**
 
 **免鉴权 · 无追踪 · 只读** ｜ 自建裸金属全节点，对 Agent 暴露统一的「验证 + 风控」语义入口
 
-Live today: **Bitcoin · Ethereum · Monero · Zcash · Tron** (Tron on a self-hosted lite full node).
+Hosted endpoint: **58 tools** — web search/fetch, on-chain verification & risk on **Bitcoin · Ethereum · Monero · Zcash · Tron**, and **10 CyberLibrary book tools**. This repository is the dependency-free reference implementation: **45 tools** (41 free verification + 2 risk + 2 web); the hosted endpoint additionally bundles CyberLibrary.
 
 > **Base and Solana data tools were retired on 2026-10-18.** The five-chain surface is Bitcoin, Ethereum, Monero, Zcash and Tron. x402 payments still settle in USDC on Base or Solana; that is a payment rail, not a data service.
 
-[![Tools](https://img.shields.io/badge/tools-45-brightgreen)](https://robotbase.cc/mcp/tools)
+[![Hosted tools](https://img.shields.io/badge/hosted%20tools-58-brightgreen)](https://robotbase.cc/mcp/tools) [![Reference tools](https://img.shields.io/badge/reference%20tools-45-blue)](https://github.com/wygogogo19/robotbase-mcp)
 [![Protocol](https://img.shields.io/badge/MCP-2025--06--18-blue)](https://modelcontextprotocol.io)
 [![Transport](https://img.shields.io/badge/transport-streamable--http-orange)](https://robotbase.cc/mcp)
 [![Glama](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp/badges/score.svg)](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp)
@@ -24,7 +24,7 @@ Listed in the **official MCP Registry** as `io.github.wygogogo19/robotbase-mcp` 
 
 An autonomous agent handling crypto has exactly two blocking questions: **did this payment actually settle**, and **what will the next one cost**. Ask an LLM those today and it has nowhere reliable to look — the MCP ecosystem is rich in wrappers around hosted indexers and thin on self-run infrastructure.
 
-This server answers both with **45 strictly read-only tools** (41 free verification tools + 2 metered risk tools + 2 metered web tools) backed by our own full nodes, local indexes and a metered web layer: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, a full Monero surface (`xmr_get_fee_rates`, `xmr_get_transaction`, `xmr_verify_payment`, …) read straight off our own monerod, an Ethereum surface (`eth_get_transaction`, `eth_get_fee_rates`, `eth_read_contract`) on our own Reth node, and a Tron surface (`tron_read_contract`, `tron_get_transaction`) on our own java-tron node.
+The hosted endpoint answers with **58 strictly read-only tools** (44 free verification tools + 2 metered risk tools + 10 metered CyberLibrary book tools + 2 metered web tools); this reference implementation ships **45** of them (41 free + 2 risk + 2 web). Everything is backed by our own full nodes, local indexes and a metered web layer: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, a full Monero surface (`xmr_get_fee_rates`, `xmr_get_transaction`, `xmr_verify_payment`, …) read straight off our own monerod, an Ethereum surface (`eth_get_transaction`, `eth_get_fee_rates`, `eth_read_contract`) on our own Reth node, and a Tron surface (`tron_read_contract`, `tron_get_transaction`) on our own java-tron node.
 
 ## Pricing
 
@@ -73,7 +73,7 @@ export RB_X402_LEDGER_DB=./x402_credit.db
 python3 server.py
 ```
 
-With those unset, the server runs the free tier only. This repo now ships the **same 45-tool surface** as the hosted endpoint — the only difference is where the per-chain backends point (your `RB_*` variables instead of ours).
+With those unset, the server runs the free tier only. This repo ships the **45 chain/web tools** as a reference implementation — the only differences from the hosted endpoint are where the per-chain backends point (your `RB_*` variables instead of ours) and the hosted-only CyberLibrary bridge (10 book tools), which is not included here.
 
 Check a payer's balance without spending a call:
 
@@ -103,7 +103,9 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
        "params":{"name":"btc_get_fee_rates","arguments":{}}}'
 ```
 
-## Tools (45)
+## Tools (45 — reference implementation)
+
+> The hosted endpoint `https://robotbase.cc/mcp` has **58 tools**: these 45 plus the 10 **CyberLibrary** book tools (`cyberlibrary_catalog_index`, `cyberlibrary_language_shard`, `cyberlibrary_book_meta`, `cyberlibrary_get_toc`, `cyberlibrary_get_chapter`, `cyberlibrary_get_markdown`, `cyberlibrary_cite`, `cyberlibrary_search_books`, `cyberlibrary_fulltext_search`, `cyberlibrary_service_info`).
 
 | Tool | What it does | Typical question |
 |---|---|---|
