@@ -29,7 +29,7 @@ except Exception:            # noqa: BLE001
 PORT = int(os.environ.get("RB_PORT", "8090"))
 BIND = os.environ.get("RB_BIND", "127.0.0.1")
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "robotbase-mcp", "version": "0.21.0", "title": "RobotBase MCP — search, read, verify and pay from one read-only endpoint"}
+SERVER_INFO = {"name": "robotbase-mcp", "version": "0.22.0", "title": "RobotBase MCP — search, read, verify and pay from one read-only endpoint"}
 BTC_ENV = os.environ.get("RB_BTC_ENV", "")
 ZEC_BASE = os.environ.get("RB_ZEC_BASE", "http://127.0.0.1:8080")
 HOME_BASE = os.environ.get("RB_HOME_BASE", "http://127.0.0.1:8081")
@@ -3986,7 +3986,7 @@ def server_card():
     return {
         "name": "robotbase-mcp",
         "title": "RobotBase MCP Server - search, read, verify and pay from one read-only endpoint",
-        "version": "0.21.0",
+        "version": "0.22.0",
         "description": "One read-only MCP endpoint for agents to search the web, read any page, verify "
                        "on-chain payments and pay per call - no API keys, no accounts, no custody. "
                        "Five chains are live, each read from mainnet nodes we run ourselves: "
