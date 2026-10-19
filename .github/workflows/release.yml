@@ -1,0 +1,66 @@
+name: Create GitHub Release
+
+# Creates a GitHub Release for a version tag. Runs on tag pushes and can be
+# dispatched manually with an existing tag (used to backfill v0.14.0).
+# Uses the default GITHUB_TOKEN with contents: write — no PAT needed.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (e.g. v0.14.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          git rev-parse "refs/tags/$TAG" >/dev/null
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice title=Release exists::$TAG already has a GitHub Release."
+            exit 0
+          fi
+          NOTES=$(cat <<'EOF'
+          ## RobotBase MCP — one read-only endpoint for agents
+
+          **search → read → verify → pay.** Hosted endpoint: https://robotbase.cc/mcp
+
+          - **Web tools** — `web_search` (Serper primary, Tavily/Brave/cn.bing RSS fallbacks) and
+            `web_fetch` (robots.txt + SSRF-guarded; direct fetch + stdlib extraction, provider fallback).
+            Independent free buckets: 20 searches / 50 fetches per IP per day, then 1 credit each over x402.
+          - **Verification & risk** — BTC / ETH / XMR / ZEC / TRON read from nodes we run ourselves,
+            plus TRON address risk and TRC-20 USDT settlement verification.
+          - **CyberLibrary** — 80k+ public-domain books in 25 languages (hosted-only, 10 metered tools).
+
+          Hosted surface: **58 tools** (44 free verification + 2 risk + 10 CyberLibrary + 2 web).
+          This repository is the dependency-free reference implementation: **45 tools**.
+          No API keys, no accounts, no custody. Base and Solana are x402 payment rails only — no chain data is served for them.
+
+          Docs: https://robotbase.cc/mcp · Tools: https://robotbase.cc/mcp/tools · Registry: https://registry.modelcontextprotocol.io
+          EOF
+          )
+          gh release create "$TAG" \
+            --title "$TAG — search, read, verify, pay (58 hosted tools)" \
+            --notes "$NOTES"
