@@ -29,7 +29,7 @@ except Exception:            # noqa: BLE001
 PORT = int(os.environ.get("RB_PORT", "8090"))
 BIND = os.environ.get("RB_BIND", "127.0.0.1")
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "robotbase-mcp", "version": "0.14.0", "title": "RobotBase MCP — search, read, verify and pay from one read-only endpoint"}
+SERVER_INFO = {"name": "robotbase-mcp", "version": "0.21.0", "title": "RobotBase MCP — search, read, verify and pay from one read-only endpoint"}
 BTC_ENV = os.environ.get("RB_BTC_ENV", "")
 ZEC_BASE = os.environ.get("RB_ZEC_BASE", "http://127.0.0.1:8080")
 HOME_BASE = os.environ.get("RB_HOME_BASE", "http://127.0.0.1:8081")
@@ -3986,7 +3986,7 @@ def server_card():
     return {
         "name": "robotbase-mcp",
         "title": "RobotBase MCP Server - search, read, verify and pay from one read-only endpoint",
-        "version": "0.14.0",
+        "version": "0.21.0",
         "description": "One read-only MCP endpoint for agents to search the web, read any page, verify "
                        "on-chain payments and pay per call - no API keys, no accounts, no custody. "
                        "Five chains are live, each read from mainnet nodes we run ourselves: "
@@ -4011,7 +4011,11 @@ def server_card():
                        "(robots.txt-respecting, SSRF-guarded, no login or paywall bypass, provider "
                        "fallback for pages blocked from this node, capped at 12000 characters). Each "
                        "has its own free daily allowance per IP (search 20, fetch 50) and is metered "
-                       "at 1 x402 credit per call. No API key, no account and no subscription are offered.",
+                       "at 1 x402 credit per call. The hosted endpoint https://robotbase.cc/mcp adds "
+                       "five more web tools (web_screenshot, web_map, web_fetch_batch, web_feed, "
+                       "web_metadata) and fifteen CyberLibrary book tools, for 68 hosted tools in "
+                       "total; this repository is the 45-tool reference implementation. No API key, "
+                       "no account and no subscription are offered.",
         "homepage": "https://robotbase.cc/mcp",
         "transport": {"type": "streamable-http", "url": "https://robotbase.cc/mcp"},
         "endpoints": {
@@ -4029,7 +4033,8 @@ def server_card():
                  "onchain", "verification", "risk-intelligence", "aml", "rug-pull", "honeypot", "evm",
                  "usdt", "mempool",
                  "fees", "privacy-coins", "read-only", "mcp-server", "web3-agents",
-                 "web-search", "web-fetch", "search", "fetch"],
+                 "web-search", "web-fetch", "search", "fetch", "web-screenshot", "web-map",
+                 "web-crawl", "rss", "books", "x402"],
         "pricing": {"verification_tools": "free", "risk_tools": "%d free calls/day per IP, then 0.01 USDC per call" % RISK_FREE_PER_DAY,
                     "web_tools": "20 searches + 50 fetches/day per IP free (separate buckets), then 0.01 USDC per credit over x402 (web_search 1, web_fetch 1)",
                     "payment": "x402 (HTTP 402) in USDC on Base or Solana; credit packs 10 calls / 0.10 USDC and 100 calls / 1.00 USDC; payment rail only - no Base or Solana chain data",

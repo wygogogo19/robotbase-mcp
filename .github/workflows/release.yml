@@ -49,12 +49,12 @@ jobs:
 
           - **Web tools** — `web_search` (Serper primary, Tavily/Brave/cn.bing RSS fallbacks) and
             `web_fetch` (robots.txt + SSRF-guarded; direct fetch + stdlib extraction, provider fallback).
-            Independent free buckets: 20 searches / 50 fetches per IP per day, then 1 credit each over x402.
+            Independent free buckets: 20 searches / 50 fetch-family calls per IP per day, then 1–2 credits over x402.
           - **Verification & risk** — BTC / ETH / XMR / ZEC / TRON read from nodes we run ourselves,
             plus TRON address risk and TRC-20 USDT settlement verification.
-          - **CyberLibrary** — 80k+ public-domain books in 25 languages (hosted-only, 10 metered tools).
+          - **CyberLibrary** — 80k+ public-domain books in 25 languages (hosted-only, 15 metered tools).
 
-          Hosted surface: **58 tools** (44 free verification + 2 risk + 10 CyberLibrary + 2 web).
+          Hosted surface: **68 tools** (44 free verification + 2 risk + 15 CyberLibrary + 7 web).
           This repository is the dependency-free reference implementation: **45 tools**.
           No API keys, no accounts, no custody. Base and Solana are x402 payment rails only — no chain data is served for them.
 
@@ -62,5 +62,5 @@ jobs:
           EOF
           )
           gh release create "$TAG" \
-            --title "$TAG — search, read, verify, pay (58 hosted tools)" \
+            --title "$TAG — search, read, verify, pay (68 hosted tools)" \
             --notes "$NOTES"
