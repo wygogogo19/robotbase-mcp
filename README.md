@@ -8,7 +8,7 @@ Live today: **Bitcoin · Ethereum · Monero · Zcash · Tron** (Tron on a self-h
 
 > **Base and Solana data tools were retired on 2026-10-18.** The five-chain surface is Bitcoin, Ethereum, Monero, Zcash and Tron. x402 payments still settle in USDC on Base or Solana; that is a payment rail, not a data service.
 
-[![Tools](https://img.shields.io/badge/tools-43-brightgreen)](https://robotbase.cc/mcp/tools)
+[![Tools](https://img.shields.io/badge/tools-45-brightgreen)](https://robotbase.cc/mcp/tools)
 [![Protocol](https://img.shields.io/badge/MCP-2025--06--18-blue)](https://modelcontextprotocol.io)
 [![Transport](https://img.shields.io/badge/transport-streamable--http-orange)](https://robotbase.cc/mcp)
 [![Glama](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp/badges/score.svg)](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp)
@@ -24,7 +24,7 @@ Listed in the **official MCP Registry** as `io.github.wygogogo19/robotbase-mcp` 
 
 An autonomous agent handling crypto has exactly two blocking questions: **did this payment actually settle**, and **what will the next one cost**. Ask an LLM those today and it has nowhere reliable to look — the MCP ecosystem is rich in wrappers around hosted indexers and thin on self-run infrastructure.
 
-This server answers both with **43 strictly read-only tools** (41 free verification tools + 2 metered risk tools) backed by our own full nodes and local indexes: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, a full Monero surface (`xmr_get_fee_rates`, `xmr_get_transaction`, `xmr_verify_payment`, …) read straight off our own monerod, an Ethereum surface (`eth_get_transaction`, `eth_get_fee_rates`, `eth_read_contract`) on our own Reth node, and a Tron surface (`tron_read_contract`, `tron_get_transaction`) on our own java-tron node.
+This server answers both with **45 strictly read-only tools** (41 free verification tools + 2 metered risk tools + 2 metered web tools) backed by our own full nodes, local indexes and a metered web layer: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, a full Monero surface (`xmr_get_fee_rates`, `xmr_get_transaction`, `xmr_verify_payment`, …) read straight off our own monerod, an Ethereum surface (`eth_get_transaction`, `eth_get_fee_rates`, `eth_read_contract`) on our own Reth node, and a Tron surface (`tron_read_contract`, `tron_get_transaction`) on our own java-tron node.
 
 ## Pricing
 
@@ -32,7 +32,8 @@ This server answers both with **43 strictly read-only tools** (41 free verificat
 |---|---|---|
 | **Verification (41 tools)** | Fee, mempool, tx/block/address verification, node and shielded-pool telemetry, optional raw-tx relay | **Free forever**, no key, no signup |
 | **Risk intelligence (2 tools)** | `tron_check_address_risk`, `tron_verify_usdt_transfer` | **5 calls/day per IP** free, resets 00:00 Asia/Shanghai |
-| **x402 credit packs** | Past the free allowance, each risk call costs **$0.01** | **10 calls / 0.10 USDC** or **100 calls / 1.00 USDC** in USDC on Base or Solana, paid from the caller's own wallet — payment rail only, no Base/Solana chain data |
+| **Web tools (2 tools)** | `web_search` (ranked web results) and `web_fetch` (readable text of one public URL) — independent buckets, so searching never eats the risk allowance | **20 searches + 50 fetches/day per IP** free, resets 00:00 Asia/Shanghai |
+| **x402 credit packs** | Past the free allowance, each metered call costs **$0.01** (1 credit: risk 1, `web_search` 1, `web_fetch` 1) | **10 calls / 0.10 USDC** or **100 calls / 1.00 USDC** in USDC on Base or Solana, paid from the caller's own wallet — payment rail only, no Base/Solana chain data |
 
 **Base and Solana are a payment rail only.** x402 settles in USDC on Base or Solana, but RobotBase does **not** serve Base or Solana chain data: those eight data tools were retired on 2026-10-18, and the roster is Bitcoin, Ethereum, Monero, Zcash and Tron.
 
@@ -72,7 +73,7 @@ export RB_X402_LEDGER_DB=./x402_credit.db
 python3 server.py
 ```
 
-With those unset, the server runs the free tier only. This repo now ships the **same 43-tool surface** as the hosted endpoint — the only difference is where the per-chain backends point (your `RB_*` variables instead of ours).
+With those unset, the server runs the free tier only. This repo now ships the **same 45-tool surface** as the hosted endpoint — the only difference is where the per-chain backends point (your `RB_*` variables instead of ours).
 
 Check a payer's balance without spending a call:
 
@@ -102,7 +103,7 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
        "params":{"name":"btc_get_fee_rates","arguments":{}}}'
 ```
 
-## Tools (43)
+## Tools (45)
 
 | Tool | What it does | Typical question |
 |---|---|---|
@@ -163,6 +164,37 @@ Each one returns `risk_level`, a 0-100 `safety_score`, the verbatim upstream fla
 
 Boundary worth stating plainly: RobotBase does **not** index Monero transactions, wallets or ring signatures, and does **not** label or risk-score Bitcoin addresses. Where a node cannot answer, the tool says so instead of guessing.
 
+### Web tools (high-frequency)
+
+Two general-purpose web tools sit next to the on-chain surface. They are the entry point an agent
+uses before it verifies: search the live web, read the one page that looks authoritative, then
+check the claim on chain. No API key is needed to call them.
+
+| Tool | What it does | Typical question |
+|---|---|---|
+| `web_search(query, count?, freshness?, site?, lang?)` | Ranked web results with title, URL, snippet and published date. **Serper is the primary provider**, with Tavily, Brave and a zero-key `cn.bing` RSS feed as fallbacks; the answer carries a `provider` field. Results are deduplicated (one domain cannot take more than ~40% of a result set) and cached for up to 10 minutes | "What is the BTC fee market saying today?" "Recent Zcash governance proposals?" |
+| `web_fetch(url, max_chars?, format?)` | Readable text/markdown of **one** public URL: `robots.txt` is checked first and `scripts`/`nav`/`header`/`footer` are stripped by a standard-library extractor. Direct fetch is tried first; pages blocked from this node are fetched through the provider fallback and marked `source=provider`. Response capped at 12,000 characters per call | "Read this article and summarise it" "Turn this URL into clean markdown" |
+
+**Independent free allowance:** `web_search` 20 calls/day per IP and `web_fetch` 50 calls/day per
+IP, in separate buckets from the 5/day risk allowance — searching can never consume the risk
+tools' free calls. A cached search still counts as one call against the free allowance; a paid
+call answered from cache does not spend a credit. Past the allowance each call is 1 x402 credit
+($0.01), charged through the same USDC credit balance as the risk tools.
+
+**Boundaries:** `web_fetch` reads one public URL, never a batch or a whole site; it does not log
+in, break paywalls, follow `noindex` tricks or bypass `robots.txt`. All fetching is SSRF-guarded:
+only `http`/`https`, only ports 80/443, private / loopback / link-local / reserved / CGNAT
+addresses are rejected, every redirect hop is re-validated, the resolved IP is pinned to the
+connection, and the response body is capped at 2 MB. Audit stores no query string and no URL —
+only the tool name, latency, result and a truncated IP hash.
+
+**Provider configuration (optional).** The reference implementation is standard library only.
+Set `RB_SERPER_KEY` for the primary search provider, and optionally `RB_TAVILY_KEY` /
+`RB_BRAVE_KEY` for the fallback chain (`cn.bing` RSS needs no key). Set
+`RB_TAVILY_DAILY_CREDITS` (default 15) to cap daily Tavily credits, and `RB_SERPER_DAILY_CALLS`
+(default 200) to cap Serper calls. With no provider key at all, `web_search` degrades to the
+zero-key `cn.bing` RSS feed and `web_fetch` still works for directly reachable pages.
+
 ## Beyond a generic reader
 
 Most MCP servers wrap a third-party API. These come from infrastructure we operate, which is why they are hard to find elsewhere:
@@ -187,7 +219,9 @@ Most MCP servers wrap a third-party API. These come from infrastructure we opera
             ├── XMR  : monerod JSON-RPC (node telemetry only)
             ├── ZEC  : Zebra RPC (valuePools → shielded-pool supply)
             ├── TRON : java-tron lite full node (tip state + a ~6 day window)
-            └── meta : gateway service aggregation
+            ├── meta : gateway service aggregation
+            └── web  : Serper / Tavily / Brave / cn.bing RSS search (optional keys),
+                       direct fetch + standard-library extraction, Tavily /extract fallback
 ```
 
 ## Privacy & limits
@@ -196,7 +230,10 @@ Most MCP servers wrap a third-party API. These come from infrastructure we opera
 - **120 req/min per IP**, one tier (`X-MCP-Plan` / `X-RateLimit-Limit` response headers). Paid access is x402 credit and does not raise the per-IP rate limit.
 - Audit stores only a **truncated SHA-256 of the client IP** — never query parameters.
 - **Read-only**: no trading, signing, custody, or write methods. BTC transactions are looked up with `txindex`.
-- Responses are trimmed to ~3.8 KB per call to protect LLM context.
+- Responses are trimmed to ~3.8 KB per call to protect LLM context; `web_fetch` is the
+  exception (12,000 characters) because its whole point is to return a page's text.
+- **Web tools** have an extra 20 req/min/IP limit on top of the 120/min/IP overall limit, and
+  their free allowance (20 searches + 50 fetches/day/IP) is tracked in separate buckets.
 
 ## Self-hosting (this repo)
 
@@ -217,6 +254,18 @@ export RB_HOME_BASE=http://127.0.0.1:8081                 # gateway aggregation:
 export RB_USAGE_DB=./usage.db                             # optional usage audit
 export RB_BILLING_DB=./billing.db                         # deprecated: API-key verification (no keys are issued since 2026-10-16)
 export RB_RISK_DB=./risk_quota.db                         # optional: daily risk-tool allowance bookkeeping
+export RB_WEB_CACHE_DB=./web_cache.db                     # optional: web result cache + web quota/spend tables
+# web tools: no key is required. Optional provider keys buy quality/reliability:
+export RB_SERPER_KEY=...                                  # primary search provider (best results)
+export RB_TAVILY_KEY=...                                  # fallback search + fetch-extract fallback
+export RB_BRAVE_KEY=...                                   # optional extra search fallback
+export RB_SERPER_DAILY_CALLS=200                          # optional: daily Serper call cap
+export RB_TAVILY_DAILY_CREDITS=15                         # optional: daily Tavily credit cap
+export RB_WEB_SEARCH_FREE=20 RB_WEB_FETCH_FREE=50         # optional: per-IP free web allowance
+export RB_WEB_SEARCH_GLOBAL=100 RB_WEB_FETCH_GLOBAL=200   # optional: site-wide free web caps
+export RB_WEB_DAILY_BUDGET_USD=5                          # optional: daily upstream spend breaker
+export RB_WEB_TRUNCATE=12000 RB_WEB_CACHE_MAX_MB=100      # optional: web_fetch cap / cache cap
+export RB_WEB_UA='RobotBaseMCP/0.14 (+https://robotbase.cc/mcp)'  # optional: crawler User-Agent
 # optional paid tier — see examples/x402.env.example for the full list
 export RB_X402_ENABLED=1
 export RB_X402_FACILITATOR_URL=https://facilitator.example

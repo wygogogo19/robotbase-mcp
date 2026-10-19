@@ -8,7 +8,8 @@ java-tron lite full node，只覆盖最近 65,536 块（约 6 天）与最新状
 对外说明边界。x402 支付（Base/Solana 上的 USDC）保留，但它只是收款通道，不提供这两条
 链的链上数据服务。
 """
-import base64, hashlib, html, ipaddress, json, os, re, socket, sqlite3, threading, time, urllib.error, urllib.parse, urllib.request
+import base64, hashlib, html, html.parser, ipaddress, json, os, re, socket, sqlite3, threading, time, urllib.error, urllib.parse, urllib.request
+import xml.etree.ElementTree as ET, zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import http.client
 
@@ -28,7 +29,7 @@ except Exception:            # noqa: BLE001
 PORT = int(os.environ.get("RB_PORT", "8090"))
 BIND = os.environ.get("RB_BIND", "127.0.0.1")
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "robotbase-mcp", "version": "0.12.6", "title": "RobotBase MCP — on-chain verification & risk intelligence for Web3 agents"}
+SERVER_INFO = {"name": "robotbase-mcp", "version": "0.13.0", "title": "RobotBase MCP — on-chain verification & risk intelligence for Web3 agents"}
 BTC_ENV = os.environ.get("RB_BTC_ENV", "")
 ZEC_BASE = os.environ.get("RB_ZEC_BASE", "http://127.0.0.1:8080")
 HOME_BASE = os.environ.get("RB_HOME_BASE", "http://127.0.0.1:8081")
@@ -2210,6 +2211,1304 @@ TOOLS = [    ("list_chains",
 ]
 
 
+# ============== 2026-10-19 M1：web_search + web_fetch（高频联网工具）==================
+# 工具契约与托管端点一致：搜索 provider 链 Serper（主选，条款明确允许增值分发）
+# → Tavily（备选，日 credit 上限默认 15）→ Brave（可选，很多网络不可达，3s 快速失败）
+# → cn.bing RSS（零 key 最后兜底）；抓取优先直连 + 标准库正文抽取，直连失败/被墙再走
+# Tavily /extract。边界：纯标准库、单文件、不新增常驻服务；既有 43 个工具的行为一行不改。
+# 计费：web 独立免费额度桶（search 20/天/IP、fetch 50/天/IP；全站 100/200），
+#       超出走既有 x402 402 流程；web_search / web_fetch 各 1 credit。
+WEB_TOOLS = ("web_search", "web_fetch")
+METERED_TOOLS = RISK_TOOLS + WEB_TOOLS
+
+
+def _env_int(name, default):
+    try:
+        return int(str(os.environ.get(name, "")).strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name, default):
+    try:
+        return float(str(os.environ.get(name, "")).strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
+TAVILY_KEY = os.environ.get("RB_TAVILY_KEY", "").strip()
+SERPER_KEY = os.environ.get("RB_SERPER_KEY", "").strip()      # 主通道（Serper）
+BRAVE_KEY = os.environ.get("RB_BRAVE_KEY", "").strip()        # 可选备选（很多网络不可达）
+TAVILY_SEARCH_URL = os.environ.get("RB_TAVILY_SEARCH_URL", "https://api.tavily.com/search")
+TAVILY_EXTRACT_URL = os.environ.get("RB_TAVILY_EXTRACT_URL", "https://api.tavily.com/extract")
+SERPER_SEARCH_URL = os.environ.get("RB_SERPER_SEARCH_URL", "https://google.serper.dev/search")
+BRAVE_SEARCH_URL = os.environ.get("RB_BRAVE_SEARCH_URL", "https://api.search.brave.com/res/v1/web/search")
+BING_RSS_URL = os.environ.get("RB_BING_RSS_URL", "https://cn.bing.com/search")
+WEB_SEARCH_FREE = _env_int("RB_WEB_SEARCH_FREE", 20)
+WEB_FETCH_FREE = _env_int("RB_WEB_FETCH_FREE", 50)
+WEB_SEARCH_GLOBAL = _env_int("RB_WEB_SEARCH_GLOBAL", 100)
+WEB_FETCH_GLOBAL = _env_int("RB_WEB_FETCH_GLOBAL", 200)
+TAVILY_DAILY_CREDITS = _env_int("RB_TAVILY_DAILY_CREDITS", 15)
+SERPER_DAILY_CALLS = _env_int("RB_SERPER_DAILY_CALLS", 200)
+WEB_DAILY_BUDGET_MICRO = int(_env_float("RB_WEB_DAILY_BUDGET_USD", 5.0) * 1_000_000)
+WEB_CACHE_DB = os.environ.get("RB_WEB_CACHE_DB", "./web_cache.db")
+WEB_SEARCH_TTL = _env_int("RB_WEB_SEARCH_TTL", 600)
+WEB_FETCH_TTL = _env_int("RB_WEB_FETCH_TTL", 1800)
+WEB_TRUNCATE = _env_int("RB_WEB_TRUNCATE", 12000)
+WEB_CACHE_MAX_MB = _env_int("RB_WEB_CACHE_MAX_MB", 100)
+WEB_UA = os.environ.get("RB_WEB_UA", "RobotBaseMCP/0.14 (+https://robotbase.cc/mcp)")
+WEB_RATE_PER_MIN = _env_int("RB_WEB_RATE_PER_MIN", 20)
+WEB_MAX_BYTES = 2 * 1024 * 1024          # 解压后正文上限 2 MB
+WEB_TIMEOUT_CONNECT = 5.0                # 建连上限
+WEB_TIMEOUT_TOTAL = 8.0                  # 直连单跳总预算（socket 级）
+WEB_MAX_REDIRECTS = 3
+WEB_SEARCH_MAX_BYTES = 3800              # web_search 结果 JSON 上限（<4KB）
+WEB_MIN_CONTENT = 200                    # 直连抽取少于 200 字 → 视为抽取失败，走 provider
+
+_WEB_TTLS = {"search": WEB_SEARCH_TTL, "fetch": WEB_FETCH_TTL}
+_WEB_SEM = threading.BoundedSemaphore(8)       # 上游并发上限
+_WEB_CTYPES = ("text/html", "application/xhtml+xml", "text/plain", "application/json",
+               "application/xml", "text/xml", "text/markdown")
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+
+
+class _WebFetchError(Exception):
+    """抓取管线的可读错误（code 是给客户端的稳定错误码）。"""
+
+    def __init__(self, code, detail=""):
+        super().__init__(code + ((": " + str(detail)) if detail else ""))
+        self.code = code
+        self.detail = str(detail)
+
+
+class WebRateLimited(Exception):
+    """web 工具专属限速（20 次/分/IP），与整体 120/min 限速相互独立。"""
+
+
+def _bj_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.gmtime(time.time() + 8 * 3600))
+
+
+# ---------------------------------------------------------------- 缓存 / 花费 / credit
+def init_web_db():
+    """建 web 缓存、每日花费、Tavily credit、Serper 日调用、robots 缓存五张表；权限 600。"""
+    try:
+        con = _db(WEB_CACHE_DB)
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS web_cache(
+            key TEXT PRIMARY KEY, ts REAL NOT NULL, payload TEXT NOT NULL,
+            bytes INTEGER NOT NULL DEFAULT 0);
+        CREATE INDEX IF NOT EXISTS idx_web_cache_ts ON web_cache(ts);
+        CREATE TABLE IF NOT EXISTS web_spend(
+            day TEXT NOT NULL, kind TEXT NOT NULL, calls INTEGER NOT NULL DEFAULT 0,
+            est_cost_micro_usd INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(day, kind));
+        CREATE TABLE IF NOT EXISTS tavily_credit(
+            day TEXT PRIMARY KEY, credits INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS serper_daily(
+            day TEXT PRIMARY KEY, calls INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS robots_cache(
+            host TEXT PRIMARY KEY, ts REAL NOT NULL, rules TEXT NOT NULL);
+        """)
+        con.commit()
+        con.close()
+    except Exception as exc:  # noqa: BLE001
+        print("[web] cache db init failed: %s" % exc, flush=True)
+        return
+    try:
+        os.chmod(WEB_CACHE_DB, 0o600)
+    except OSError:
+        pass
+
+
+def _web_cache_get(kind, key):
+    try:
+        con = _db(WEB_CACHE_DB)
+        row = con.execute("SELECT ts,payload FROM web_cache WHERE key=?", (key,)).fetchone()
+        con.close()
+        if row and (time.time() - float(row["ts"])) < _WEB_TTLS[kind]:
+            return json.loads(row["payload"])
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _web_cache_put(kind, key, payload):
+    """只缓存成功结果；按 ts LRU 淘汰，整体控制在 WEB_CACHE_MAX_MB 内。"""
+    try:
+        raw = json.dumps(payload, ensure_ascii=False)
+        con = _db(WEB_CACHE_DB)
+        con.execute("INSERT INTO web_cache(key,ts,payload,bytes) VALUES(?,?,?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET ts=excluded.ts,payload=excluded.payload,"
+                    "bytes=excluded.bytes", (key, time.time(), raw, len(raw.encode())))
+        total = con.execute("SELECT COALESCE(SUM(bytes),0) s FROM web_cache").fetchone()["s"]
+        cap = WEB_CACHE_MAX_MB * 1024 * 1024
+        if total > cap:
+            target = int(cap * 0.9)
+            for r in con.execute("SELECT key,bytes FROM web_cache ORDER BY ts ASC").fetchall():
+                if total <= target:
+                    break
+                con.execute("DELETE FROM web_cache WHERE key=?", (r["key"],))
+                total -= int(r["bytes"] or 0)
+        con.commit()
+        con.close()
+    except Exception as exc:  # noqa: BLE001
+        print("[web] cache write failed: %s" % exc, flush=True)
+
+
+def _web_spend_add(kind, calls=1, est_micro=0):
+    try:
+        con = _db(WEB_CACHE_DB)
+        con.execute("INSERT INTO web_spend(day,kind,calls,est_cost_micro_usd) VALUES(?,?,?,?) "
+                    "ON CONFLICT(day,kind) DO UPDATE SET calls=calls+excluded.calls, "
+                    "est_cost_micro_usd=est_cost_micro_usd+excluded.est_cost_micro_usd",
+                    (_bj_day(), kind, int(calls), int(est_micro)))
+        con.commit()
+        con.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _web_budget_ok():
+    """每日上游花费熔断（RB_WEB_DAILY_BUDGET_USD，默认 5 USD）。"""
+    try:
+        con = _db(WEB_CACHE_DB)
+        row = con.execute("SELECT COALESCE(SUM(est_cost_micro_usd),0) s FROM web_spend WHERE day=?",
+                          (_bj_day(),)).fetchone()
+        con.close()
+        return int(row["s"] or 0) < WEB_DAILY_BUDGET_MICRO
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _tavily_credit_used():
+    try:
+        con = _db(WEB_CACHE_DB)
+        row = con.execute("SELECT credits FROM tavily_credit WHERE day=?", (_bj_day(),)).fetchone()
+        con.close()
+        return int(row["credits"] or 0) if row else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _tavily_credit_take(n=1):
+    """预占 Tavily credit（原子读改写）；超日上限返回 False（search 降级、fetch 报错）。"""
+    if n <= 0:
+        return True
+    try:
+        con = _db(WEB_CACHE_DB)
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT credits FROM tavily_credit WHERE day=?", (_bj_day(),)).fetchone()
+        used = int(row["credits"] or 0) if row else 0
+        if used + n > TAVILY_DAILY_CREDITS:
+            con.rollback()
+            con.close()
+            return False
+        con.execute("INSERT INTO tavily_credit(day,credits) VALUES(?,?) "
+                    "ON CONFLICT(day) DO UPDATE SET credits=credits+?", (_bj_day(), n, n))
+        con.commit()
+        con.close()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _tavily_credit_refund(n=1):
+    try:
+        con = _db(WEB_CACHE_DB)
+        con.execute("UPDATE tavily_credit SET credits=MAX(0,credits-?) WHERE day=?",
+                    (int(n), _bj_day()))
+        con.commit()
+        con.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _serper_daily_used():
+    try:
+        con = _db(WEB_CACHE_DB)
+        row = con.execute("SELECT calls FROM serper_daily WHERE day=?", (_bj_day(),)).fetchone()
+        con.close()
+        return int(row["calls"] or 0) if row else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _serper_daily_take():
+    """预占一次 Serper 日调用额度（RB_SERPER_DAILY_CALLS，默认 200/天）。"""
+    try:
+        con = _db(WEB_CACHE_DB)
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT calls FROM serper_daily WHERE day=?", (_bj_day(),)).fetchone()
+        used = int(row["calls"] or 0) if row else 0
+        if used >= SERPER_DAILY_CALLS:
+            con.rollback()
+            con.close()
+            return False
+        con.execute("INSERT INTO serper_daily(day,calls) VALUES(?,1) "
+                    "ON CONFLICT(day) DO UPDATE SET calls=calls+1", (_bj_day(),))
+        con.commit()
+        con.close()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# ---------------------------------------------------------------- 独立免费额度桶
+def _web_quota_cfg(name):
+    if name == "web_search":
+        return "ws", WEB_SEARCH_FREE, "__global_web_search__", WEB_SEARCH_GLOBAL
+    return "wf", WEB_FETCH_FREE, "__global_web_fetch__", WEB_FETCH_GLOBAL
+
+
+def _web_quota(name, consume=False):
+    """返回 (allowed, used, limit)。web 桶与风控的 5 次/天桶完全独立。"""
+    prefix, limit, gkey, glimit = _web_quota_cfg(name)
+    h = prefix + ":" + hashlib.sha256(_quota_subject().encode()).hexdigest()[:16]
+    d = _bj_day()
+    con = _db(RISK_DB)
+    try:
+        row = con.execute("SELECT used FROM risk_quota WHERE day=? AND ip_hash=?", (d, h)).fetchone()
+        used = int(row["used"]) if row else 0
+        g = con.execute("SELECT used FROM risk_quota WHERE day=? AND ip_hash=?", (d, gkey)).fetchone()
+        gused = int(g["used"]) if g else 0
+        if gused >= glimit:
+            return False, max(used, limit), limit
+        if not consume:
+            return used < limit, used, limit
+        if used >= limit:
+            return False, used, limit
+        con.execute("INSERT INTO risk_quota(day,ip_hash,used) VALUES(?,?,1) "
+                    "ON CONFLICT(day,ip_hash) DO UPDATE SET used=used+1", (d, h))
+        con.execute("INSERT INTO risk_quota(day,ip_hash,used) VALUES(?,?,1) "
+                    "ON CONFLICT(day,ip_hash) DO UPDATE SET used=used+1", (d, gkey))
+        con.commit()
+        return True, used + 1, limit
+    finally:
+        con.close()
+
+
+def _web_gate(name):
+    """web 工具门禁（只查不扣）：花费熔断 / 免费额度用尽 → 走既有 402 流程。"""
+    if not _web_budget_ok():
+        raise PaymentRequired(
+            "Payment Required. The site-wide daily budget for web tools is used up (Beijing time, "
+            "resets 00:00 Asia/Shanghai). Paid calls still work with an x402 payment payload in "
+            "params._meta[\"x402/payment\"]; there is no API key.")
+    ok, used, limit = _web_quota(name, False)
+    if not ok:
+        raise PaymentRequired(
+            "Payment Required. The free web allowance for %s is %d calls/day per IP and is used up "
+            "for today (Beijing time, resets 00:00 Asia/Shanghai). This bucket is separate from the "
+            "risk-tool allowance. Pay in USDC with x402: read accepts[] from structuredContent, "
+            "sign one EIP-3009 authorization, and retry this same call with it in "
+            "params._meta[\"x402/payment\"]. There is no API key." % (name, limit))
+    return _meter_payload(used, limit, pending=True)
+
+
+_web_rl, _web_rl_lock = {}, threading.Lock()
+
+
+def _web_rate_ok():
+    ip = _quota_subject() or "unknown"
+    now = time.time()
+    with _web_rl_lock:
+        win = _web_rl.setdefault(ip, [])
+        win[:] = [t for t in win if now - t < 60]
+        if len(win) >= WEB_RATE_PER_MIN:
+            return False
+        win.append(now)
+    return True
+
+
+def _call_web_tool(name, fn, args):
+    """web 工具的免费档执行：额度门禁 → web 专属限速 → 执行 → 计费。"""
+    gate = _web_gate(name)
+    tier = gate.get("free_tier") or {}
+    used_before, limit = int(tier.get("used_today", 0)), int(tier.get("limit_per_day", -1))
+    if not _web_rate_ok():
+        raise WebRateLimited("web tools are limited to %d calls/min per IP; retry after 60s"
+                             % WEB_RATE_PER_MIN)
+    out = fn(args or {})
+    no_charge = isinstance(out, dict) and bool(out.pop("_no_charge", False))
+    if limit < 0:
+        meter = _meter_payload(0, -1)
+    elif no_charge:
+        meter = _meter_payload(used_before, limit, pending=True, charged=False)
+    else:
+        ok, used, _l = _web_quota(name, True)
+        meter = _meter_payload(used if ok else used_before + 1, limit)
+        meter["free_tier"]["charged_this_call"] = True
+    if isinstance(out, dict):
+        out["_metering"] = meter
+    else:
+        out = {"result": out, "_metering": meter}
+    return out
+
+
+# ---------------------------------------------------------------- SSRF 硬防护
+def _ip_public(ip):
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
+            or ip.is_reserved or ip.is_unspecified):
+        return False
+    if ip.version == 4 and ip in _CGNAT:
+        return False
+    return bool(ip.is_global)
+
+
+def _safe_url(u):
+    """连接前校验 + 全部 A/AAAA 解析校验；失败一律 _WebFetchError('invalid_url')。"""
+    if not u or len(u) > 2048:
+        raise _WebFetchError("invalid_url", "length")
+    try:
+        p = urllib.parse.urlsplit(u)
+    except ValueError:
+        raise _WebFetchError("invalid_url", "parse")
+    if p.scheme not in ("http", "https"):
+        raise _WebFetchError("invalid_url", "scheme")
+    if p.username or p.password:
+        raise _WebFetchError("invalid_url", "userinfo")
+    host = (p.hostname or "").strip().rstrip(".")
+    if not host:
+        raise _WebFetchError("invalid_url", "host")
+    hl = host.lower()
+    if (hl == "localhost" or hl.endswith(".localhost") or hl.endswith(".local")
+            or hl.endswith(".internal") or hl.endswith(".onion")):
+        raise _WebFetchError("invalid_url", "host blocklist")
+    try:
+        port = p.port or (443 if p.scheme == "https" else 80)
+    except ValueError:
+        raise _WebFetchError("invalid_url", "port")
+    if port not in (80, 443):
+        raise _WebFetchError("invalid_url", "port")
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError:
+        raise _WebFetchError("invalid_url", "dns")
+    # 只保留公网地址：DNS 污染/轮换场景里常混入私网或保留地址（例如被污染的
+    # en.wikipedia.org 会返回 2001::1），过滤掉它们但仍然只连接公网 IP；
+    # 若一个公网地址都没有（loopback / private / link-local / 未指定地址），则硬拒绝。
+    ips = []
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(str(info[4][0]).split("%")[0])
+        except ValueError:
+            continue
+        if _ip_public(ip):
+            ips.append(str(ip))
+    if not ips:
+        raise _WebFetchError("invalid_url", "non-public address")
+    return p, ips
+
+
+def _decode_body(raw, ctype):
+    m = re.search(r"charset=([\w\-]+)", ctype or "", re.I)
+    enc = m.group(1) if m else "utf-8"
+    try:
+        return raw.decode(enc, errors="replace")
+    except LookupError:
+        return raw.decode("utf-8", errors="replace")
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """把 DNS 解析结果钉在连接层，避免解析后重绑定（HTTP）。"""
+
+    def __init__(self, host, port, ip, timeout=WEB_TIMEOUT_TOTAL):
+        super().__init__(host, port, timeout=timeout)
+        self._pin_ip = ip
+        self._create_connection = self._pinned_create
+
+    def _pinned_create(self, address, timeout=None, source_address=None):
+        sock = socket.create_connection((self._pin_ip, self.port), WEB_TIMEOUT_CONNECT, source_address)
+        sock.settimeout(WEB_TIMEOUT_TOTAL)
+        return sock
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """同上，HTTPS 仍用真实 host 做 SNI / 证书校验（只把 TCP 目标钉到 IP）。"""
+
+    def __init__(self, host, port, ip, timeout=WEB_TIMEOUT_TOTAL):
+        super().__init__(host, port, timeout=timeout)
+        self._pin_ip = ip
+        self._create_connection = self._pinned_create
+
+    def _pinned_create(self, address, timeout=None, source_address=None):
+        sock = socket.create_connection((self._pin_ip, self.port), WEB_TIMEOUT_CONNECT, source_address)
+        sock.settimeout(WEB_TIMEOUT_TOTAL)
+        return sock
+
+
+def _direct_http_get(u, max_bytes=WEB_MAX_BYTES, allow_any_ctype=False):
+    """直连 GET：逐跳 SSRF 校验、最多 3 跳重定向、gzip 解压后 ≤2 MB。"""
+    current = u
+    for _hop in range(WEB_MAX_REDIRECTS + 1):
+        p, ips = _safe_url(current)
+        host = p.hostname
+        port = p.port or (443 if p.scheme == "https" else 80)
+        path = p.path or "/"
+        if p.query:
+            path += "?" + p.query
+        headers = {"User-Agent": WEB_UA,
+                   "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                              "text/plain;q=0.8,text/markdown;q=0.7"),
+                   "Accept-Encoding": "gzip",
+                   "Accept-Language": "en-US,en;q=0.8,zh-CN;q=0.6"}
+        cls = _PinnedHTTPSConnection if p.scheme == "https" else _PinnedHTTPConnection
+        conn = cls(host, port, ips[0])
+        try:
+            conn.request("GET", path, headers=headers)
+            resp = conn.getresponse()
+            status = resp.status
+            if status in (301, 302, 303, 307, 308):
+                loc = resp.getheader("Location")
+                if not loc:
+                    raise _WebFetchError("fetch_failed", "redirect without location")
+                current = urllib.parse.urljoin(current, loc)
+                continue
+            ctype = (resp.getheader("Content-Type") or "").split(";")[0].strip().lower()
+            if status >= 400:
+                raise _WebFetchError(
+                    "blocked_by_site" if status in (401, 403, 429) else "fetch_failed",
+                    "HTTP %d" % status)
+            if ctype and not allow_any_ctype and not any(ctype.startswith(x) for x in _WEB_CTYPES):
+                raise _WebFetchError("unsupported_content_type", ctype)
+            raw = resp.read(max_bytes + 1)
+            if (resp.getheader("Content-Encoding") or "").lower() == "gzip" and raw:
+                try:
+                    raw = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(raw, max_bytes + 1)
+                except zlib.error:
+                    raw = b""
+            if len(raw) > max_bytes:
+                raise _WebFetchError("too_large", "body")
+            return {"final_url": current, "status": status, "content_type": ctype,
+                    "body": _decode_body(raw, ctype)}
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+    raise _WebFetchError("too_many_redirects", "")
+
+
+# ---------------------------------------------------------------- robots.txt
+_ROBOTS_TTL = 3600
+_ROBOTS_MEM, _ROBOTS_LOCK = {}, threading.Lock()
+
+
+def _robots_match(pattern, path):
+    if not pattern:
+        return False
+    anchor = pattern.endswith("$")
+    core = pattern[:-1] if anchor else pattern
+    rx = re.escape(core).replace(r"\*", ".*")
+    if anchor:
+        rx += "$"
+    try:
+        return re.match(rx, path) is not None
+    except re.error:
+        return False
+
+
+def _parse_robots(text):
+    groups, agents, rules = [], [], []
+
+    def _close():
+        if agents:
+            groups.append((list(agents), list(rules)))
+
+    for line in (text or "").splitlines():
+        s = line.split("#", 1)[0].strip()
+        if ":" not in s:
+            continue
+        k, v = s.split(":", 1)
+        k, v = k.strip().lower(), v.strip()
+        if k == "user-agent":
+            if rules:
+                _close()
+                agents, rules = [], []
+            agents.append(v.lower())
+        elif k in ("allow", "disallow") and agents:
+            rules.append((k, v))
+    _close()
+    for target in ("robotbasemcp", "robotbase", "*"):
+        for ags, rs in groups:
+            if target in ags:
+                return rs
+    return []
+
+
+def _robots_fetch(origin):
+    try:
+        d = _direct_http_get(origin + "/robots.txt", max_bytes=512 * 1024, allow_any_ctype=True)
+    except _WebFetchError as exc:
+        if exc.code == "blocked_by_site":
+            return [("disallow", "/")]      # 401/403 视为全站禁止（RFC 9309）
+        return []
+    except Exception:  # noqa: BLE001
+        return []
+    return _parse_robots(d.get("body") or "")
+
+
+def _robots_rules(origin):
+    now = time.time()
+    with _ROBOTS_LOCK:
+        hit = _ROBOTS_MEM.get(origin)
+        if hit and now - hit[0] < _ROBOTS_TTL:
+            return hit[1]
+    rules = None
+    try:
+        con = _db(WEB_CACHE_DB)
+        row = con.execute("SELECT ts,rules FROM robots_cache WHERE host=?", (origin,)).fetchone()
+        con.close()
+        if row and now - float(row["ts"]) < _ROBOTS_TTL:
+            rules = json.loads(row["rules"])
+    except Exception:  # noqa: BLE001
+        rules = None
+    if rules is None:
+        rules = _robots_fetch(origin)
+        try:
+            con = _db(WEB_CACHE_DB)
+            con.execute("INSERT INTO robots_cache(host,ts,rules) VALUES(?,?,?) "
+                        "ON CONFLICT(host) DO UPDATE SET ts=excluded.ts,rules=excluded.rules",
+                        (origin, now, json.dumps(rules)))
+            con.commit()
+            con.close()
+        except Exception:  # noqa: BLE001
+            pass
+    with _ROBOTS_LOCK:
+        _ROBOTS_MEM[origin] = (now, rules)
+        if len(_ROBOTS_MEM) > 256:
+            for k in sorted(_ROBOTS_MEM, key=lambda k: _ROBOTS_MEM[k][0])[:64]:
+                _ROBOTS_MEM.pop(k, None)
+    return rules
+
+
+def _robots_allowed(u):
+    p = urllib.parse.urlsplit(u)
+    origin = "%s://%s" % (p.scheme, p.netloc)
+    rules = _robots_rules(origin)
+    if not rules:
+        return True
+    path = p.path or "/"
+    if p.query:
+        path += "?" + p.query
+    best, best_len = None, -1
+    for kind, pat in rules:
+        if pat and _robots_match(pat, path):
+            score = len(pat)
+            if score > best_len:
+                best, best_len = kind, score
+    return best != "disallow"
+
+
+# ---------------------------------------------------------------- 正文抽取（纯标准库）
+class _TextExtractor(html.parser.HTMLParser):
+    SKIP = {"script", "style", "noscript", "nav", "header", "footer", "aside", "form",
+            "iframe", "svg", "canvas", "template", "button", "select", "input", "textarea",
+            "dialog", "menu", "figure"}
+    # 空元素（HTML 里没有结束标签）：绝不能在 skip 计数器上留残余，否则整页文本都会被吞掉
+    VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+            "param", "source", "track", "wbr"}
+    BLOCKS = {"p", "div", "section", "article", "main", "ul", "ol", "table", "tbody",
+              "thead", "tr", "blockquote", "figcaption", "dt", "dd", "li"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.skip = 0
+        self.in_title = False
+        self.title = []
+        self.buf = []
+        self.blocks = []
+        self.prefix = ""
+        self.pre = False
+        self.pre_buf = []
+        self.link = None
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag == "title":
+            self.in_title = True
+            return
+        if tag in self.SKIP:
+            if tag not in self.VOID:
+                self.skip += 1
+            return
+        if self.skip:
+            return
+        if tag == "pre":
+            self._flush()
+            self.pre, self.pre_buf = True, []
+            return
+        if tag in ("h1", "h2", "h3"):
+            self._flush()
+            self.prefix = "#" * int(tag[1]) + " "
+            return
+        if tag == "li":
+            self._flush()
+            self.prefix = "- "
+            return
+        if tag == "br":
+            self.buf.append(" ")
+            return
+        if tag == "a":
+            href = dict(attrs).get("href") or ""
+            if isinstance(href, str) and href.startswith(("http://", "https://")) and len(href) <= 500:
+                self.link = (href, len(self.buf))
+            return
+        if tag in self.BLOCKS:
+            self._flush()
+
+    def handle_startendtag(self, tag, attrs):
+        """自闭合标签（<input/>、<svg/>…）不能走 start+end 配对的 skip 计数。"""
+        tag = tag.lower()
+        if tag == "br":
+            self.buf.append(" ")
+            return
+        if tag in self.SKIP:
+            return
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag == "title":
+            self.in_title = False
+            return
+        if tag in self.SKIP:
+            if self.skip:
+                self.skip -= 1
+            return
+        if self.skip:
+            return
+        if tag == "pre":
+            self._flush_pre()
+            return
+        if tag == "a" and self.link:
+            href, start = self.link
+            self.link = None
+            label = "".join(self.buf[start:]).strip()
+            if 0 < len(label) <= 100:
+                self.buf[start:] = ["[%s](%s)" % (label, href)]
+            return
+        if tag in self.BLOCKS:
+            self._flush()
+
+    def handle_data(self, data):
+        if self.in_title:
+            self.title.append(data)
+        elif self.skip:
+            return
+        elif self.pre:
+            self.pre_buf.append(data)
+        else:
+            self.buf.append(data)
+
+    def _flush(self):
+        txt = " ".join(("".join(self.buf)).split())
+        self.buf = []
+        if txt:
+            self.blocks.append((self.prefix + txt) if self.prefix else txt)
+        self.prefix = ""
+
+    def _flush_pre(self):
+        txt = "\n".join(l.rstrip() for l in "".join(self.pre_buf).splitlines()).strip("\n")
+        self.pre, self.pre_buf = False, []
+        if txt.strip():
+            self.blocks.append("```\n" + txt + "\n```")
+
+
+def _strip_tags_fallback(raw):
+    """兜底：解析器因畸形 HTML 拿不到正文时，用正则粗提文本（宁可粗糙也不能空）。"""
+    s = re.sub(r"(?is)<(script|style|noscript|svg|template|nav|header|footer|aside|form|iframe)"
+               r"\b.*?</\1\s*>", " ", raw or "")
+    s = re.sub(r"(?is)<[^>]+>", "\n", s)
+    s = html.unescape(s)
+    lines = [" ".join(l.split()) for l in s.splitlines()]
+    return "\n\n".join(l for l in lines if l)
+
+
+def _html_to_text(raw):
+    p = _TextExtractor()
+    try:
+        p.feed(raw or "")
+        p.close()
+    except Exception:  # noqa: BLE001
+        pass
+    p._flush()
+    title = html.unescape("".join(p.title)).strip()
+    content = "\n\n".join(b for b in p.blocks if b.strip())
+    content = re.sub(r"\n{3,}", "\n\n", content).strip()
+    if len(content) < 50:
+        fallback = _strip_tags_fallback(raw)
+        if len(fallback) > len(content):
+            content = fallback[:200000]
+    return title, content
+
+
+def _markdown_to_text(md):
+    s = re.sub(r"```[^\n]*\n?", "", md or "")
+    s = re.sub(r"^#{1,6}\s*", "", s, flags=re.M)
+    s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
+    s = re.sub(r"^\s*[-*]\s+", "", s, flags=re.M)
+    return re.sub(r"\n{3,}", "\n\n", s).strip()
+
+
+def _clean_provider_text(s):
+    s = (s or "").replace("\r\n", "\n").replace("\r", "\n")
+    s = "\n".join(l.rstrip() for l in s.split("\n"))
+    return re.sub(r"\n{3,}", "\n\n", s).strip()
+
+
+# ---------------------------------------------------------------- 搜索后端
+def _http_json_auth(url, payload, key, timeout, headers=None):
+    h = {"Content-Type": "application/json", "User-Agent": WEB_UA}
+    if headers:
+        h.update(headers)
+    elif key:
+        h["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST", headers=h)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode(errors="replace") or "{}")
+
+
+def _tavily_search(query, count, freshness, site, lang):
+    if not TAVILY_KEY:
+        raise RuntimeError("tavily_not_configured")
+    if not _tavily_credit_take(1):
+        raise RuntimeError("tavily_daily_credit_exhausted")
+    body = {"query": query, "search_depth": "basic",
+            "max_results": max(1, min(10, count)),
+            "include_answer": False, "include_raw_content": False}
+    if site:
+        body["include_domains"] = [site]
+    if freshness in ("day", "week", "month", "year"):
+        body["time_range"] = freshness
+    ok = False
+    try:
+        data = _http_json_auth(TAVILY_SEARCH_URL, body, TAVILY_KEY, timeout=12)
+        ok = True
+    finally:
+        if not ok:
+            _tavily_credit_refund(1)
+    _web_spend_add("search", 1, 6000)          # ≈$0.006/次（basic search）
+    results = []
+    for it in (data.get("results") or []):
+        url = str(it.get("url") or "").strip()
+        if not url:
+            continue
+        results.append({"title": str(it.get("title") or "").strip()[:200],
+                        "url": url,
+                        "snippet": str(it.get("content") or "").strip()[:500],
+                        "published": it.get("published_date") or None})
+    if not results:
+        raise RuntimeError("tavily_empty")
+    return results
+
+
+def _serper_search(query, count, freshness, site, lang):
+    """主通道：Serper（SERP 数据 B2B 服务，ToS 明确允许增值分发；与 Google 无关）。
+
+    契约：POST https://google.serper.dev/search，X-API-KEY 头，num 硬性 ≤10，
+    超时 5s，失败不重试（每次重试都多付一次且拉高延迟）；日调用上限 RB_SERPER_DAILY_CALLS。
+    """
+    if not SERPER_KEY:
+        raise RuntimeError("serper_not_configured")
+    if not _serper_daily_take():
+        raise RuntimeError("serper_daily_call_cap")
+    q = query + ((" site:" + site) if site else "")
+    body = {"q": q, "num": max(1, min(10, count))}
+    if lang:
+        body["hl"] = lang
+    if freshness in ("day", "week", "month", "year"):
+        body["tbs"] = {"day": "qdr:d", "week": "qdr:w", "month": "qdr:m", "year": "qdr:y"}[freshness]
+    data = _http_json_auth(SERPER_SEARCH_URL, body, SERPER_KEY, timeout=5,
+                           headers={"X-API-KEY": SERPER_KEY})
+    _web_spend_add("search", 1, 400)           # ≈$0.0004/次
+    results = []
+    for it in (data.get("organic") or []):
+        url = str(it.get("link") or "").strip()
+        if not url:
+            continue
+        results.append({"title": str(it.get("title") or "").strip()[:200], "url": url,
+                        "snippet": str(it.get("snippet") or "").strip()[:500],
+                        "published": it.get("date") or None})
+    if not results:
+        raise RuntimeError("serper_empty")
+    return results
+
+
+def _brave_search(query, count, freshness, site, lang):
+    """备选：Brave Search API。很多网络（包括本项目的落地环境）到
+    api.search.brave.com 不可达，所以超时固定 3s：失败必须快、被跳过，不能拖慢
+    整条搜索链路。"""
+    if not BRAVE_KEY:
+        raise RuntimeError("brave_not_configured")
+    params = {"q": query + ((" site:" + site) if site else ""),
+              "count": str(max(1, min(10, count)))}
+    if lang:
+        params["search_lang"] = lang
+    if freshness in ("day", "week", "month", "year"):
+        params["freshness"] = {"day": "pd", "week": "pw", "month": "pm", "year": "py"}[freshness]
+    url = BRAVE_SEARCH_URL + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"X-Subscription-Token": BRAVE_KEY,
+                                               "Accept": "application/json",
+                                               "User-Agent": WEB_UA})
+    with urllib.request.urlopen(req, timeout=3) as r:
+        data = json.loads(r.read(2 * 1024 * 1024).decode(errors="replace") or "{}")
+    results = []
+    for it in (((data.get("web") or {}).get("results")) or []):
+        u = str(it.get("url") or "").strip()
+        if not u:
+            continue
+        results.append({"title": str(it.get("title") or "").strip()[:200], "url": u,
+                        "snippet": str(it.get("description") or "").strip()[:500],
+                        "published": it.get("page_age") or None})
+    if not results:
+        raise RuntimeError("brave_empty")
+    _web_spend_add("search", 1, 0)
+    return results
+
+
+def _bing_rss_search(query, count, freshness, site, lang):
+    q = query + ((" site:" + site) if site else "")
+    params = {"q": q, "format": "rss", "count": str(max(10, count))}
+    if lang:
+        params["setlang"] = lang
+    url = BING_RSS_URL + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": WEB_UA,
+                                               "Accept": "application/rss+xml, application/xml, text/xml"})
+    with urllib.request.urlopen(req, timeout=8) as r:
+        raw = r.read(2 * 1024 * 1024)
+    root = ET.fromstring(raw)
+    results = []
+    for it in root.findall(".//item"):
+        link = (it.findtext("link") or "").strip()
+        title = (it.findtext("title") or "").strip()
+        desc = it.findtext("description") or ""
+        desc = html.unescape(re.sub(r"<[^>]+>", " ", desc))
+        desc = " ".join(desc.split())
+        pub = (it.findtext("pubDate") or "").strip() or None
+        if link:
+            results.append({"title": title[:200], "url": link,
+                            "snippet": desc[:500], "published": pub})
+    if not results:
+        raise RuntimeError("bing_empty")
+    # 兜底通道按验收口径返回 7–10 条（bing RSS 本身通常给 10 条）；不按 count 再切
+    return results[:10]
+
+
+def _normalize_results(results):
+    seen, out = set(), []
+    for r in results:
+        u = (r.get("url") or "").strip()
+        if not u.startswith(("http://", "https://")) or u in seen:
+            continue
+        seen.add(u)
+        out.append(r)
+    n = len(out)
+    if n >= 4:
+        domains = {}
+        for r in out:
+            try:
+                dom = (urllib.parse.urlsplit(r["url"]).hostname or "").lower()
+            except ValueError:
+                dom = ""
+            domains[dom] = domains.get(dom, 0) + 1
+        top, cnt = max(domains.items(), key=lambda kv: kv[1])
+        if cnt > max(2, int(n * 0.4)):
+            keep, c, deduped = max(2, int(n * 0.4)), 0, []
+            for r in out:
+                try:
+                    dom = (urllib.parse.urlsplit(r["url"]).hostname or "").lower()
+                except ValueError:
+                    dom = ""
+                if dom == top:
+                    c += 1
+                    if c > keep:
+                        continue
+                deduped.append(r)
+            out = deduped
+    return out
+
+
+def _cap_search_payload(payload, limit=WEB_SEARCH_MAX_BYTES):
+    raw = json.dumps(payload, ensure_ascii=False)
+    if len(raw) <= limit:
+        return payload
+    results = payload.get("results") or []
+    for cap in (300, 220, 160, 120, 80, 40, 0):
+        for r in results:
+            r["snippet"] = (r.get("snippet") or "")[:cap]
+        raw = json.dumps(payload, ensure_ascii=False)
+        if len(raw) <= limit:
+            payload["truncated"] = True
+            return payload
+    payload["truncated"] = True
+    payload["results"] = results[:max(1, len(results) // 2)]
+    return payload
+
+
+def _search_key(query, count, freshness, site, lang):
+    raw = json.dumps([query, count, freshness, site, lang], ensure_ascii=False, sort_keys=True)
+    return "s:" + hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _search_error(q, code, message=""):
+    out = {"query": q[:200], "count": 0, "results": [], "provider": None,
+           "cached": False, "truncated": False, "error": code}
+    if message:
+        out["message"] = message
+    out["_no_charge"] = True
+    return out
+
+
+def t_web_search(query=None, count=5, freshness=None, site=None, lang=None):
+    """web_search 工具体：缓存 → Tavily（主）→ cn.bing RSS（兜底）。"""
+    started = time.time()
+    q = " ".join(str(query or "").split())[:200]
+    if not q:
+        return _search_error(q, "query_required", "query must be a non-empty string (1-200 chars)")
+    try:
+        c = max(1, min(10, int(count)))
+    except (TypeError, ValueError):
+        c = 5
+    fr = str(freshness or "").strip().lower()
+    fr = fr if fr in ("day", "week", "month", "year") else None
+    st = str(site or "").strip().lower()
+    if st:
+        st = re.sub(r"^[a-z]+://", "", st).split("/")[0].split("?")[0]
+        if not re.fullmatch(r"[a-z0-9][a-z0-9.\-]{1,250}\.[a-z]{2,}", st):
+            return _search_error(q, "invalid_site", "site must be a bare domain like github.com")
+    lg = re.sub(r"[^a-z0-9\-]", "", str(lang or "").strip().lower())[:20] or None
+    key = _search_key(q, c, fr, st, lg)
+    cached = _web_cache_get("search", key)
+    if cached is not None:
+        out = dict(cached)
+        out["cached"] = True
+        out["took_ms"] = int((time.time() - started) * 1000)
+        return out
+    # 主选 Serper → Tavily（日 15 credits 上限）→ Brave（3s 快速跳过）→ cn.bing RSS 兜底
+    provider, results, errs = None, None, []
+    if SERPER_KEY and _serper_daily_used() < SERPER_DAILY_CALLS:
+        try:
+            results = _serper_search(q, c, fr, st, lg)
+            provider = "serper"
+        except Exception as exc:  # noqa: BLE001
+            errs.append("serper:%s" % type(exc).__name__)
+    if results is None and TAVILY_KEY and _tavily_credit_used() < TAVILY_DAILY_CREDITS:
+        try:
+            results = _tavily_search(q, c, fr, st, lg)
+            provider = "tavily"
+        except Exception as exc:  # noqa: BLE001
+            errs.append("tavily:%s" % type(exc).__name__)
+    if results is None and BRAVE_KEY:
+        try:
+            results = _brave_search(q, c, fr, st, lg)
+            provider = "brave"
+        except Exception as exc:  # noqa: BLE001
+            errs.append("brave:%s" % type(exc).__name__)
+    if results is None:
+        try:
+            results = _bing_rss_search(q, c, fr, st, lg)
+            provider = "bing_rss"
+            _web_spend_add("search", 1, 0)
+        except Exception as exc:  # noqa: BLE001
+            errs.append("bing_rss:%s" % type(exc).__name__)
+    if results is None:
+        return _search_error(q, "search_failed",
+                             "all search providers failed (%s); try again later" % ", ".join(errs))
+    out = {"query": q, "count": 0, "results": _normalize_results(results),
+           "provider": provider, "cached": False, "truncated": False,
+           "took_ms": int((time.time() - started) * 1000)}
+    out["count"] = len(out["results"])
+    out = _cap_search_payload(out)
+    if out["results"]:
+        _web_cache_put("search", key, out)
+    return out
+
+
+# ---------------------------------------------------------------- 抓取管线
+def _url_domain(u):
+    try:
+        p = urllib.parse.urlsplit(u if "://" in (u or "") else "http://" + (u or ""))
+        return (p.hostname or "")[:200]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _fetch_error(u, code, message=""):
+    dom = _url_domain(u)
+    out = {"url": dom, "final_url": dom, "status": 0, "title": "", "content": "",
+           "chars": 0, "truncated": False, "fetched_at": _bj_iso(), "source": None,
+           "cached": False, "error": code}
+    if message:
+        out["message"] = message
+    out["_no_charge"] = True
+    return out
+
+
+def _fetch_key(u):
+    p = urllib.parse.urlsplit(u)
+    netloc = (p.hostname or "").lower()
+    if p.port and p.port not in (80, 443):
+        netloc += ":%d" % p.port
+    norm = "%s://%s%s" % (p.scheme.lower(), netloc, p.path or "/")
+    if p.query:
+        norm += "?" + p.query
+    return "f:" + hashlib.sha256(norm.encode()).hexdigest()
+
+
+def _tavily_extract(u):
+    if not TAVILY_KEY:
+        raise RuntimeError("tavily_not_configured")
+    if not _tavily_credit_take(1):
+        raise RuntimeError("tavily_daily_credit_exhausted")
+    ok = False
+    try:
+        data = _http_json_auth(TAVILY_EXTRACT_URL,
+                               {"urls": [u], "extract_depth": "basic"}, TAVILY_KEY, timeout=25)
+        ok = True
+    finally:
+        if not ok:
+            _tavily_credit_refund(1)
+    _web_spend_add("fetch", 1, 1600)           # ≈$0.0016/页（basic extract）
+    results = data.get("results") or []
+    raw = (results[0] or {}).get("raw_content") if results else ""
+    if not raw or len(str(raw)) < 50:
+        raise RuntimeError("tavily_extract_empty")
+    return _clean_provider_text(str(raw))
+
+
+def _apply_fetch_view(base, max_chars, fmt, cached, started):
+    content = base.get("content") or ""
+    if fmt == "text":
+        content = _markdown_to_text(content)
+    truncated = len(content) > max_chars
+    if truncated:
+        content = content[:max_chars]
+    out = {"url": base.get("url"), "final_url": base.get("final_url"),
+           "status": base.get("status"), "title": base.get("title"), "content": content,
+           "chars": len(content), "truncated": truncated,
+           "fetched_at": base.get("fetched_at"), "source": base.get("source"),
+           "cached": cached, "took_ms": int((time.time() - started) * 1000)}
+    # 整体响应（含 metering 前）控制在 WEB_TRUNCATE 内，保证 JSON 不被拦腰截断
+    budget = max(1000, WEB_TRUNCATE - 600)
+    while out["content"] and len(json.dumps(out, ensure_ascii=False)) > budget:
+        out["content"] = out["content"][:int(len(out["content"]) * 0.8)]
+        out["truncated"] = True
+        out["chars"] = len(out["content"])
+    return out
+
+
+def t_web_fetch(url=None, max_chars=8000, format="markdown"):
+    """web_fetch 工具体：缓存 → robots → 直连+抽取 → Tavily /extract 兜底。"""
+    started = time.time()
+    u = str(url or "").strip()
+    try:
+        mc = int(max_chars)
+    except (TypeError, ValueError):
+        mc = 8000
+    mc = max(2000, min(20000, mc))
+    fmt = "text" if str(format or "").strip().lower() == "text" else "markdown"
+    if not u:
+        return _fetch_error(u, "invalid_url", "url is required")
+    if len(u) > 2048:
+        return _fetch_error(u, "invalid_url", "url must be at most 2048 characters")
+    try:
+        p = urllib.parse.urlsplit(u)
+        if p.scheme not in ("http", "https"):
+            raise ValueError("scheme")
+    except ValueError:
+        return _fetch_error(u, "invalid_url", "only http(s) URLs are supported")
+    key = _fetch_key(u)
+    cached = _web_cache_get("fetch", key)
+    if cached is not None:
+        out = _apply_fetch_view(cached, mc, fmt, True, started)
+        if getattr(_REQ, "payment", None):
+            out["_no_charge"] = True          # 付费用户缓存命中不扣点
+        return out
+    got = _WEB_SEM.acquire(timeout=10)
+    if not got:
+        return _fetch_error(u, "busy", "too many web_fetch calls in flight; retry shortly")
+    try:
+        # ① robots.txt（命中 Disallow 不抓、不计费）
+        try:
+            if not _robots_allowed(u):
+                return _fetch_error(u, "robots_disallowed",
+                                    "this site's robots.txt disallows fetching this path")
+        except _WebFetchError:
+            return _fetch_error(u, "invalid_url")
+        except Exception:  # noqa: BLE001
+            pass
+        source, title, content, final_url, status = None, "", "", u, 0
+        direct_err = ""
+        # ② 直连 + 标准库正文抽取
+        try:
+            d = _direct_http_get(u)
+            ctype = d.get("content_type") or ""
+            body = d.get("body") or ""
+            final_url, status = d["final_url"], d["status"]
+            if "html" in ctype or (not ctype and "<html" in body[:2000].lower()):
+                title, content = _html_to_text(body)
+            else:
+                content = body
+                first = content.strip().splitlines()[0][:200] if content.strip() else ""
+                title = first
+            if len(content) < WEB_MIN_CONTENT:
+                raise _WebFetchError("content_too_short", "%d chars" % len(content))
+            source = "direct"
+        except _WebFetchError as exc:
+            if exc.code == "invalid_url":
+                return _fetch_error(u, "invalid_url", "URL rejected by the SSRF guard")
+            if exc.code in ("unsupported_content_type", "too_large"):
+                return _fetch_error(u, exc.code, "the target returned an unsupported document")
+            direct_err = exc.code
+        except Exception as exc:  # noqa: BLE001
+            direct_err = ("timeout" if isinstance(exc, (socket.timeout, TimeoutError))
+                          or "timed out" in str(exc).lower() else type(exc).__name__)
+        # ③ provider 兜底（被墙/直连失败）
+        if source is None:
+            try:
+                content = _tavily_extract(u)
+                source, status, final_url = "provider", 200, u
+                title = ""
+            except Exception as exc:  # noqa: BLE001
+                reason = str(exc).lower()
+                if "credit" in reason or "not_configured" in reason:
+                    code = "provider_budget_exhausted"
+                elif "timed out" in reason or "timeout" in reason or direct_err == "timeout":
+                    code = "timeout"
+                else:
+                    code = "blocked_by_network"
+                if code == "provider_budget_exhausted":
+                    msg = ("the daily provider budget is exhausted; the direct fetch failed "
+                           "(%s)" % (direct_err or "unknown"))
+                elif code == "timeout":
+                    msg = ("the fetch timed out (direct fetch: %s; the provider fallback also "
+                           "timed out)" % (direct_err or "unknown"))
+                else:
+                    msg = ("this site is not reachable from this node and the provider fallback "
+                           "failed")
+                return _fetch_error(u, code, msg)
+        base = {"url": u, "final_url": final_url, "status": status, "title": title,
+                "content": content[:20000], "fetched_at": _bj_iso(), "source": source}
+        _web_cache_put("fetch", key, base)
+        if source == "direct":
+            _web_spend_add("fetch", 1, 0)
+        return _apply_fetch_view(base, mc, fmt, False, started)
+    finally:
+        try:
+            _WEB_SEM.release()
+        except ValueError:
+            pass
+
+
+# ---------------------------------------------------------------- 工具注册
+_WEB_SEARCH_DESC = (
+    "Search the live web and get ranked results with title, URL, snippet and published date. "
+    "When to use: an agent needs current facts, news or links that are not on chain - 'what is "
+    "the BTC fee market saying today', 'recent Zcash governance proposals', 'find the docs page "
+    "for X'. Use it before web_fetch, then fetch the one URL that looks authoritative. "
+    "Do not use: for on-chain facts (use the BTC/ETH/XMR/ZEC/TRON tools), or when you already "
+    "have the target URL (that is web_fetch). "
+    "Returns: {query, count, results:[{title,url,snippet,published}], provider "
+    "(serper|tavily|brave|bing_rss), cached, took_ms, _metering}. Results may be cached for up "
+    "to 10 minutes; a cached result still counts as one call against the free allowance. "
+    "Metered: 20 free searches/day per IP (separate from the risk-tool allowance), then 1 "
+    "credit per call over x402 - there is no API key; the 402 answer carries accepts[]. "
+    "Max count is 10."
+)
+_WEB_FETCH_DESC = (
+    "Fetch one public web page and return its readable text as clean markdown or plain text, with "
+    "navigation, scripts, headers and footers stripped. "
+    "When to use: you have a specific URL (from web_search or the user) and need what the page "
+    "actually says - 'read this article', 'summarise this docs page', 'turn this URL into "
+    "markdown'. "
+    "Do not use: to crawl or mirror a site, to fetch a page behind a login or paywall, or to "
+    "read API/RPC endpoints. "
+    "Returns: {url, final_url, status, title, content, chars, truncated, fetched_at, source "
+    "(direct|provider), cached, took_ms, _metering}. The response is capped at 12000 characters "
+    "per call; raise max_chars (up to 20000) when you need more. Reads one public URL only, "
+    "respects robots.txt, and does not bypass login or paywall. Direct fetch is tried first; "
+    "pages blocked from this node are fetched through a provider and marked source=provider. "
+    "Metered: 50 free fetches/day per IP (separate from the risk-tool allowance), then 1 "
+    "credit per call over x402 - there is no API key; the 402 answer carries accepts[]."
+)
+WEB_TOOL_SPECS = [
+    ("web_search", _WEB_SEARCH_DESC,
+     {"type": "object",
+      "properties": {
+          "query": {"type": "string", "description": "Search query (1-200 characters)."},
+          "count": {"type": "integer", "description": "Number of results to return, 1-10. Default 5."},
+          "freshness": {"type": "string", "enum": ["day", "week", "month", "year"],
+                        "description": "Optional freshness filter."},
+          "site": {"type": "string",
+                   "description": "Optional: restrict results to one domain, e.g. github.com."},
+          "lang": {"type": "string",
+                   "description": "Optional language preference, e.g. zh-cn or en."}},
+      "required": ["query"], "additionalProperties": False},
+     lambda a: t_web_search(a.get("query"), a.get("count", 5), a.get("freshness"),
+                            a.get("site"), a.get("lang"))),
+    ("web_fetch", _WEB_FETCH_DESC,
+     {"type": "object",
+      "properties": {
+          "url": {"type": "string", "description": "The http(s) URL to read (max 2048 chars)."},
+          "max_chars": {"type": "integer",
+                        "description": "Truncate the returned content to this many characters (2000-20000). Default 8000."},
+          "format": {"type": "string", "enum": ["markdown", "text"],
+                     "description": "Output format. Default markdown."}},
+      "required": ["url"], "additionalProperties": False},
+     lambda a: t_web_fetch(a.get("url"), a.get("max_chars", 8000), a.get("format", "markdown"))),
+]
+TOOLS.extend(WEB_TOOL_SPECS)
+
+
+def _metered_precheck(name, args):
+    """计量工具的本地格式校验：失败不进门禁、不扣额度。web 工具做本地校验，其余复用风控校验。"""
+    if name in WEB_TOOLS:
+        a = args or {}
+        if name == "web_search":
+            q = str(a.get("query") or "").strip()
+            if not q:
+                return {"query": "", "count": 0, "results": [], "provider": None,
+                        "cached": False, "error": "query_required",
+                        "message": "query must be a non-empty string (1-200 characters)"}
+            if len(q) > 200:
+                return {"query": q[:200], "count": 0, "results": [], "provider": None,
+                        "cached": False, "error": "query_too_long",
+                        "message": "query must be at most 200 characters"}
+        if name == "web_fetch":
+            u = str(a.get("url") or "").strip()
+            if not u:
+                return {"url": "", "error": "invalid_url", "message": "url is required"}
+            try:
+                p = urllib.parse.urlsplit(u)
+                if p.scheme not in ("http", "https"):
+                    raise ValueError
+            except ValueError:
+                return {"url": _url_domain(u), "error": "invalid_url",
+                        "message": "only http(s) URLs are supported"}
+        return None
+    return _risk_precheck(name, args)
+
+
+def _quota_preview(name):
+    if name in WEB_TOOLS:
+        ok, used, limit = _web_quota(name, False)
+        return used, limit
+    _a, used, limit = _risk_quota(False)
+    return used, limit
+
+
+def _tool_output_limit(name):
+    if name == "web_fetch":
+        return WEB_TRUNCATE
+    if name == "web_search":
+        return 4096
+    return 3800
+
+
 def tools_list():
     return [{"name": n, "description": d, "inputSchema": s} for n, d, s, _ in TOOLS]
 
@@ -2217,12 +3516,15 @@ def tools_list():
 def call_tool(name, args):
     for n, _d, _s, fn in TOOLS:
         if n == name:
-            if n not in RISK_TOOLS:
+            if n not in METERED_TOOLS:
                 return fn(args or {})
             # ---- x402：客户自带付款（信用包）。先入账，再执行工具。----
             # 注意顺序：付款成功才执行；执行失败不退款（客户买的是额度，不是这一次调用）。
             payment = getattr(_REQ, "payment", None)
             if payment and x402_pay is not None and x402_pay.enabled():
+                if name in WEB_TOOLS and not _web_rate_ok():
+                    raise WebRateLimited("web tools are limited to %d calls/min per IP; "
+                                         "retry after 60s" % WEB_RATE_PER_MIN)
                 res = x402_pay.try_pay(name, payment)
                 if not res.get("ok"):
                     _REQ.x402_result = {"success": False,
@@ -2301,12 +3603,15 @@ def call_tool(name, args):
                             _paid_dedup.pop(_k, None)
                     _paid_dedup[_pd_key] = (time.time(), _pd_store)
                 return out
-            pre = _risk_precheck(name, args or {})
+            pre = _metered_precheck(name, args or {})
             if pre is not None:                      # 本地校验失败：不扣费，也不受额度门禁影响
-                _a, _u, _l = _risk_quota(False)
+                _u, _l = _quota_preview(name)
                 pre["_metering"] = (_meter_payload(_u, _l, pending=True, charged=False)
                                     if _l >= 0 else _meter_payload(0, -1))
                 return pre
+
+            if name in WEB_TOOLS:                    # web 工具：独立额度桶 + 独立限速，不复用风控去重
+                return _call_web_tool(name, fn, args or {})
 
             # 去重按 IP 隔离：旧的全局键让不同 IP 在 5 分钟内重复同一查询都免费，
             # 等于把免费额度放大成"每个热门地址只算一次"。现在同一 IP 的重试仍免费，
@@ -2392,7 +3697,14 @@ def handle(msg):
                              "runs out the tool answers Payment Required with the machine-readable terms "
                              "in structuredContent.accepts[]; settle a credit pack once and keep sending "
                              "the same payment payload so it decrements credit instead of charging "
-                             "again. Every answer carries its own _metering block. Metering is safe to retry: "
+                             "again. Every answer carries its own _metering block. Two high-frequency "
+                             "web tools are exposed on the same endpoint: web_search returns ranked web "
+                             "results (provider serper, with tavily/brave/bing_rss fallbacks; cached up "
+                             "to 10 minutes) and web_fetch returns readable markdown/text of one public "
+                             "URL (robots.txt-respecting, SSRF-guarded, no login or paywall bypass, capped "
+                             "at 12000 characters per call). They have their own free daily allowance per "
+                             "IP (web_search 20, web_fetch 50, reset 00:00 Asia/Shanghai, separate from "
+                             "the risk allowance) and are metered at 1 credit each. Metering is safe to retry: "
                              "repeating the exact same risk query within 5 minutes is answered from cache "
                              "with charged_this_call=false, and a locally invalid argument is rejected "
                              "without consuming a free call.")}}
@@ -2420,10 +3732,11 @@ def handle(msg):
                     verify_ledger.record(name, params.get('arguments') or {}, out)
                 except Exception:  # noqa: BLE001
                     pass
-            _is_err = bool(name == "btc_get_address" and isinstance(out, dict) and out.get("error"))
+            _is_err = bool(isinstance(out, dict) and out.get("error")
+                           and (name == "btc_get_address" or name in WEB_TOOLS))
             if _is_err:
                 _REQ.err = str(out.get("error"))
-            result = {"content": [{"type": "text", "text": truncate(out)}], "isError": _is_err}
+            result = {"content": [{"type": "text", "text": truncate(out, _tool_output_limit(name))}], "isError": _is_err}
             if _REQ.x402_result:      # 结算成功：按规范回 payment-response
                 result["_meta"] = {"x402/payment-response": _REQ.x402_result}
             return {"jsonrpc": "2.0", "id": mid, "result": result}
@@ -2441,6 +3754,12 @@ def handle(msg):
                     {"error": "payment_required", "tool": name, "message": str(pay),
                      "free_per_day": RISK_FREE_PER_DAY, "top_up": TOPUP_URL},
                     ensure_ascii=False)}],
+                "isError": True}}
+        except WebRateLimited as rl:
+            _REQ.err = "rate_limited: web tools"
+            return {"jsonrpc": "2.0", "id": mid, "result": {
+                "content": [{"type": "text", "text": json.dumps(
+                    {"error": "rate_limited", "message": str(rl), "retry_after_sec": 60})}],
                 "isError": True}}
         except Exception as exc:  # noqa: BLE001
             _REQ.err = "%s: %s" % (type(exc).__name__, exc)
@@ -2533,12 +3852,15 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
                         ├── XMR   monerod full node
                         ├── ZEC   Zebra full node (incl. value-pool / shielded supply)
                         ├── TRON  java-tron lite full node (tip state + a recent ~6 day window)
-                        └── gateway service aggregation (status pages / dashboards)</pre></div>
+                        └── gateway service aggregation (status pages / dashboards)
+                        └── web : Serper / Tavily / Brave / cn.bing RSS search,
+                                  direct fetch + Tavily /extract fallback (SSRF-guarded)</pre></div>
 
 <h2>Rate limits and privacy</h2>
 <div class="card"><div class="grid">
 <div><div class="muted">Verification tools</div><div><b>Free</b> - no key, no signup</div></div>
 <div><div class="muted">Risk tools</div><div><b>5 free/day per IP</b>, then <b>$0.01</b> per call by x402</div></div>
+<div><div class="muted">Web tools</div><div><b>20 searches + 50 fetches/day per IP</b> free (separate buckets); <b>20 req/min/IP</b>; then <b>$0.01</b> per call by x402</div></div>
 <div><div class="muted">Payment</div><div>USDC on Base or Solana via x402 - <b>payment rail only, no Base/Solana chain data</b>; no API key, no subscription</div></div>
 <div><div class="muted">Anonymous</div><div><b>120 req/min/IP</b></div></div>
 <div><div class="muted">Privacy</div><div>Audit keeps only the first 16 chars of the IP SHA256 — <b>query arguments are never logged</b></div></div>
@@ -2561,10 +3883,29 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
   Payment settles in USDC on Base or Solana via x402; RobotBase does not serve Base or Solana chain data.</p>
 </div>
 
+<h2>Web tools (high-frequency)</h2>
+<div class="card">
+  <p class="muted" style="margin-top:0">Two generic web tools give an agent current facts that
+  are not on chain - same endpoint, same x402 flow:</p>
+<ul style="margin:0;padding-left:20px">
+<li><code>web_search</code> - ranked web results (title, URL, snippet, published date); Serper-backed
+with Tavily / Brave / cn.bing RSS fallbacks; results may be cached for up to 10 minutes</li>
+<li><code>web_fetch</code> - readable text/markdown of <b>one</b> public URL; respects robots.txt,
+no login/paywall bypass; direct fetch first, provider fallback for pages blocked from this node;
+response capped at 12000 characters</li>
+</ul>
+  <p class="muted" style="margin-bottom:0">Independent free allowance: <b>20 searches and 50 fetches
+  per day per IP</b> (separate from the risk-tool allowance), then <b>$0.01 per call</b> by x402.
+  A cached search still counts as one call against the free allowance; a paid cache hit does not
+  spend a credit. All fetching is SSRF-guarded: private, loopback, link-local and cloud-metadata
+  addresses are rejected, redirects are re-checked hop by hop, and responses are capped at 2 MB.</p>
+</div>
+
 <h2 id="pricing">Pricing</h2>
 <div class="card"><div class="grid">
 <div><div class="muted">Verification tools (41)</div><div><b>$0</b> — free forever, no key, no signup</div></div>
 <div><div class="muted">Risk intelligence (2 tools)</div><div><b>__RISK_FREE__ calls/day per IP free</b>, then <b>$0.01</b> per call</div></div>
+<div><div class="muted">Web tools (2 tools)</div><div><b>20 searches + 50 fetches/day per IP free</b> (separate allowance), then <b>$0.01</b> per call</div></div>
 <div><div class="muted">How you pay</div><div><b>x402</b> — USDC on Base or Solana, paid by the caller's own wallet; <b>payment rail only</b>, no Base/Solana chain data</div></div>
 <div><div class="muted">Credit packs</div><div><b>10 calls / 0.10 USDC</b> · <b>100 calls / 1.00 USDC</b> — live terms in <code>accepts[]</code></div></div>
 </div>
@@ -2581,6 +3922,8 @@ of any 402 answer. Nothing is metered by surprise: every risk-tool answer carrie
 <li>"Did this txid actually confirm, and in which block?" → <code>btc_get_transaction</code></li>
 <li>"How much ZEC is in the Zcash shielded pools?" → <code>zec_get_pool_status</code></li>
 <li>"Is the Monero node synced, and how deep is its txpool?" → <code>xmr_get_node_status</code></li>
+<li>"What is the BTC fee market saying today?" → <code>web_search</code>, then <code>web_fetch</code> on the best result</li>
+<li>"Turn this article URL into clean markdown" → <code>web_fetch</code></li>
 </ul></div>
 
 <p class="muted" style="margin-top:26px">RobotBase · read-only on-chain data infrastructure · <a href="https://robotbase.cc/">robotbase.cc</a> ·
@@ -2617,6 +3960,7 @@ def docs_html():
                                                               "tron_read_contract", "tron_get_chain_economics",
                                                               "tron_list_witnesses", "tron_list_proposals"]),
         ("⑦ Risk intelligence — metered", ["tron_check_address_risk", "tron_verify_usdt_transfer"]),
+        ("⑧ Web tools (high-frequency)", ["web_search", "web_fetch"]),
     ]
     desc = {n: d for n, d, _s, _f in TOOLS}
     rows = ""
@@ -2642,7 +3986,7 @@ def server_card():
     return {
         "name": "robotbase-mcp",
         "title": "RobotBase MCP Server - on-chain verification & risk intelligence for Web3 agents",
-        "version": "0.12.6",
+        "version": "0.13.0",
         "description": "The verification and risk-intelligence layer for Web3 agents, as one read-only MCP "
                        "endpoint. Five chains are live, each read from mainnet nodes we run ourselves: "
                        "Bitcoin (fees, mempool state with a fee-rate histogram and RBF/CPFP feasibility, "
@@ -2659,8 +4003,14 @@ def server_card():
                        "RobotBase publishes no RPC endpoint of any kind. Verification tools are free; "
                        "risk tools include a daily free allowance, then 0.01 USDC per call settled over "
                        "x402 by the caller's own wallet - x402 runs on Base or Solana as a payment rail "
-                       "only, and no Base or Solana chain data is served. No API key, no account and no "
-                       "subscription are offered.",
+                       "only, and no Base or Solana chain data is served. Two high-frequency web "
+                       "tools are exposed on the same endpoint: web_search returns ranked web results "
+                       "(Serper primary with Tavily/Brave/cn.bing RSS fallbacks, cached up to 10 "
+                       "minutes) and web_fetch returns readable markdown/text of one public URL "
+                       "(robots.txt-respecting, SSRF-guarded, no login or paywall bypass, provider "
+                       "fallback for pages blocked from this node, capped at 12000 characters). Each "
+                       "has its own free daily allowance per IP (search 20, fetch 50) and is metered "
+                       "at 1 x402 credit per call. No API key, no account and no subscription are offered.",
         "homepage": "https://robotbase.cc/mcp",
         "transport": {"type": "streamable-http", "url": "https://robotbase.cc/mcp"},
         "endpoints": {
@@ -2671,12 +4021,16 @@ def server_card():
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {"tools": {"listChanged": False}},
         "auth": {"type": "none", "optional": "x402 (USDC) for metered tools; no API keys are issued"},
-        "rateLimits": {"anonymous": "120/min per IP", "note": "no keyed tier exists"},
+        "rateLimits": {"anonymous": "120/min per IP",
+                       "web_tools": "20/min per IP (separate from the 120/min overall limit)",
+                       "note": "no keyed tier exists"},
         "tags": ["bitcoin", "ethereum", "monero", "zcash", "tron", "blockchain-data",
                  "onchain", "verification", "risk-intelligence", "aml", "rug-pull", "honeypot", "evm",
                  "usdt", "mempool",
-                 "fees", "privacy-coins", "read-only", "mcp-server", "web3-agents"],
+                 "fees", "privacy-coins", "read-only", "mcp-server", "web3-agents",
+                 "web-search", "web-fetch", "search", "fetch"],
         "pricing": {"verification_tools": "free", "risk_tools": "%d free calls/day per IP, then 0.01 USDC per call" % RISK_FREE_PER_DAY,
+                    "web_tools": "20 searches + 50 fetches/day per IP free (separate buckets), then 0.01 USDC per credit over x402 (web_search 1, web_fetch 1)",
                     "payment": "x402 (HTTP 402) in USDC on Base or Solana; credit packs 10 calls / 0.10 USDC and 100 calls / 1.00 USDC; payment rail only - no Base or Solana chain data",
                     "api_key": "not offered", "subscription": "not offered",
                     "top_up": TOPUP_URL},
@@ -4425,6 +5779,7 @@ other windows: <a href="/mcp/stats?hours=1">1h</a> · <a href="/mcp/stats?hours=
 if __name__ == "__main__":
     init_usage()
     init_risk_db()
+    init_web_db()
     if x402_pay is not None:
         try:
             x402_pay.init()

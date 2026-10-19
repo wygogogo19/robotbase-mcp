@@ -39,7 +39,33 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
        "params":{"name":"xmr_get_node_status","arguments":{}}}'
 ```
 
-## 4. Metered risk tools and x402
+## 4. Web tools (search + fetch)
+
+`web_search` ranks the live web (Serper primary; Tavily / Brave / cn.bing RSS fallbacks) and
+`web_fetch` returns the readable text of one public URL. They have their own free allowance —
+20 searches and 50 fetches per day per IP, in separate buckets from the risk tools — and then cost
+1 x402 credit per call. Results may be cached for up to 10 minutes.
+
+```bash
+# search: title / url / snippet / published, plus the provider that answered
+curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":6,"method":"tools/call",
+       "params":{"name":"web_search",
+                 "arguments":{"query":"bitcoin fee market","count":3}}}'
+
+# fetch one public page as clean markdown (robots.txt-respecting, SSRF-guarded)
+curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":7,"method":"tools/call",
+       "params":{"name":"web_fetch",
+                 "arguments":{"url":"https://docs.python.org/3/library/json.html",
+                              "max_chars":8000}}}'
+```
+
+The response body is capped at 12,000 characters; raise `max_chars` (up to 20,000) if you need
+more of the page. `source` is `direct` when this node fetched the page itself and `provider` when
+a blocked page was fetched through the provider fallback.
+
+## 5. Metered risk tools and x402
 
 There is **no API key**: `X-API-Key` is not part of this service and sending it changes nothing.
 The two risk tools have a free allowance of 5 calls/day per IP; past that the call returns
@@ -66,7 +92,7 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
 Response headers `X-MCP-Plan` (`anon`) and `X-RateLimit-Limit` show the effective quota — 120 req/min
 per IP, the only tier there is.
 
-## 5. Usage audit
+## 6. Usage audit
 
 ```bash
 curl -s 'https://robotbase.cc/mcp/stats?hours=24'          # JSON

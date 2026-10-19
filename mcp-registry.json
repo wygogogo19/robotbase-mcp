@@ -1,8 +1,8 @@
 {
  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
  "name": "io.github.wygogogo19/robotbase-mcp",
- "description": "On-chain verification and risk intelligence MCP for Web3 agents. BTC/ETH/XMR/ZEC/TRON nodes live.",
- "version": "0.12.6",
+ "description": "BTC/ETH/XMR/ZEC/TRON on-chain verification + risk MCP; web search and fetch built in.",
+ "version": "0.13.0",
  "repository": {
   "url": "https://github.com/wygogogo19/robotbase-mcp",
   "source": "github",
