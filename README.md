@@ -6,9 +6,11 @@
 
 Hosted endpoint: **72 tools** — ten web tools (search, fetch, screenshot, map, batch, feed, metadata, crawl, extract, act), on-chain verification & risk on **Bitcoin · Ethereum · Monero · Zcash · Tron**, and **16 CyberLibrary book tools**. This repository is the dependency-free reference implementation: **45 tools** (41 free verification + 2 risk + 2 web); the hosted endpoint additionally bundles 3 free XMR wallet/merchant tools, 16 CyberLibrary tools and 8 more web tools.
 
+- **Install guide for agents:** [`llms-install.md`](./llms-install.md) · **Privacy:** <https://robotbase.cc/privacy> · **Security:** [`SECURITY.md`](./SECURITY.md)
+
 > **Base and Solana data tools were retired on 2026-10-18.** The five-chain surface is Bitcoin, Ethereum, Monero, Zcash and Tron. x402 payments still settle in USDC on Base or Solana; that is a payment rail, not a data service.
 
-[![Hosted tools](https://img.shields.io/badge/hosted%20tools-68-brightgreen)](https://robotbase.cc/mcp/tools) [![Reference tools](https://img.shields.io/badge/reference%20tools-45-blue)](https://github.com/wygogogo19/robotbase-mcp)
+[![Hosted tools](https://img.shields.io/badge/hosted%20tools-72-brightgreen)](https://robotbase.cc/mcp/tools) [![Reference tools](https://img.shields.io/badge/reference%20tools-45-blue)](https://github.com/wygogogo19/robotbase-mcp)
 [![Protocol](https://img.shields.io/badge/MCP-2025--06--18-blue)](https://modelcontextprotocol.io)
 [![Transport](https://img.shields.io/badge/transport-streamable--http-orange)](https://robotbase.cc/mcp)
 [![Glama](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp/badges/score.svg)](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp)
