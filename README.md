@@ -107,72 +107,16 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
 
 ## Tools (45 — reference implementation)
 
+> Public order is **web-first, then high-frequency verification** (the order returned by `tools/list` and `server.json`); the hosted endpoint puts its 16 CyberLibrary tools last.
+
 > The hosted endpoint `https://robotbase.cc/mcp` has **72 tools**: these 45 plus 3 free XMR wallet/merchant tools, the 16 **CyberLibrary** book tools (`cyberlibrary_catalog_index`, `cyberlibrary_language_shard`, `cyberlibrary_book_meta`, `cyberlibrary_get_toc`, `cyberlibrary_get_chapter`, `cyberlibrary_get_markdown`, `cyberlibrary_cite`, `cyberlibrary_search_books`, `cyberlibrary_fulltext_search`, `cyberlibrary_service_info`, `cyberlibrary_get_chunks`, `cyberlibrary_verify_quote`, `cyberlibrary_search_passages`, `cyberlibrary_rag_context`, `cyberlibrary_semantic_search`, `cyberlibrary_search`) and eight additional web tools (`web_screenshot`, `web_map`, `web_fetch_batch`, `web_feed`, `web_metadata`, `web_crawl`, `web_extract`, `web_act`).
-
-| Tool | What it does | Typical question |
-|---|---|---|
-| `list_chains` | Every chain on the roster with its state (`live\|provisioning\|planned`) and availability | "Which chains do you support? Are they online?" |
-| `chain_status(chain)` | Node height, sync progress, peers, mempool, version (`btc\|eth\|xmr\|zec\|tron`) | "Is the Monero node synced?" |
-| `robotbase_capabilities` | What each node can and cannot answer, incl. pruning/retention limits | "Can you still read that far back?" |
-| `robotbase_services` | Gateway-wide service health | "Give me an overall health check" |
-| `btc_get_fee_rates` | Fees for 1/2/3/6/12/24-block targets + mempool floor, in sat/vB | "What fee should I pay right now?" |
-| `btc_get_mempool_state` | Mempool depth, capacity load, min fee, total fees + busy/normal verdict | "Is Bitcoin congested right now?" |
-| `btc_get_transaction(txid)` | BTC transaction: confirmations, block, I/O summary | "Did this payment actually settle?" |
-| `btc_get_block(height\|blockhash)` | Block summary (defaults to tip) | "How many txs in the latest block?" |
-| `btc_get_network_stats` | Difficulty, hashrate, total txs and current tx/s, client, peers, relay fee, uptime, synced indexes | "How much hashrate secures Bitcoin?" |
-| `btc_get_address(address)` | Balance, UTXOs, tx count, recent txs (P2PKH/P2SH/bech32/bech32m) | "How much BTC is in this address?" |
-| `zec_get_pool_status` | Zcash node state **plus all six value pools** (transparent/sprout/sapling/orchard/ironwood/lockbox) with 1h/24h deltas | "How much ZEC is shielded, and is it growing?" |
-| `zec_get_recent_blocks(n)` | Recent Zcash blocks | "Are ZEC blocks healthy?" |
-| `zec_get_network_stats` | Mempool, node version, difficulty, hashrate, chain progress, block reward, funding streams (ZCG) and lockbox | "How much hashrate secures Zcash, and where does the subsidy go?" |
-| `zec_get_treestate(block_hash?\|height?)` | Sapling / Orchard / Ironwood shielded commitment-tree anchor roots at a block | "How is the shielded set advancing?" |
-| `zec_get_transaction(txid)` | ZEC transaction: confirmations, block, active-chain, and how much is transparent vs shielded. Shielded amounts/parties are reported as **not disclosed by the protocol** | "Did this ZEC payment land?" |
-| `eth_get_transaction(txid)` | ETH transaction: status, gas, fee, confirmations, finalized, and **ERC-20 transfers decoded from the receipt logs** with the token's own decimals resolved | "Did this ETH or USDT/USDC payment settle?" |
-| `eth_get_fee_rates` | Base fee (now and next), priority-fee percentiles, and cost estimates for a plain and an ERC-20 transfer | "What will my Ethereum transaction cost?" |
-| `eth_get_account(address)` | ETH balance, nonce, and whether the address is a contract | "Is this an EOA or a contract?" |
-| `eth_get_block(height?\|block_hash?)` | Block by number, tag (latest/finalized/safe) or hash: txs, gas used vs limit, base fee, builder | "How full is Ethereum right now?" |
-| `eth_get_logs(from?, to?, address?, topic0?)` | Event logs over a range with ERC-20 Transfers decoded; auto-narrows when a query exceeds the node's result cap | "Who moved this token in the last N blocks?" |
-| `eth_read_contract(contract, function, argument?)` | Read-only `eth_call` on our own Reth node: `balanceOf`, `allowance`, `decimals`, `symbol`, `name`, `totalSupply`, or any raw selector | "What is this address's USDT balance?" |
-| `xmr_get_node_status` | Monero node: true last-block height, sync flag, difficulty, txpool, database size, monerod version, peers | "Is the Monero node synced?" |
-| `xmr_get_fee_rates` | Fee estimate per kB across ascending priority tiers, read from our own node | "What fee will my XMR transaction need?" |
-| `xmr_get_mempool_state` | Pending tx count, total bytes and fees, age of the oldest pending tx, double-spend/failing counts | "Is Monero congested right now?" |
-| `xmr_get_block(height\|block_hash)` | One block header: time, tx count, reward, difficulty, weight, protocol version | "What is in block 3,784,931?" |
-| `xmr_get_recent_blocks(n)` | Recent blocks plus the observed block interval vs the 120s target | "Are XMR blocks healthy?" |
-| `xmr_get_output_distribution(from?, to?)` | Spendable outputs per ring-size bucket — Monero's anonymity-set side. Raw counts, never a "privacy score". Data lags the tip by ~5,000 blocks and says so | "How large is the spendable output set?" |
-| `xmr_get_transaction(txid)` | Is this txid mined, which block, confirmations, size, outputs, ring size. Amount/sender/recipient are reported as **not disclosed by the protocol** — Monero hides them by design and no third party can recover them | "Did my XMR transfer get mined?" |
-| `xmr_get_network_stats` | Network hashrate, difficulty, emission and fees over the last 720 blocks, protocol version, next hard fork | "How much hashrate secures Monero?" |
-| `xmr_verify_payment(txid, address, tx_key\|signature)` | **Cryptographic Monero payment verification**: give it a txid plus the transaction key (`get_tx_key`) or a tx proof (`get_tx_proof`) from your own wallet and it verifies the transaction really pays that address, for how much, with how many confirmations. Runs on RobotBase's own monero-wallet-rpc instance (separate service, separate credentials, empty wallet — no funds, no receiving keys) | "Did this XMR payment actually arrive?" |
-| `broadcast_raw_transaction` | Relay an already-signed BTC transaction through our own node (testmempoolaccept first; operator-gated) | "Broadcast this signed tx for me" |
-| `tron_get_node_status` | Tron node: tip height, finalized (solidity) height and lag, peers, client version, txs in the tip block | "Is the Tron node synced?" |
-| `tron_get_current_block` | The block being produced: number, id, timestamp, tx count by contract type, producing witness | "How busy is Tron right now?" |
-| `tron_get_block(height\|block_id)` | One block: producer, timestamp, tx count by type, tx ids | "What is in block 87,147,698?" |
-| `tron_list_proposals(limit?)` | Governance proposals: id, proposer, state, approvals and the parameters they would change | "Is a chain-parameter change pending?" |
-| `tron_get_transaction(txid)` | One transaction: success/reverted, energy used, confirmations, finalized-on-solidity, and **TRC-20 transfers decoded from the receipt logs** (token, from, to, amount) | "Did this USDT payment land, and for how much?" |
-| `tron_get_account(address)` | TRX balance, activation state, energy and bandwidth, witness flag, account age | "How much TRX is in this address?" |
-| `tron_get_contract(address)` | Is the ABI published, name, creator, function list, code hash, TRC-20 detection | "Is this contract verified?" |
-| `tron_read_contract(contract, function, argument)` | **Read-only constant call run by our own node** — `balanceOf`, `allowance`, `decimals`, `symbol`, `name`, `totalSupply`, or any raw selector. No key, no state change | "What is this address's USDT balance?" |
-| `tron_get_chain_economics` | Energy price (sun/unit), transaction fee, account creation fee, witness pay per block, energy/bandwidth limits, next maintenance | "What will a TRC-20 transfer cost in TRX?" |
-| `tron_list_witnesses(limit)` | Super representatives: blocks produced, missed, votes, websites | "Who produces Tron blocks?" |
-
-### Risk intelligence (metered)
-
-Two tools answer what a free block explorer cannot. They are aggregation over public datasets refined in our own middle layer; the TRON settlement check reads our own node inside its retention window and falls back to TronGrid for older transactions.
-
-| Tool | What it does | Typical question |
-|---|---|---|
-| `tron_check_address_risk(address)` | TRC-20 counterparty screening: judicial / black-market / mixer / phishing labels, account activation and age, 0-100 safety score, plus an explicit `not_covered` list | "Is it safe to accept USDT from this address?" |
-| `tron_verify_usdt_transfer(txid, expected_to?, expected_amount_usdt?)` | USDT settlement check: finalized on the solidity chain, confirmations, amount, sender, recipient, matched against what you expect. Reads **our own Tron node** inside its ~6 day window (sub-second, no third party) and falls back to TronGrid for older transactions — `source` says which answered, and a local miss is never reported as "not found" | "Did this USDT payment land, irreversibly, for the right amount?" |
-
-**Base and Solana are a payment rail, not a data service.** x402 settles in USDC on Base or Solana; the Base/Solana on-chain data tools were retired on 2026-10-18 and no external RPC is queried for chain data.
-
-Each one returns `risk_level`, a 0-100 `safety_score`, the verbatim upstream flags it was derived from, a `not_covered` list and a disclaimer — it relays public labels and **forms no legal opinion**. Issuer-backed tokens (regulated stablecoins) are read as issuer control rather than as a rug signal, and that decision is stated in the response.
-
-Boundary worth stating plainly: RobotBase does **not** index Monero transactions, wallets or ring signatures, and does **not** label or risk-score Bitcoin addresses. Where a node cannot answer, the tool says so instead of guessing.
 
 ### Web tools (high-frequency)
 
-The hosted endpoint exposes **seven** web tools: `web_search`, `web_fetch`, `web_screenshot`,
-`web_map`, `web_fetch_batch`, `web_feed` and `web_metadata`. This reference implementation ships
-the first two; the other five are hosted-only.
+The hosted endpoint exposes **ten** web tools: `web_search`, `web_fetch`, `web_screenshot`,
+`web_map`, `web_fetch_batch`, `web_feed`, `web_metadata`, `web_crawl`, `web_extract` and
+`web_act`. This reference implementation ships the first two; the other eight are hosted-only.
+They are listed first in the public `tools/list` order.
 
 Two general-purpose web tools sit next to the on-chain surface. They are the entry point an agent
 uses before it verifies: search the live web, read the one page that looks authoritative, then
@@ -202,6 +146,67 @@ Set `RB_SERPER_KEY` for the primary search provider, and optionally `RB_TAVILY_K
 `RB_TAVILY_DAILY_CREDITS` (default 15) to cap daily Tavily credits, and `RB_SERPER_DAILY_CALLS`
 (default 200) to cap Serper calls. With no provider key at all, `web_search` degrades to the
 zero-key `cn.bing` RSS feed and `web_fetch` still works for directly reachable pages.
+
+### Chain verification tools
+
+| Tool | What it does | Typical question |
+|---|---|---|
+| `list_chains` | Every chain on the roster with its state (`live\|provisioning\|planned`) and availability | "Which chains do you support? Are they online?" |
+| `chain_status(chain)` | Node height, sync progress, peers, mempool, version (`btc\|eth\|xmr\|zec\|tron`) | "Is the Monero node synced?" |
+| `robotbase_capabilities` | What each node can and cannot answer, incl. pruning/retention limits | "Can you still read that far back?" |
+| `robotbase_services` | Gateway-wide service health | "Give me an overall health check" |
+| `btc_get_fee_rates` | Fees for 1/2/3/6/12/24-block targets + mempool floor, in sat/vB | "What fee should I pay right now?" |
+| `btc_get_mempool_state` | Mempool depth, capacity load, min fee, total fees + busy/normal verdict | "Is Bitcoin congested right now?" |
+| `btc_get_transaction(txid)` | BTC transaction: confirmations, block, I/O summary | "Did this payment actually settle?" |
+| `btc_get_block(height\|blockhash)` | Block summary (defaults to tip) | "How many txs in the latest block?" |
+| `btc_get_network_stats` | Difficulty, hashrate, total txs and current tx/s, client, peers, relay fee, uptime, synced indexes | "How much hashrate secures Bitcoin?" |
+| `btc_get_address(address)` | Balance, UTXOs, tx count, recent txs (P2PKH/P2SH/bech32/bech32m) | "How much BTC is in this address?" |
+| `broadcast_raw_transaction` | Relay an already-signed BTC transaction through our own node (testmempoolaccept first; operator-gated) | "Broadcast this signed tx for me" |
+| `eth_get_transaction(txid)` | ETH transaction: status, gas, fee, confirmations, finalized, and **ERC-20 transfers decoded from the receipt logs** with the token's own decimals resolved | "Did this ETH or USDT/USDC payment settle?" |
+| `eth_get_fee_rates` | Base fee (now and next), priority-fee percentiles, and cost estimates for a plain and an ERC-20 transfer | "What will my Ethereum transaction cost?" |
+| `eth_get_account(address)` | ETH balance, nonce, and whether the address is a contract | "Is this an EOA or a contract?" |
+| `eth_get_block(height?\|block_hash?)` | Block by number, tag (latest/finalized/safe) or hash: txs, gas used vs limit, base fee, builder | "How full is Ethereum right now?" |
+| `eth_get_logs(from?, to?, address?, topic0?)` | Event logs over a range with ERC-20 Transfers decoded; auto-narrows when a query exceeds the node's result cap | "Who moved this token in the last N blocks?" |
+| `eth_read_contract(contract, function, argument?)` | Read-only `eth_call` on our own Reth node: `balanceOf`, `allowance`, `decimals`, `symbol`, `name`, `totalSupply`, or any raw selector | "What is this address's USDT balance?" |
+| `tron_get_node_status` | Tron node: tip height, finalized (solidity) height and lag, peers, client version, txs in the tip block | "Is the Tron node synced?" |
+| `tron_get_current_block` | The block being produced: number, id, timestamp, tx count by contract type, producing witness | "How busy is Tron right now?" |
+| `tron_get_block(height\|block_id)` | One block: producer, timestamp, tx count by type, tx ids | "What is in block 87,147,698?" |
+| `tron_list_proposals(limit?)` | Governance proposals: id, proposer, state, approvals and the parameters they would change | "Is a chain-parameter change pending?" |
+| `tron_get_transaction(txid)` | One transaction: success/reverted, energy used, confirmations, finalized-on-solidity, and **TRC-20 transfers decoded from the receipt logs** (token, from, to, amount) | "Did this USDT payment land, and for how much?" |
+| `tron_get_account(address)` | TRX balance, activation state, energy and bandwidth, witness flag, account age | "How much TRX is in this address?" |
+| `tron_get_contract(address)` | Is the ABI published, name, creator, function list, code hash, TRC-20 detection | "Is this contract verified?" |
+| `tron_read_contract(contract, function, argument)` | **Read-only constant call run by our own node** — `balanceOf`, `allowance`, `decimals`, `symbol`, `name`, `totalSupply`, or any raw selector. No key, no state change | "What is this address's USDT balance?" |
+| `tron_get_chain_economics` | Energy price (sun/unit), transaction fee, account creation fee, witness pay per block, energy/bandwidth limits, next maintenance | "What will a TRC-20 transfer cost in TRX?" |
+| `tron_list_witnesses(limit)` | Super representatives: blocks produced, missed, votes, websites | "Who produces Tron blocks?" |
+| `xmr_get_node_status` | Monero node: true last-block height, sync flag, difficulty, txpool, database size, monerod version, peers | "Is the Monero node synced?" |
+| `xmr_get_fee_rates` | Fee estimate per kB across ascending priority tiers, read from our own node | "What fee will my XMR transaction need?" |
+| `xmr_get_mempool_state` | Pending tx count, total bytes and fees, age of the oldest pending tx, double-spend/failing counts | "Is Monero congested right now?" |
+| `xmr_get_block(height\|block_hash)` | One block header: time, tx count, reward, difficulty, weight, protocol version | "What is in block 3,784,931?" |
+| `xmr_get_recent_blocks(n)` | Recent blocks plus the observed block interval vs the 120s target | "Are XMR blocks healthy?" |
+| `xmr_get_output_distribution(from?, to?)` | Spendable outputs per ring-size bucket — Monero's anonymity-set side. Raw counts, never a "privacy score". Data lags the tip by ~5,000 blocks and says so | "How large is the spendable output set?" |
+| `xmr_get_transaction(txid)` | Is this txid mined, which block, confirmations, size, outputs, ring size. Amount/sender/recipient are reported as **not disclosed by the protocol** — Monero hides them by design and no third party can recover them | "Did my XMR transfer get mined?" |
+| `xmr_get_network_stats` | Network hashrate, difficulty, emission and fees over the last 720 blocks, protocol version, next hard fork | "How much hashrate secures Monero?" |
+| `xmr_verify_payment(txid, address, tx_key\|signature)` | **Cryptographic Monero payment verification**: give it a txid plus the transaction key (`get_tx_key`) or a tx proof (`get_tx_proof`) from your own wallet and it verifies the transaction really pays that address, for how much, with how many confirmations. Runs on RobotBase's own monero-wallet-rpc instance (separate service, separate credentials, empty wallet — no funds, no receiving keys) | "Did this XMR payment actually arrive?" |
+| `zec_get_pool_status` | Zcash node state **plus all six value pools** (transparent/sprout/sapling/orchard/ironwood/lockbox) with 1h/24h deltas | "How much ZEC is shielded, and is it growing?" |
+| `zec_get_recent_blocks(n)` | Recent Zcash blocks | "Are ZEC blocks healthy?" |
+| `zec_get_network_stats` | Mempool, node version, difficulty, hashrate, chain progress, block reward, funding streams (ZCG) and lockbox | "How much hashrate secures Zcash, and where does the subsidy go?" |
+| `zec_get_treestate(block_hash?\|height?)` | Sapling / Orchard / Ironwood shielded commitment-tree anchor roots at a block | "How is the shielded set advancing?" |
+| `zec_get_transaction(txid)` | ZEC transaction: confirmations, block, active-chain, and how much is transparent vs shielded. Shielded amounts/parties are reported as **not disclosed by the protocol** | "Did this ZEC payment land?" |
+
+### Risk intelligence (metered)
+
+Two tools answer what a free block explorer cannot. They are aggregation over public datasets refined in our own middle layer; the TRON settlement check reads our own node inside its retention window and falls back to TronGrid for older transactions.
+
+| Tool | What it does | Typical question |
+|---|---|---|
+| `tron_check_address_risk(address)` | TRC-20 counterparty screening: judicial / black-market / mixer / phishing labels, account activation and age, 0-100 safety score, plus an explicit `not_covered` list | "Is it safe to accept USDT from this address?" |
+| `tron_verify_usdt_transfer(txid, expected_to?, expected_amount_usdt?)` | USDT settlement check: finalized on the solidity chain, confirmations, amount, sender, recipient, matched against what you expect. Reads **our own Tron node** inside its ~6 day window (sub-second, no third party) and falls back to TronGrid for older transactions — `source` says which answered, and a local miss is never reported as "not found" | "Did this USDT payment land, irreversibly, for the right amount?" |
+
+**Base and Solana are a payment rail, not a data service.** x402 settles in USDC on Base or Solana; the Base/Solana on-chain data tools were retired on 2026-10-18 and no external RPC is queried for chain data.
+
+Each one returns `risk_level`, a 0-100 `safety_score`, the verbatim upstream flags it was derived from, a `not_covered` list and a disclaimer — it relays public labels and **forms no legal opinion**. Issuer-backed tokens (regulated stablecoins) are read as issuer control rather than as a rug signal, and that decision is stated in the response.
+
+Boundary worth stating plainly: RobotBase does **not** index Monero transactions, wallets or ring signatures, and does **not** label or risk-score Bitcoin addresses. Where a node cannot answer, the tool says so instead of guessing.
 
 ## Beyond a generic reader
 
@@ -287,6 +292,7 @@ See [`examples/`](./examples) for client configs, [`examples/env.example`](./exa
 
 ## Reference implementation history
 
+- **2026-10-20 — v0.26.0**: public tool order is now web-first / high-frequency-first (`tools/list`, `server.json`, README table); hosted endpoint stays at 72 tools (44 free + 2 risk + 16 CyberLibrary + 10 web), reference implementation remains 45 tools.
 - **2026-10-19 — v0.25.2**: hosted surface reaches 72 tools (10 web tools incl. `web_crawl`/`web_extract`/`web_act` and OCR; self-hosted SearXNG primary for `web_search`; 16 CyberLibrary tools). This release also ports the defect fixes that shipped in the hosted service (v0.22.0/v0.22.1) into this 45-tool reference implementation. Highlights: JSON-safe truncation (responses
   over the transport cap stay **valid JSON** and carry `_truncated` / `_original_chars` metadata
   instead of being sliced mid-object); bech32m/BIP350 witness-v1+ and base58check address

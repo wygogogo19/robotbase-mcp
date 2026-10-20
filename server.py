@@ -29,7 +29,7 @@ except Exception:            # noqa: BLE001
 PORT = int(os.environ.get("RB_PORT", "8090"))
 BIND = os.environ.get("RB_BIND", "127.0.0.1")
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "robotbase-mcp", "version": "0.25.2", "title": "RobotBase MCP — search, read, verify and pay from one read-only endpoint"}
+SERVER_INFO = {"name": "robotbase-mcp", "version": "0.26.0", "title": "RobotBase MCP — search, read, verify and pay from one read-only endpoint"}
 BTC_ENV = os.environ.get("RB_BTC_ENV", "")
 ZEC_BASE = os.environ.get("RB_ZEC_BASE", "http://127.0.0.1:8080")
 HOME_BASE = os.environ.get("RB_HOME_BASE", "http://127.0.0.1:8081")
@@ -2434,7 +2434,7 @@ WEB_SEARCH_TTL = _env_int("RB_WEB_SEARCH_TTL", 600)
 WEB_FETCH_TTL = _env_int("RB_WEB_FETCH_TTL", 1800)
 WEB_TRUNCATE = _env_int("RB_WEB_TRUNCATE", 12000)
 WEB_CACHE_MAX_MB = _env_int("RB_WEB_CACHE_MAX_MB", 100)
-WEB_UA = os.environ.get("RB_WEB_UA", "RobotBaseMCP/0.25.2 (+https://robotbase.cc/mcp)")
+WEB_UA = os.environ.get("RB_WEB_UA", "RobotBaseMCP/0.26.0 (+https://robotbase.cc/mcp)")
 WEB_RATE_PER_MIN = _env_int("RB_WEB_RATE_PER_MIN", 20)
 WEB_MAX_BYTES = 2 * 1024 * 1024          # 解压后正文上限 2 MB
 WEB_TIMEOUT_CONNECT = 5.0                # 建连上限
@@ -3717,9 +3717,37 @@ def _tool_meta(name, sch):
     }
 
 
+# 2026-10-20: web-first, high-frequency-first public order. The internal TOOLS
+# definition stays grouped by backend; tools/list and server.json are emitted in
+# this order (CyberLibrary is last; the hosted endpoint has 16 library tools).
+DISPLAY_GROUPS = [
+    ("web", ["web_search", "web_fetch"]),
+    ("meta", ["list_chains", "chain_status", "robotbase_services", "robotbase_capabilities"]),
+    ("btc", ["btc_get_mempool_state", "btc_get_fee_rates", "btc_get_transaction",
+             "btc_get_block", "btc_get_address", "btc_get_network_stats",
+             "broadcast_raw_transaction"]),
+    ("eth", ["eth_get_block", "eth_read_contract", "eth_get_logs", "eth_get_transaction",
+             "eth_get_account", "eth_get_fee_rates"]),
+    ("tron", ["tron_check_address_risk", "tron_verify_usdt_transfer", "tron_get_current_block",
+              "tron_get_transaction", "tron_get_account", "tron_read_contract", "tron_get_block",
+              "tron_get_node_status", "tron_get_contract", "tron_get_chain_economics",
+              "tron_list_witnesses", "tron_list_proposals"]),
+    ("xmr", ["xmr_get_recent_blocks", "xmr_get_block", "xmr_get_node_status", "xmr_get_fee_rates",
+             "xmr_get_mempool_state", "xmr_get_transaction", "xmr_get_network_stats",
+             "xmr_verify_payment", "xmr_get_output_distribution"]),
+    ("zec", ["zec_get_recent_blocks", "zec_get_pool_status", "zec_get_transaction",
+             "zec_get_treestate", "zec_get_network_stats"]),
+]
+_DISPLAY_RANK = {n: i for i, n in enumerate(n for _g, names in DISPLAY_GROUPS for n in names)}
+
+
+def _ordered_tools():
+    return sorted(TOOLS, key=lambda t: _DISPLAY_RANK.get(t[0], 10 ** 9))
+
+
 def tools_list():
     out = []
-    for n, d, sch, _fn in TOOLS:
+    for n, d, sch, _fn in _ordered_tools():
         row = {"name": n, "description": d}
         row.update(_tool_meta(n, sch))
         out.append(row)
@@ -4264,7 +4292,7 @@ def server_card():
                     "payment": "x402 (HTTP 402) in USDC on Base or Solana; credit packs 10 calls / 0.10 USDC and 100 calls / 1.00 USDC; payment rail only - no Base or Solana chain data",
                     "api_key": "not offered", "subscription": "not offered",
                     "top_up": TOPUP_URL},
-        "tools": [{"name": n, "description": desc[n]} for n, _d, _s, _f in TOOLS],
+        "tools": [{"name": n, "description": desc[n]} for n, _d, _s, _f in _ordered_tools()],
     }
 
 
