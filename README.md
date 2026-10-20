@@ -34,7 +34,7 @@ The hosted endpoint answers with **72 strictly read-only tools** (44 free verifi
 |---|---|---|
 | **Verification (41 tools)** | Fee, mempool, tx/block/address verification, node and shielded-pool telemetry, optional raw-tx relay | **Free forever**, no key, no signup |
 | **Risk intelligence (2 tools)** | `tron_check_address_risk`, `tron_verify_usdt_transfer` | **5 calls/day per IP** free, resets 00:00 Asia/Shanghai |
-| **Web tools (2 tools)** | `web_search` (ranked web results) and `web_fetch` (readable text of one public URL) — independent buckets, so searching never eats the risk allowance | **20 searches + 50 fetches/day per IP** free, resets 00:00 Asia/Shanghai |
+| **Web tools (2 tools)** | `web_search` (ranked web results) and `web_fetch` (readable text of one public URL) — one shared web bucket, independent of the risk allowance | **100 calls/day per IP shared by both web tools**, resets 00:00 Asia/Shanghai |
 | **x402 credit packs** | Past the free allowance, each metered call costs **$0.01** (1 credit: risk 1, `web_search` 1, `web_fetch` 1) | **10 calls / 0.10 USDC** or **100 calls / 1.00 USDC** in USDC on Base or Solana, paid from the caller's own wallet — payment rail only, no Base/Solana chain data |
 
 **Base and Solana are a payment rail only.** x402 settles in USDC on Base or Solana, but RobotBase does **not** serve Base or Solana chain data: those eight data tools were retired on 2026-10-18, and the roster is Bitcoin, Ethereum, Monero, Zcash and Tron.
@@ -127,9 +127,7 @@ check the claim on chain. No API key is needed to call them.
 | `web_search(query, count?, freshness?, site?, lang?)` | Ranked web results with title, URL, snippet and published date. **Serper is the primary provider**, with Tavily, Brave and a zero-key `cn.bing` RSS feed as fallbacks; the answer carries a `provider` field. Results are deduplicated (one domain cannot take more than ~40% of a result set) and cached for up to 10 minutes | "What is the BTC fee market saying today?" "Recent Zcash governance proposals?" |
 | `web_fetch(url, max_chars?, format?)` | Readable text/markdown of **one** public URL: `robots.txt` is checked first and `scripts`/`nav`/`header`/`footer` are stripped by a standard-library extractor. Direct fetch is tried first; pages blocked from this node are fetched through the provider fallback and marked `source=provider`. Response capped at 12,000 characters per call | "Read this article and summarise it" "Turn this URL into clean markdown" |
 
-**Independent free allowance:** `web_search` 20 calls/day per IP and `web_fetch` 50 calls/day per
-IP, in separate buckets from the 5/day risk allowance — searching can never consume the risk
-tools' free calls. A cached search still counts as one call against the free allowance; a paid
+**Shared free allowance:** the two web tools share **100 calls/day per IP**, in a bucket separate from the 5/day risk allowance — searching can never consume the risk tools' free calls. A cached search still counts as one call against the free allowance; a paid
 call answered from cache does not spend a credit. Past the allowance each call is 1 x402 credit
 ($0.01), charged through the same USDC credit balance as the risk tools.
 
@@ -246,7 +244,7 @@ Most MCP servers wrap a third-party API. These come from infrastructure we opera
 - Responses are trimmed to ~3.8 KB per call to protect LLM context; `web_fetch` is the
   exception (12,000 characters) because its whole point is to return a page's text.
 - **Web tools** have an extra 20 req/min/IP limit on top of the 120/min/IP overall limit, and
-  their free allowance (20 searches + 50 fetches/day/IP) is tracked in separate buckets.
+  their free allowance (100 calls/day/IP shared by both web tools) is tracked separately.
 
 ## Self-hosting (this repo)
 
@@ -274,8 +272,8 @@ export RB_TAVILY_KEY=...                                  # fallback search + fe
 export RB_BRAVE_KEY=...                                   # optional extra search fallback
 export RB_SERPER_DAILY_CALLS=200                          # optional: daily Serper call cap
 export RB_TAVILY_DAILY_CREDITS=15                         # optional: daily Tavily credit cap
-export RB_WEB_SEARCH_FREE=20 RB_WEB_FETCH_FREE=50         # optional: per-IP free web allowance
-export RB_WEB_SEARCH_GLOBAL=100 RB_WEB_FETCH_GLOBAL=200   # optional: site-wide free web caps
+export RB_WEB_FREE=100                                    # optional: per-IP free web allowance (shared by web tools)
+export RB_WEB_GLOBAL=2000                                 # optional: site-wide free web cap
 export RB_WEB_DAILY_BUDGET_USD=5                          # optional: daily upstream spend breaker
 export RB_WEB_TRUNCATE=12000 RB_WEB_CACHE_MAX_MB=100      # optional: web_fetch cap / cache cap
 export RB_WEB_UA='RobotBaseMCP/0.25.2 (+https://robotbase.cc/mcp)'  # optional: crawler User-Agent
@@ -292,6 +290,7 @@ See [`examples/`](./examples) for client configs, [`examples/env.example`](./exa
 
 ## Reference implementation history
 
+- **2026-10-20 — v0.27.0**: the 10 hosted web tools now share **100 calls/day per IP** (previously `web_search` 20 + other 9 shared 50); reference implementation's 2 web tools use the same shared-100 policy. Paid points, risk/library 5/day, and all other terms unchanged.
 - **2026-10-20 — v0.26.0**: public tool order is now web-first / high-frequency-first (`tools/list`, `server.json`, README table); hosted endpoint stays at 72 tools (44 free + 2 risk + 16 CyberLibrary + 10 web), reference implementation remains 45 tools.
 - **2026-10-19 — v0.25.2**: hosted surface reaches 72 tools (10 web tools incl. `web_crawl`/`web_extract`/`web_act` and OCR; self-hosted SearXNG primary for `web_search`; 16 CyberLibrary tools). This release also ports the defect fixes that shipped in the hosted service (v0.22.0/v0.22.1) into this 45-tool reference implementation. Highlights: JSON-safe truncation (responses
   over the transport cap stay **valid JSON** and carry `_truncated` / `_original_chars` metadata

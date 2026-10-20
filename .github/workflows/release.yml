@@ -48,7 +48,7 @@ jobs:
           **search → read → verify → pay.** Hosted endpoint: https://robotbase.cc/mcp
 
           - **Web tools** — `web_search` (self-hosted SearXNG primary: Bing/Baidu/360/Sogou/Yandex; Serper/Tavily/cn.bing RSS fallbacks), `web_fetch` (robots.txt + SSRF-guarded; OCR, provider fallback), plus screenshot, map, batch, feed, metadata, crawl, extract and act.
-            Independent free buckets: 20 searches / 50 fetch-family calls per IP per day, then 1–3 credits over x402.
+            Independent free buckets: 100 shared web calls per IP per day, then 1–3 credits over x402.
           - **Verification & risk** — BTC / ETH / XMR / ZEC / TRON read from nodes we run ourselves,
             plus TRON address risk and TRC-20 USDT settlement verification.
           - **CyberLibrary** — 80k+ public-domain books in 25 languages (hosted-only, 16 metered tools).

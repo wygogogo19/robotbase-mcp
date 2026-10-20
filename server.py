@@ -29,7 +29,7 @@ except Exception:            # noqa: BLE001
 PORT = int(os.environ.get("RB_PORT", "8090"))
 BIND = os.environ.get("RB_BIND", "127.0.0.1")
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "robotbase-mcp", "version": "0.26.0", "title": "RobotBase MCP — search, read, verify and pay from one read-only endpoint"}
+SERVER_INFO = {"name": "robotbase-mcp", "version": "0.27.0", "title": "RobotBase MCP — search, read, verify and pay from one read-only endpoint"}
 BTC_ENV = os.environ.get("RB_BTC_ENV", "")
 ZEC_BASE = os.environ.get("RB_ZEC_BASE", "http://127.0.0.1:8080")
 HOME_BASE = os.environ.get("RB_HOME_BASE", "http://127.0.0.1:8081")
@@ -2394,7 +2394,7 @@ TOOLS = [    ("list_chains",
 # → Tavily（备选，日 credit 上限默认 15）→ Brave（可选，很多网络不可达，3s 快速失败）
 # → cn.bing RSS（零 key 最后兜底）；抓取优先直连 + 标准库正文抽取，直连失败/被墙再走
 # Tavily /extract。边界：纯标准库、单文件、不新增常驻服务；既有 43 个工具的行为一行不改。
-# 计费：web 独立免费额度桶（search 20/天/IP、fetch 50/天/IP；全站 100/200），
+# 计费：web 2 工具共享 100/天/IP；全站 2000。
 #       超出走既有 x402 402 流程；web_search / web_fetch 各 1 credit。
 WEB_TOOLS = ("web_search", "web_fetch")
 METERED_TOOLS = RISK_TOOLS + WEB_TOOLS
@@ -2422,10 +2422,8 @@ TAVILY_EXTRACT_URL = os.environ.get("RB_TAVILY_EXTRACT_URL", "https://api.tavily
 SERPER_SEARCH_URL = os.environ.get("RB_SERPER_SEARCH_URL", "https://google.serper.dev/search")
 BRAVE_SEARCH_URL = os.environ.get("RB_BRAVE_SEARCH_URL", "https://api.search.brave.com/res/v1/web/search")
 BING_RSS_URL = os.environ.get("RB_BING_RSS_URL", "https://cn.bing.com/search")
-WEB_SEARCH_FREE = _env_int("RB_WEB_SEARCH_FREE", 20)
-WEB_FETCH_FREE = _env_int("RB_WEB_FETCH_FREE", 50)
-WEB_SEARCH_GLOBAL = _env_int("RB_WEB_SEARCH_GLOBAL", 100)
-WEB_FETCH_GLOBAL = _env_int("RB_WEB_FETCH_GLOBAL", 200)
+WEB_FREE = _env_int("RB_WEB_FREE", 100)
+WEB_GLOBAL = _env_int("RB_WEB_GLOBAL", 2000)
 TAVILY_DAILY_CREDITS = _env_int("RB_TAVILY_DAILY_CREDITS", 15)
 SERPER_DAILY_CALLS = _env_int("RB_SERPER_DAILY_CALLS", 200)
 WEB_DAILY_BUDGET_MICRO = int(_env_float("RB_WEB_DAILY_BUDGET_USD", 5.0) * 1_000_000)
@@ -2633,9 +2631,8 @@ def _serper_daily_take():
 
 # ---------------------------------------------------------------- 独立免费额度桶
 def _web_quota_cfg(name):
-    if name == "web_search":
-        return "ws", WEB_SEARCH_FREE, "__global_web_search__", WEB_SEARCH_GLOBAL
-    return "wf", WEB_FETCH_FREE, "__global_web_fetch__", WEB_FETCH_GLOBAL
+    # 2026-10-20: both web tools share one 100/day/IP bucket.
+    return "w", WEB_FREE, "__global_web__", WEB_GLOBAL
 
 
 def _web_quota(name, consume=False):
@@ -3602,7 +3599,7 @@ _WEB_SEARCH_DESC = (
     "Returns: {query, count, results:[{title,url,snippet,published}], provider "
     "(serper|tavily|brave|bing_rss), cached, took_ms, _metering}. Results may be cached for up "
     "to 10 minutes; a cached result still counts as one call against the free allowance. "
-    "Metered: 20 free searches/day per IP (separate from the risk-tool allowance), then 1 "
+    "Metered: both web tools share 100 free calls/day per IP (separate from the risk-tool allowance), then 1 "
     "credit per call over x402 - there is no API key; the 402 answer carries accepts[]. "
     "Max count is 10."
 )
@@ -3619,7 +3616,7 @@ _WEB_FETCH_DESC = (
     "per call; raise max_chars (up to 20000) when you need more. Reads one public URL only, "
     "respects robots.txt, and does not bypass login or paywall. Direct fetch is tried first; "
     "pages blocked from this node are fetched through a provider and marked source=provider. "
-    "Metered: 50 free fetches/day per IP (separate from the risk-tool allowance), then 1 "
+    "Metered: both web tools share 100 free calls/day per IP (separate from the risk-tool allowance), then 1 "
     "credit per call over x402 - there is no API key; the 402 answer carries accepts[]."
 )
 WEB_TOOL_SPECS = [
@@ -3944,7 +3941,7 @@ def handle(msg):
                              "to 10 minutes) and web_fetch returns readable markdown/text of one public "
                              "URL (robots.txt-respecting, SSRF-guarded, no login or paywall bypass, capped "
                              "at 12000 characters per call). They have their own free daily allowance per "
-                             "IP (web_search 20, web_fetch 50, reset 00:00 Asia/Shanghai, separate from "
+                             "IP (both web tools share 100 calls/day, reset 00:00 Asia/Shanghai, separate from "
                              "the risk allowance) and are metered at 1 credit each. Metering is safe to retry: "
                              "repeating the exact same risk query within 5 minutes is answered from cache "
                              "with charged_this_call=false, and a locally invalid argument is rejected "
@@ -4109,7 +4106,7 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
 <div class="card"><div class="grid">
 <div><div class="muted">Verification tools</div><div><b>Free</b> - no key, no signup</div></div>
 <div><div class="muted">Risk tools</div><div><b>5 free/day per IP</b>, then <b>$0.01</b> per call by x402</div></div>
-<div><div class="muted">Web tools</div><div><b>20 searches + 50 fetches/day per IP</b> free (separate buckets); <b>20 req/min/IP</b>; then <b>$0.01</b> per call by x402</div></div>
+<div><div class="muted">Web tools</div><div><b>100 calls/day per IP shared by both web tools</b>; <b>20 req/min/IP</b>; then <b>$0.01</b> per call by x402</div></div>
 <div><div class="muted">Payment</div><div>USDC on Base or Solana via x402 - <b>payment rail only, no Base/Solana chain data</b>; no API key, no subscription</div></div>
 <div><div class="muted">Anonymous</div><div><b>120 req/min/IP</b></div></div>
 <div><div class="muted">Privacy</div><div>Audit keeps only the first 16 chars of the IP SHA256 — <b>query arguments are never logged</b></div></div>
@@ -4143,8 +4140,7 @@ with Tavily / Brave / cn.bing RSS fallbacks; results may be cached for up to 10 
 no login/paywall bypass; direct fetch first, provider fallback for pages blocked from this node;
 response capped at 12000 characters</li>
 </ul>
-  <p class="muted" style="margin-bottom:0">Independent free allowance: <b>20 searches and 50 fetches
-  per day per IP</b> (separate from the risk-tool allowance), then <b>$0.01 per call</b> by x402.
+  <p class="muted" style="margin-bottom:0">Independent free allowance: <b>100 calls per day per IP, shared by both web tools</b> (separate from the risk-tool allowance), then <b>$0.01 per call</b> by x402.
   A cached search still counts as one call against the free allowance; a paid cache hit does not
   spend a credit. All fetching is SSRF-guarded: private, loopback, link-local and cloud-metadata
   addresses are rejected, redirects are re-checked hop by hop, and responses are capped at 2 MB.</p>
@@ -4154,7 +4150,7 @@ response capped at 12000 characters</li>
 <div class="card"><div class="grid">
 <div><div class="muted">Verification tools (41)</div><div><b>$0</b> — free forever, no key, no signup</div></div>
 <div><div class="muted">Risk intelligence (2 tools)</div><div><b>__RISK_FREE__ calls/day per IP free</b>, then <b>$0.01</b> per call</div></div>
-<div><div class="muted">Web tools (2 tools)</div><div><b>20 searches + 50 fetches/day per IP free</b> (separate allowance), then <b>$0.01</b> per call</div></div>
+<div><div class="muted">Web tools (2 tools)</div><div><b>100 calls/day per IP shared by both web tools</b>, then <b>$0.01</b> per call</div></div>
 <div><div class="muted">How you pay</div><div><b>x402</b> — USDC on Base or Solana, paid by the caller's own wallet; <b>payment rail only</b>, no Base/Solana chain data</div></div>
 <div><div class="muted">Credit packs</div><div><b>10 calls / 0.10 USDC</b> · <b>100 calls / 1.00 USDC</b> — live terms in <code>accepts[]</code></div></div>
 </div>
@@ -4263,7 +4259,7 @@ def server_card():
                        "web_metadata, web_crawl, web_extract and web_act add screenshots, URL "
                        "discovery, batch reads, feeds, metadata, same-host crawling, structured "
                        "extraction and limited browser interaction. Web tools share a free daily "
-                       "allowance per IP (search 20, fetch-family 50) and are metered from 1 to 3 "
+                       "allowance per IP (both web tools share 100 calls/day) and are metered from 1 to 3 "
                        "x402 credits per call. The hosted endpoint adds sixteen CyberLibrary book "
                        "tools, for 72 hosted tools in total; this repository is the 45-tool "
                        "reference implementation. No API key, no account and no subscription are "
@@ -4288,7 +4284,7 @@ def server_card():
                  "web-search", "web-fetch", "search", "fetch", "web-screenshot", "web-map",
                  "web-crawl", "rss", "books", "x402"],
         "pricing": {"verification_tools": "free", "risk_tools": "%d free calls/day per IP, then 0.01 USDC per call" % RISK_FREE_PER_DAY,
-                    "web_tools": "20 searches + 50 fetches/day per IP free (separate buckets), then 0.01 USDC per credit over x402 (web_search 1, web_fetch 1)",
+                    "web_tools": "100 calls/day per IP shared by both web tools, then 0.01 USDC per credit over x402 (web_search 1, web_fetch 1)",
                     "payment": "x402 (HTTP 402) in USDC on Base or Solana; credit packs 10 calls / 0.10 USDC and 100 calls / 1.00 USDC; payment rail only - no Base or Solana chain data",
                     "api_key": "not offered", "subscription": "not offered",
                     "top_up": TOPUP_URL},

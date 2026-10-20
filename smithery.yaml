@@ -13,7 +13,7 @@ description: >-
   web_act). This repo is the dependency-free reference implementation (45 tools; CyberLibrary and
   8 additional web tools are hosted-only). Base and
   Solana are x402 payment rails only — no chain data is served for them.
-version: 0.26.0
+version: 0.27.0
 license: MIT
 homepage: https://robotbase.cc/mcp
 repository: https://github.com/wygogogo19/robotbase-mcp
