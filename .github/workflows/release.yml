@@ -53,7 +53,7 @@ jobs:
             plus TRON address risk and TRC-20 USDT settlement verification.
           - **CyberLibrary** — 80k+ public-domain books in 25 languages (hosted-only, 16 metered tools).
 
-          Hosted surface: **72 tools** (44 free verification + 2 risk + 16 CyberLibrary + 10 web).
+          Hosted surface: **76 tools** (44 free verification + 2 risk + 16 CyberLibrary + 14 web).
           This repository is the dependency-free reference implementation: **45 tools**.
           No API keys, no accounts, no custody. Base and Solana are x402 payment rails only — no chain data is served for them.
 
@@ -61,5 +61,5 @@ jobs:
           EOF
           )
           gh release create "$TAG" \
-            --title "$TAG — search, read, verify, pay (72 hosted tools)" \
+            --title "$TAG — search, read, verify, pay (76 hosted tools)" \
             --notes "$NOTES"

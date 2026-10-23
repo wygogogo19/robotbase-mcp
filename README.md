@@ -4,13 +4,13 @@
 
 **免鉴权 · 无追踪 · 只读** ｜ 自建裸金属全节点，对 Agent 暴露统一的「验证 + 风控」语义入口
 
-Hosted endpoint: **72 tools** — ten web tools (search, fetch, screenshot, map, batch, feed, metadata, crawl, extract, act), on-chain verification & risk on **Bitcoin · Ethereum · Monero · Zcash · Tron**, and **16 CyberLibrary book tools**. This repository is the dependency-free reference implementation: **45 tools** (41 free verification + 2 risk + 2 web); the hosted endpoint additionally bundles 3 free XMR wallet/merchant tools, 16 CyberLibrary tools and 8 more web tools.
+Hosted endpoint: **76 tools** — fourteen web tools (search, fetch, screenshot, map, batch, feed, metadata, crawl, extract, act, extract_schema, diff, crawl_async, crawl_job), on-chain verification & risk on **Bitcoin · Ethereum · Monero · Zcash · Tron**, and **16 CyberLibrary book tools**. This repository is the dependency-free reference implementation: **45 tools** (41 free verification + 2 risk + 2 web); the hosted endpoint additionally bundles 3 free XMR wallet/merchant tools, 16 CyberLibrary tools and 12 more web tools.
 
 - **Install guide for agents:** [`llms-install.md`](./llms-install.md) · **Privacy:** <https://robotbase.cc/privacy> · **Security:** [`SECURITY.md`](./SECURITY.md)
 
 > **Base and Solana data tools were retired on 2026-10-18.** The five-chain surface is Bitcoin, Ethereum, Monero, Zcash and Tron. x402 payments still settle in USDC on Base or Solana; that is a payment rail, not a data service.
 
-[![Hosted tools](https://img.shields.io/badge/hosted%20tools-72-brightgreen)](https://robotbase.cc/mcp/tools) [![Reference tools](https://img.shields.io/badge/reference%20tools-45-blue)](https://github.com/wygogogo19/robotbase-mcp)
+[![Hosted tools](https://img.shields.io/badge/hosted%20tools-76-brightgreen)](https://robotbase.cc/mcp/tools) [![Reference tools](https://img.shields.io/badge/reference%20tools-45-blue)](https://github.com/wygogogo19/robotbase-mcp)
 [![Protocol](https://img.shields.io/badge/MCP-2025--06--18-blue)](https://modelcontextprotocol.io)
 [![Transport](https://img.shields.io/badge/transport-streamable--http-orange)](https://robotbase.cc/mcp)
 [![Glama](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp/badges/score.svg)](https://glama.ai/mcp/servers/wygogogo19/robotbase-mcp)
@@ -26,7 +26,7 @@ Listed in the **official MCP Registry** as `io.github.wygogogo19/robotbase-mcp` 
 
 An autonomous agent handling crypto has exactly two blocking questions: **did this payment actually settle**, and **what will the next one cost**. Ask an LLM those today and it has nowhere reliable to look — the MCP ecosystem is rich in wrappers around hosted indexers and thin on self-run infrastructure.
 
-The hosted endpoint answers with **72 strictly read-only tools** (44 free verification tools + 2 metered risk tools + 16 metered CyberLibrary book tools + 10 metered web tools); this reference implementation ships **45** of them (41 free + 2 risk + 2 web). Everything is backed by our own full nodes, local indexes and a metered web layer: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, a full Monero surface (`xmr_get_fee_rates`, `xmr_get_transaction`, `xmr_verify_payment`, …) read straight off our own monerod, an Ethereum surface (`eth_get_transaction`, `eth_get_fee_rates`, `eth_read_contract`) on our own Reth node, and a Tron surface (`tron_read_contract`, `tron_get_transaction`) on our own java-tron node.
+The hosted endpoint answers with **76 strictly read-only tools** (44 free verification tools + 2 metered risk tools + 16 metered CyberLibrary book tools + 14 metered web tools); this reference implementation ships **45** of them (41 free + 2 risk + 2 web). Everything is backed by our own full nodes, local indexes and a metered web layer: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, a full Monero surface (`xmr_get_fee_rates`, `xmr_get_transaction`, `xmr_verify_payment`, …) read straight off our own monerod, an Ethereum surface (`eth_get_transaction`, `eth_get_fee_rates`, `eth_read_contract`) on our own Reth node, and a Tron surface (`tron_read_contract`, `tron_get_transaction`) on our own java-tron node.
 
 ## Pricing
 
@@ -75,7 +75,7 @@ export RB_X402_LEDGER_DB=./x402_credit.db
 python3 server.py
 ```
 
-With those unset, the server runs the free tier only. This repo ships the **45 chain/web tools** as a reference implementation — the only differences from the hosted endpoint are where the per-chain backends point (your `RB_*` variables instead of ours) and the hosted-only CyberLibrary bridge (16 book tools) and eight additional web tools (screenshot, map, batch, feed, metadata, crawl, extract, act), which are not included here.
+With those unset, the server runs the free tier only. This repo ships the **45 chain/web tools** as a reference implementation — the only differences from the hosted endpoint are where the per-chain backends point (your `RB_*` variables instead of ours) and the hosted-only CyberLibrary bridge (16 book tools) and twelve additional web tools (screenshot, map, batch, feed, metadata, crawl, extract, act, extract_schema, diff, crawl_async, crawl_job), which are not included here.
 
 Check a payer's balance without spending a call:
 
@@ -109,7 +109,7 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
 
 > Public order is **web-first, then high-frequency verification** (the order returned by `tools/list` and `server.json`); the hosted endpoint puts its 16 CyberLibrary tools last.
 
-> The hosted endpoint `https://robotbase.cc/mcp` has **72 tools**: these 45 plus 3 free XMR wallet/merchant tools, the 16 **CyberLibrary** book tools (`cyberlibrary_catalog_index`, `cyberlibrary_language_shard`, `cyberlibrary_book_meta`, `cyberlibrary_get_toc`, `cyberlibrary_get_chapter`, `cyberlibrary_get_markdown`, `cyberlibrary_cite`, `cyberlibrary_search_books`, `cyberlibrary_fulltext_search`, `cyberlibrary_service_info`, `cyberlibrary_get_chunks`, `cyberlibrary_verify_quote`, `cyberlibrary_search_passages`, `cyberlibrary_rag_context`, `cyberlibrary_semantic_search`, `cyberlibrary_search`) and eight additional web tools (`web_screenshot`, `web_map`, `web_fetch_batch`, `web_feed`, `web_metadata`, `web_crawl`, `web_extract`, `web_act`).
+> The hosted endpoint `https://robotbase.cc/mcp` has **76 tools**: these 45 plus 3 free XMR wallet/merchant tools, the 16 **CyberLibrary** book tools (`cyberlibrary_catalog_index`, `cyberlibrary_language_shard`, `cyberlibrary_book_meta`, `cyberlibrary_get_toc`, `cyberlibrary_get_chapter`, `cyberlibrary_get_markdown`, `cyberlibrary_cite`, `cyberlibrary_search_books`, `cyberlibrary_fulltext_search`, `cyberlibrary_service_info`, `cyberlibrary_get_chunks`, `cyberlibrary_verify_quote`, `cyberlibrary_search_passages`, `cyberlibrary_rag_context`, `cyberlibrary_semantic_search`, `cyberlibrary_search`) and twelve additional web tools (`web_screenshot`, `web_map`, `web_fetch_batch`, `web_feed`, `web_metadata`, `web_crawl`, `web_extract`, `web_act`, `web_extract_schema`, `web_diff`, `web_crawl_async`, `web_crawl_job`).
 
 ### Web tools (high-frequency)
 
@@ -244,7 +244,7 @@ Most MCP servers wrap a third-party API. These come from infrastructure we opera
 - Responses are trimmed to ~3.8 KB per call to protect LLM context; `web_fetch` is the
   exception (12,000 characters) because its whole point is to return a page's text.
 - **Web tools** have an extra 20 req/min/IP limit on top of the 120/min/IP overall limit, and
-  their free allowance (100 calls/day/IP shared by both web tools) is tracked separately.
+  their free allowance (100 calls/day/IP shared by all 14 web tools) is tracked separately.
 
 ## Self-hosting (this repo)
 
@@ -291,6 +291,7 @@ See [`examples/`](./examples) for client configs, [`examples/env.example`](./exa
 ## Reference implementation history
 
 - **2026-10-20 — v0.27.0**: the 10 hosted web tools now share **100 calls/day per IP** (previously `web_search` 20 + other 9 shared 50); reference implementation's 2 web tools use the same shared-100 policy. Paid points, risk/library 5/day, and all other terms unchanged.
+- **2026-10-23 — v0.30.0**: hosted surface reaches **76 tools** (44 free verification + 2 risk + 16 CyberLibrary + **14 web**), adding `web_extract_schema`, `web_diff`, `web_crawl_async` and `web_crawl_job`; reference implementation remains 45 tools. Registry/Glama/Smithery metadata synced to the hosted surface.
 - **2026-10-20 — v0.26.0**: public tool order is now web-first / high-frequency-first (`tools/list`, `server.json`, README table); hosted endpoint stays at 72 tools (44 free + 2 risk + 16 CyberLibrary + 10 web), reference implementation remains 45 tools.
 - **2026-10-19 — v0.25.2**: hosted surface reaches 72 tools (10 web tools incl. `web_crawl`/`web_extract`/`web_act` and OCR; self-hosted SearXNG primary for `web_search`; 16 CyberLibrary tools). This release also ports the defect fixes that shipped in the hosted service (v0.22.0/v0.22.1) into this 45-tool reference implementation. Highlights: JSON-safe truncation (responses
   over the transport cap stay **valid JSON** and carry `_truncated` / `_original_chars` metadata
