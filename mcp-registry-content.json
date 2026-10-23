@@ -1,0 +1,18 @@
+{
+ "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+ "name": "io.github.wygogogo19/robotbase-content",
+ "description": "Agent MCP: 35 tools — social hot lists, attention trends, 80k+ books, 17 web tools.",
+ "version": "0.32.0",
+ "repository": {
+  "url": "https://github.com/wygogogo19/robotbase-mcp",
+  "source": "github",
+  "id": "1368415872"
+ },
+ "websiteUrl": "https://content.robotbase.cc/mcp",
+ "remotes": [
+  {
+   "type": "streamable-http",
+   "url": "https://content.robotbase.cc/mcp"
+  }
+ ]
+}

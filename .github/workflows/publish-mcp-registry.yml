@@ -1,31 +1,29 @@
 name: Publish to MCP Registry
 
-# Publishes mcp-registry.json to the official MCP Registry using GitHub OIDC, so a
-# version bump only needs a commit (or a v* tag) instead of a manual CLI + device flow.
-#
-# The registry validates namespace ownership: the workflow must run in
-# wygogogo19/robotbase-mcp to publish io.github.wygogogo19/robotbase-mcp.
-
+# Publishes the three RobotBase editions to the official MCP Registry using
+# GitHub OIDC. Each manifest is a separate server entry:
+#   mcp-registry.json         -> io.github.wygogogo19/robotbase-mcp (Web3 alias)
+#   mcp-registry-dev.json     -> io.github.wygogogo19/robotbase-dev
+#   mcp-registry-content.json -> io.github.wygogogo19/robotbase-content
 on:
   push:
     branches: [main]
     paths:
-      - "mcp-registry.json"
+      - "mcp-registry*.json"
       - ".github/workflows/publish-mcp-registry.yml"
     tags: ["v*"]
   workflow_dispatch:
 
 permissions:
-  id-token: write      # required for OIDC authentication
+  id-token: write
   contents: read
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
 
       - name: Install mcp-publisher
         run: |
@@ -34,87 +32,25 @@ jobs:
       - name: Authenticate to the MCP Registry (GitHub OIDC)
         run: ./mcp-publisher login github-oidc
 
-      # A tag carries no manifest of its own: the version that ships is whatever
-      # mcp-registry.json says, not whatever the tag is called. Without this guard a
-      # re-pushed historical tag (v0.6.0 was force-pushed on 2026-10-14 while the
-      # public history was scrubbed) tries to re-publish an old, already-published
-      # version and ends as a red run that means nothing.
-      - name: Ignore tags that do not match the manifest version
-        id: tagguard
-        if: github.ref_type == 'tag'
+      - name: Publish each edition
         run: |
-          VERSION=$(python3 -c "import json;print(json.load(open('mcp-registry.json'))['version'])")
-          if [ "$GITHUB_REF_NAME" = "v$VERSION" ]; then
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Tag ignored::$GITHUB_REF_NAME does not match manifest v$VERSION — nothing to publish."
-          fi
-
-      # Fail fast with the registry's own error text instead of a red publish step.
-      # (The registry rejects e.g. descriptions longer than 100 characters.)
-      - name: Validate the manifest
-        run: ./mcp-publisher validate mcp-registry.json
-
-      # Reads the per-server /versions endpoint, not ?search=. The search
-      # endpoint took 57-180s per call under load on 2026-10-14 (and timed out
-      # past 120s in one shot) while /versions answers in ~3s, so this gate
-      # used to sit for minutes in the flakiest part of the registry.
-      - name: Skip if this version is already published
-        id: registry
-        run: |
-          VERSION=$(python3 -c "import json;print(json.load(open('mcp-registry.json'))['version'])")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          URL="https://registry.modelcontextprotocol.io/v0/servers/io.github.wygogogo19%2Frobotbase-mcp/versions"
-          STATE=unknown
-          if BODY=$(curl -fsS --retry 5 --retry-all-errors --retry-delay 5 --max-time 90 "$URL"); then
-            if printf '%s' "$BODY" \
-                 | python3 -c "import json,sys;d=json.load(sys.stdin);sys.exit(0 if any(i['server']['version']=='$VERSION' for i in d.get('servers',[])) else 1)"; then
-              STATE=published
-            else
-              STATE=new
+          set -euo pipefail
+          for f in mcp-registry.json mcp-registry-dev.json mcp-registry-content.json; do
+            echo "== $f"
+            VERSION=$(python3 -c "import json;print(json.load(open('$f'))['version'])")
+            if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+              echo "::notice title=Tag ignored::$GITHUB_REF_NAME does not match $f v$VERSION"
+              continue
             fi
-          fi
-          case "$STATE" in
-            published)
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              echo "::notice title=Already published::$VERSION is already in the MCP Registry — nothing to do."
-              ;;
-            new)
-              echo "skip=false" >> "$GITHUB_OUTPUT"
-              echo "::notice title=Publishing::$VERSION is new — will publish."
-              ;;
-            *)
-              # Inconclusive lookup: attempt the publish anyway and let the
-              # registry be the source of truth. A version that silently never
-              # ships is worse than a red run that says so.
-              echo "skip=false" >> "$GITHUB_OUTPUT"
-              echo "::warning title=Version lookup inconclusive::the registry read endpoint did not answer; attempting a publish."
-              ;;
-          esac
-
-      - name: Publish mcp-registry.json
-        if: steps.registry.outputs.skip != 'true' && steps.tagguard.outputs.skip != 'true'
-        run: |
-          # 2026-10-14 10:31 +08: the v0.8.0 publish call failed after exactly
-          # 60s while the registry was slow, then went through in 2s when the
-          # run was re-triggered. Retry in-step instead of waking us up.
-          VERSION=$(python3 -c "import json;print(json.load(open('mcp-registry.json'))['version'])")
-          for attempt in 1 2 3; do
-            OUT=$(./mcp-publisher publish mcp-registry.json 2>&1) && {
-              printf '%s\n' "$OUT"
-              echo "::notice title=Published::$VERSION publish succeeded on attempt $attempt"
-              exit 0
-            }
+            ./mcp-publisher validate "$f"
+            OUT=$(./mcp-publisher publish "$f" 2>&1) || true
             printf '%s\n' "$OUT"
-            # The lookup gate above can be inconclusive while the registry is slow;
-            # a duplicate-version rejection is not a failure, it is the state we want.
             if printf '%s' "$OUT" | grep -qiE 'already (exists|published)|duplicate|conflict'; then
-              echo "::notice title=Already published::$VERSION is already in the MCP Registry — nothing to do."
-              exit 0
+              echo "::notice title=Already published::$f v$VERSION"
+              continue
             fi
-            echo "::warning title=Publish attempt $attempt failed::retrying in 20s"
-            sleep 20
+            printf '%s' "$OUT" | grep -qiE 'published|success' || {
+              echo "::error title=Publish failed::$f"
+              exit 1
+            }
           done
-          echo "::error title=Publish failed::all 3 attempts returned an error from the registry."
-          exit 1

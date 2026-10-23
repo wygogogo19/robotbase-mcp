@@ -1,8 +1,8 @@
 {
  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
  "name": "io.github.wygogogo19/robotbase-mcp",
- "description": "Agent MCP: 79 tools — 17 web, BTC/ETH/XMR/ZEC/TRON verification & risk, 80k+ books.",
- "version": "0.31.1",
+ "description": "Agent MCP: 65 tools — 5-chain verification, risk, prediction & crypto trends, 17 web tools.",
+ "version": "0.32.0",
  "repository": {
   "url": "https://github.com/wygogogo19/robotbase-mcp",
   "source": "github",
