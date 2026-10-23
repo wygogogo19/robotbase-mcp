@@ -47,13 +47,13 @@ jobs:
 
           **search → read → verify → pay.** Hosted endpoint: https://robotbase.cc/mcp
 
-          - **Web tools** — `web_search` (self-hosted SearXNG primary: Bing/Baidu/360/Sogou/Yandex; Serper/Tavily/cn.bing RSS fallbacks), `web_fetch` (robots.txt + SSRF-guarded; OCR, provider fallback), plus screenshot, map, batch, feed, metadata, crawl, extract and act.
+          - **Web tools** — `web_search` (self-hosted SearXNG primary: Bing/Baidu/360/Sogou/Yandex; Serper/Tavily/cn.bing RSS fallbacks), `web_fetch` (robots.txt + SSRF-guarded; OCR, provider fallback), plus screenshot, map, batch, feed, metadata, crawl, extract, act, schema extraction, diff, async crawl and scheduled change monitors with optional HMAC-SHA256 webhooks.
             Independent free buckets: 100 shared web calls per IP per day, then 1–3 credits over x402.
           - **Verification & risk** — BTC / ETH / XMR / ZEC / TRON read from nodes we run ourselves,
             plus TRON address risk and TRC-20 USDT settlement verification.
           - **CyberLibrary** — 80k+ public-domain books in 25 languages (hosted-only, 16 metered tools).
 
-          Hosted surface: **76 tools** (44 free verification + 2 risk + 16 CyberLibrary + 14 web).
+          Hosted surface: **79 tools** (44 free verification + 2 risk + 16 CyberLibrary + 17 web).
           This repository is the dependency-free reference implementation: **45 tools**.
           No API keys, no accounts, no custody. Base and Solana are x402 payment rails only — no chain data is served for them.
 
@@ -61,5 +61,5 @@ jobs:
           EOF
           )
           gh release create "$TAG" \
-            --title "$TAG — search, read, verify, pay (76 hosted tools)" \
+            --title "$TAG — search, read, verify, pay (79 hosted tools)" \
             --notes "$NOTES"

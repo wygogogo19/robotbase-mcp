@@ -35,8 +35,8 @@ claude mcp add --transport http robotbase https://robotbase.cc/mcp
 
 ## What you get
 
-- 14 web tools: `web_search`, `web_fetch`, `web_screenshot`, `web_map`, `web_fetch_batch`,
-  `web_feed`, `web_metadata`, `web_crawl`, `web_extract`, `web_act`, `web_extract_schema`, `web_diff`, `web_crawl_async`, `web_crawl_job`.
+- 17 web tools: `web_search`, `web_fetch`, `web_screenshot`, `web_map`, `web_fetch_batch`,
+  `web_feed`, `web_metadata`, `web_crawl`, `web_extract`, `web_act`, `web_extract_schema`, `web_diff`, `web_crawl_async`, `web_crawl_job`, `web_monitor_set`, `web_monitor_list`, `web_monitor_delete`.
 - 44 free verification tools across Bitcoin, Ethereum, Monero, Zcash and Tron
   (`btc_get_fee_rates`, `btc_get_transaction`, `eth_read_contract`, `xmr_verify_payment`,
   `zec_get_pool_status`, `tron_verify_usdt_transfer`, ...).
@@ -72,7 +72,7 @@ Base/Solana chain data is served. Free tier needs no wallet.
 - **Timeout / blocked site** — `web_fetch` tries direct fetch first, then a provider fallback;
   some sites are unreachable from our egress. The tool returns a readable error rather than
   empty content.
-- **Tool not found** — refresh the client's tool list; the hosted surface currently has 76 tools.
+- **Tool not found** — refresh the client's tool list; the hosted surface currently has 79 tools.
 
 ## Self-hosting (optional)
 
