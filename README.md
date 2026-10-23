@@ -26,7 +26,7 @@ Listed in the **official MCP Registry** as `io.github.wygogogo19/robotbase-mcp` 
 
 An autonomous agent handling crypto has exactly two blocking questions: **did this payment actually settle**, and **what will the next one cost**. Ask an LLM those today and it has nowhere reliable to look — the MCP ecosystem is rich in wrappers around hosted indexers and thin on self-run infrastructure.
 
-The hosted endpoint answers with **79 strictly read-only tools** (44 free verification tools + 2 metered risk tools + 16 metered CyberLibrary book tools + 17 web tools, of which 14 are metered and 3 are free monitor helpers); this reference implementation ships **45** of them (41 free + 2 risk + 2 web). Everything is backed by our own full nodes, local indexes and a metered web layer: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, a full Monero surface (`xmr_get_fee_rates`, `xmr_get_transaction`, `xmr_verify_payment`, …) read straight off our own monerod, an Ethereum surface (`eth_get_transaction`, `eth_get_fee_rates`, `eth_read_contract`) on our own Reth node, and a Tron surface (`tron_read_contract`, `tron_get_transaction`) on our own java-tron node.
+The hosted endpoint answers with **79 strictly read-only tools** (44 free verification tools + 2 metered risk tools + 16 metered CyberLibrary book tools + 17 web tools: 14 metered plus 3 free helpers — `web_crawl_job`, `web_monitor_list` and `web_monitor_delete`); this reference implementation ships **45** of them (41 free + 2 risk + 2 web). Everything is backed by our own full nodes, local indexes and a metered web layer: `btc_get_transaction` for the settlement check, `btc_get_fee_rates` and `btc_get_mempool_state` for the price of the next one, `zec_get_pool_status` for Zcash shielded-pool supply, a full Monero surface (`xmr_get_fee_rates`, `xmr_get_transaction`, `xmr_verify_payment`, …) read straight off our own monerod, an Ethereum surface (`eth_get_transaction`, `eth_get_fee_rates`, `eth_read_contract`) on our own Reth node, and a Tron surface (`tron_read_contract`, `tron_get_transaction`) on our own java-tron node.
 
 ## Pricing
 
@@ -245,7 +245,7 @@ Most MCP servers wrap a third-party API. These come from infrastructure we opera
 - Responses are trimmed to ~3.8 KB per call to protect LLM context; `web_fetch` is the
   exception (12,000 characters) because its whole point is to return a page's text.
 - **Web tools** have an extra 20 req/min/IP limit on top of the 120/min/IP overall limit, and
-  their free allowance (100 calls/day/IP shared by all 17 web tools) is tracked separately.
+  their free allowance (100 calls/day/IP shared by the 14 metered web tools) is tracked separately.
 
 ## Self-hosting (this repo)
 
@@ -292,7 +292,7 @@ See [`examples/`](./examples) for client configs, [`examples/env.example`](./exa
 ## Reference implementation history
 
 - **2026-10-20 — v0.27.0**: the 10 hosted web tools now share **100 calls/day per IP** (previously `web_search` 20 + other 9 shared 50); reference implementation's 2 web tools use the same shared-100 policy. Paid points, risk/library 5/day, and all other terms unchanged.
-- **2026-10-23 — v0.31.0**: hosted surface reaches **79 tools** (44 free verification + 2 risk + 16 CyberLibrary + **17 web**: 14 metered + 3 free monitor helpers), adding `web_monitor_set`, `web_monitor_list` and `web_monitor_delete` for scheduled page-change monitoring with optional HMAC-SHA256 webhooks; reference implementation remains 45 tools. Tool count 79, metered 32. Registry/Glama/Smithery metadata synced to the hosted surface.
+- **2026-10-23 — v0.31.0**: hosted surface reaches **79 tools** (44 free verification + 2 risk + 16 CyberLibrary + **17 web**: 14 metered + 3 free helpers — `web_crawl_job`, `web_monitor_list`, `web_monitor_delete`), adding `web_monitor_set`, `web_monitor_list` and `web_monitor_delete` for scheduled page-change monitoring with optional HMAC-SHA256 webhooks; reference implementation remains 45 tools. Tool count 79, metered 32. Registry/Glama/Smithery metadata synced to the hosted surface.
 - **2026-10-23 — v0.30.0**: hosted surface reaches **76 tools** (44 free verification + 2 risk + 16 CyberLibrary + **14 web**), adding `web_extract_schema`, `web_diff`, `web_crawl_async` and `web_crawl_job`; reference implementation remains 45 tools. Registry/Glama/Smithery metadata synced to the hosted surface.
 - **2026-10-20 — v0.26.0**: public tool order is now web-first / high-frequency-first (`tools/list`, `server.json`, README table); hosted endpoint stays at 72 tools (44 free + 2 risk + 16 CyberLibrary + 10 web), reference implementation remains 45 tools.
 - **2026-10-19 — v0.25.2**: hosted surface reaches 72 tools (10 web tools incl. `web_crawl`/`web_extract`/`web_act` and OCR; self-hosted SearXNG primary for `web_search`; 16 CyberLibrary tools). This release also ports the defect fixes that shipped in the hosted service (v0.22.0/v0.22.1) into this 45-tool reference implementation. Highlights: JSON-safe truncation (responses

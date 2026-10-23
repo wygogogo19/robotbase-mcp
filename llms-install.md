@@ -35,7 +35,7 @@ claude mcp add --transport http robotbase https://robotbase.cc/mcp
 
 ## What you get
 
-- 17 web tools: `web_search`, `web_fetch`, `web_screenshot`, `web_map`, `web_fetch_batch`,
+- 17 web tools: 14 metered plus 3 free (`web_crawl_job`, `web_monitor_list`, `web_monitor_delete`): `web_search`, `web_fetch`, `web_screenshot`, `web_map`, `web_fetch_batch`,
   `web_feed`, `web_metadata`, `web_crawl`, `web_extract`, `web_act`, `web_extract_schema`, `web_diff`, `web_crawl_async`, `web_crawl_job`, `web_monitor_set`, `web_monitor_list`, `web_monitor_delete`.
 - 44 free verification tools across Bitcoin, Ethereum, Monero, Zcash and Tron
   (`btc_get_fee_rates`, `btc_get_transaction`, `eth_read_contract`, `xmr_verify_payment`,
