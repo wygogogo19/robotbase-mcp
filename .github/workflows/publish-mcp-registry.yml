@@ -35,7 +35,7 @@ jobs:
       - name: Publish each edition
         run: |
           set -euo pipefail
-          for f in mcp-registry.json mcp-registry-dev.json mcp-registry-content.json; do
+          for f in mcp-registry-web3.json mcp-registry-dev.json mcp-registry-content.json mcp-registry.json; do
             echo "== $f"
             VERSION=$(python3 -c "import json;print(json.load(open('$f'))['version'])")
             if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then

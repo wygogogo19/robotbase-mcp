@@ -10,6 +10,16 @@ Hosted surface: **three MCP editions**, all including the full **17-tool web too
 **Content** (`https://content.robotbase.cc/mcp`, **35 tools** — social hot lists, attention trends, 16 CyberLibrary book tools + web).
 `https://robotbase.cc/mcp` is the Web3 compatibility alias. This repository is the dependency-free reference implementation: **45 tools** (41 free verification + 2 risk + 2 web).
 
+| Edition | Endpoint | Tools | Audience |
+|---|---|---:|---|
+| **Web3** | `https://web3.robotbase.cc/mcp` | 65 | chain verification, risk, prediction markets, crypto trends |
+| **Dev** | `https://dev.robotbase.cc/mcp` | 18 | GitHub/HF/npm/PyPI/HN trends + web docs tooling |
+| **Content** | `https://content.robotbase.cc/mcp` | 35 | social hot lists, attention trends, books + web |
+| **Compatibility alias** | `https://robotbase.cc/mcp` | 65 | existing clients; resolves to Web3 |
+
+All four include the **17-tool web toolbox**. Free web allowance is **100 calls/day/IP per edition**; the x402 credit balance is shared.
+
+
 - **Install guide for agents:** [`llms-install.md`](./llms-install.md) · **Privacy:** <https://robotbase.cc/privacy> · **Security:** [`SECURITY.md`](./SECURITY.md)
 
 > **Base and Solana data tools were retired on 2026-10-18.** The five-chain surface is Bitcoin, Ethereum, Monero, Zcash and Tron. x402 payments still settle in USDC on Base or Solana; that is a payment rail, not a data service.
