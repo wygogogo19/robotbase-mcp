@@ -15,7 +15,8 @@ Hosted surface: **three MCP editions**, all including the full **17-tool web too
 | **Web3** | `https://web3.robotbase.cc/mcp` | 65 | chain verification, risk, prediction markets, crypto trends |
 | **Dev** | `https://dev.robotbase.cc/mcp` | 18 | GitHub/HF/npm/PyPI/HN trends + web docs tooling |
 | **Content** | `https://content.robotbase.cc/mcp` | 35 | social hot lists, attention trends, books + web |
-| **Compatibility alias** | `https://robotbase.cc/mcp` | 65 | existing clients; resolves to Web3 |
+
+> `https://robotbase.cc/mcp` is a compatibility alias of Web3 for existing clients — it is not a separate MCP server and should not be listed as a separate connector.
 
 All four include the **17-tool web toolbox**. Free web allowance is **100 calls/day/IP per edition**; the x402 credit balance is shared.
 
