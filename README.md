@@ -49,7 +49,7 @@ The Web3 edition answers with **65 strictly read-only tools** (44 free verificat
 |---|---|---|
 | **Verification (41 tools)** | Fee, mempool, tx/block/address verification, node and shielded-pool telemetry, optional raw-tx relay | **Free forever**, no key, no signup |
 | **Risk intelligence (2 tools)** | `tron_check_address_risk`, `tron_verify_usdt_transfer` | **5 calls/day per IP** free, resets 00:00 Asia/Shanghai |
-| **Web tools (2 tools)** | `web_search` (ranked web results) and `web_fetch` (readable text of one public URL) — one shared web bucket, independent of the risk allowance | **100 calls/day per IP shared by both web tools**, resets 00:00 Asia/Shanghai |
+| **Hosted web tools (17 tools)** | `web_search`, `web_fetch`, `web_crawl`, `web_map`, `web_extract`, `web_act`, `web_screenshot`, `web_feed`, `web_metadata`, `web_fetch_batch`, `web_diff`, `web_monitor_*` and helpers — one shared web bucket | **100 calls/day per IP, per edition**, resets 00:00 Asia/Shanghai |
 | **x402 credit packs** | Past the free allowance, each metered call costs **$0.01** (1 credit: risk 1, `web_search` 1, `web_fetch` 1) | **10 calls / 0.10 USDC** or **100 calls / 1.00 USDC** in USDC on Base or Solana, paid from the caller's own wallet — payment rail only, no Base/Solana chain data |
 
 **Base and Solana are a payment rail only.** x402 settles in USDC on Base or Solana, but RobotBase does **not** serve Base or Solana chain data: those eight data tools were retired on 2026-10-18, and the roster is Bitcoin, Ethereum, Monero, Zcash and Tron.
