@@ -4,9 +4,9 @@
  "description": "Agent MCP: 18 tools — GitHub/HF/npm/PyPI/HN trends plus 17 web tools for coding agents.",
  "version": "0.32.2",
  "repository": {
-  "url": "https://github.com/wygogogo19/robotbase-mcp",
+  "url": "https://github.com/wygogogo19/robotbase-dev",
   "source": "github",
-  "id": "1368415872"
+  "id": "1436784454"
  },
  "websiteUrl": "https://dev.robotbase.cc/mcp",
  "remotes": [
