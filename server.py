@@ -29,7 +29,7 @@ except Exception:            # noqa: BLE001
 PORT = int(os.environ.get("RB_PORT", "8090"))
 BIND = os.environ.get("RB_BIND", "127.0.0.1")
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "robotbase-mcp", "version": "0.31.0", "title": "RobotBase MCP — search, read, verify and pay from one read-only endpoint"}
+SERVER_INFO = {"name": "robotbase-mcp", "version": "0.32.0", "title": "RobotBase MCP — search, read, verify and pay from one read-only endpoint"}
 BTC_ENV = os.environ.get("RB_BTC_ENV", "")
 ZEC_BASE = os.environ.get("RB_ZEC_BASE", "http://127.0.0.1:8080")
 HOME_BASE = os.environ.get("RB_HOME_BASE", "http://127.0.0.1:8081")
@@ -229,8 +229,8 @@ def truncate(obj, limit=3800):
 # （BTC/ETH/XMR/ZEC/TRON），五条今天都是 live。成熟度仍只用 live / provisioning /
 # planned 三态；provisioning / planned 的链绝不冒充可查询。
 # LTC/DOGE/KAS/RVN、TON 以及 Base/Solana 均已从名册下线。
-CHAINS = ("btc", "eth", "xmr", "zec", "tron")
-ROSTER_CHAINS = ("btc", "eth", "xmr", "zec", "tron")
+CHAINS = ("btc", "xmr", "zec")
+ROSTER_CHAINS = ("btc", "xmr", "zec")
 
 
 def _as_num(v):
@@ -1350,7 +1350,7 @@ def t_zec_block_attribution_intel(blocks=200):
 # 用户指令：P1 主打「高价值风控工具 + 轻量聚合」，不做通用 RPC 转发。
 # 数据源一律是公开聚合接口（GoPlus Labs + TronGrid），只读、不接触私钥、不托管资金。
 # 计费：每个 IP 每天 5 次免费；超出后走 x402（USDC）。2026-10-16 起不再发放 API key。
-RISK_TOOLS = ("tron_check_address_risk", "tron_verify_usdt_transfer")
+RISK_TOOLS = ()   # 2026-11-20 TRON/ETH retired
 RISK_FREE_PER_DAY = 5
 RISK_DB = os.environ.get("RB_RISK_DB", "./risk_quota.db")
 GOPLUS_BASE = os.environ.get("RB_GOPLUS_BASE", "https://api.gopluslabs.io/api/v1")
@@ -3646,6 +3646,7 @@ WEB_TOOL_SPECS = [
      lambda a: t_web_fetch(a.get("url"), a.get("max_chars", 8000), a.get("format", "markdown"))),
 ]
 TOOLS.extend(WEB_TOOL_SPECS)
+TOOLS = [t for t in TOOLS if not t[0].startswith(("eth_", "tron_"))]
 
 
 def _metered_precheck(name, args):

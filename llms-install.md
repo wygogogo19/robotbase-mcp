@@ -1,7 +1,7 @@
 # Installing RobotBase MCP (for AI agents / Cline / Codex / Claude Code / Cursor)
 
 RobotBase is one remote MCP endpoint: live web search + fetch, on-chain verification and
-risk on five self-hosted chains, and 80k+ public-domain books. No API key, no account, no
+verification on four self-hosted chains, and 80k+ public-domain books. No API key, no account, no
 local process or container is required for the hosted endpoint.
 
 ## Endpoint
@@ -37,10 +37,10 @@ claude mcp add --transport http robotbase https://robotbase.cc/mcp
 
 - 17 web tools: 14 metered plus 3 free (`web_crawl_job`, `web_monitor_list`, `web_monitor_delete`): `web_search`, `web_fetch`, `web_screenshot`, `web_map`, `web_fetch_batch`,
   `web_feed`, `web_metadata`, `web_crawl`, `web_extract`, `web_act`, `web_extract_schema`, `web_diff`, `web_crawl_async`, `web_crawl_job`, `web_monitor_set`, `web_monitor_list`, `web_monitor_delete`.
-- 44 free verification tools across Bitcoin, Ethereum, Monero, Zcash and Tron
-  (`btc_get_fee_rates`, `btc_get_transaction`, `eth_read_contract`, `xmr_verify_payment`,
-  `zec_get_pool_status`, `tron_verify_usdt_transfer`, ...).
-- 2 TRON risk tools + 16 CyberLibrary book tools (catalog, TOC, chapter, Markdown, citations,
+- 29 free verification/raw-broadcast tools across Bitcoin, Litecoin, Monero and Zcash
+  (`btc_get_fee_rates`, `ltc_get_fee_rates`, `xmr_verify_payment`, `zec_get_pool_status`, ...).
+  The hosted Web3 edition has 52 tools; this repository ships a 27-tool BTC/XMR/ZEC reference subset.
+- 16 CyberLibrary book tools (hosted editions only; catalog, TOC, chapter, Markdown, citations,
   title search, full-text search, RAG context).
 
 ## Free tier and limits (per IP, per day)
@@ -50,7 +50,7 @@ claude mcp add --transport http robotbase https://robotbase.cc/mcp
 | Verification tools | free forever, no key | — |
 | Web search | 20 calls/day | 1 credit per call (x402) |
 | Fetch family | 50 calls/day | 1 credit per call (x402) |
-| Risk + CyberLibrary | 5 calls/day (shared) | 1–5 credits (risk 1, retrieval 1–2, full-text 5) |
+| CyberLibrary | 5 calls/day | retrieval 1–2, full-text 5 |
 
 Credits are prepaid USDC packs, paid by the caller's own wallet over x402 (USDC on Base or
 Solana), **not** an API key or subscription. Base and Solana are payment rails only; no
@@ -60,7 +60,7 @@ Base/Solana chain data is served. Free tier needs no wallet.
 
 - "What changed in the Bitcoin fee market today? Search, read the best result, then check BTC fee rates."
 - "Read this URL and give me a clean Markdown summary."
-- "Did this USDT transfer land, and is the sender risky?"
+- "Did this Litecoin transaction confirm, and what fee should the next one pay?"
 - "Find every mention of 'ledger' in Moby Dick, with citations."
 - "Verify this Monero payment using its tx key."
 

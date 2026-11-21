@@ -43,7 +43,7 @@ curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
 
 `web_search` ranks the live web (Serper primary; Tavily / Brave / cn.bing RSS fallbacks) and
 `web_fetch` returns the readable text of one public URL. They have their own free allowance —
-20 searches and 50 fetches per day per IP, in separate buckets from the risk tools — and then cost
+20 searches and 50 fetches per day per IP, in a separate bucket — and then cost
 1 x402 credit per call. Results may be cached for up to 10 minutes.
 
 ```bash
@@ -65,10 +65,10 @@ The response body is capped at 12,000 characters; raise `max_chars` (up to 20,00
 more of the page. `source` is `direct` when this node fetched the page itself and `provider` when
 a blocked page was fetched through the provider fallback.
 
-## 5. Metered risk tools and x402
+## 5. Metered web tools and x402
 
 There is **no API key**: `X-API-Key` is not part of this service and sending it changes nothing.
-The two risk tools have a free allowance of 5 calls/day per IP; past that the call returns
+The metered web tools have their own daily free allowance; past that the call returns
 `Payment Required` with machine-readable terms in `structuredContent.accepts[]` (USDC on Base or
 Solana, 10 calls / 0.10 USDC or 100 calls / 1.00 USDC; Base and Solana are a payment rail only —
 no Base or Solana chain data is served):
@@ -76,7 +76,7 @@ no Base or Solana chain data is served):
 ```bash
 curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":6,"method":"tools/call",
-       "params":{"name":"tron_check_address_risk","arguments":{"address":"T..."}}}'
+       "params":{"name":"web_fetch","arguments":{"url":"https://robotbase.cc/"}}}'
 ```
 
 Settle one pack, then re-send **the same payment payload** on later calls — it is idempotent per
@@ -85,7 +85,7 @@ payment nonce, so it is charged once and each call spends one credit:
 ```bash
 curl -s https://robotbase.cc/mcp -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":7,"method":"tools/call",
-       "params":{"name":"tron_check_address_risk","arguments":{"address":"T..."},
+       "params":{"name":"web_fetch","arguments":{"url":"https://robotbase.cc/"},
                  "_meta":{"x402/payment":{ ... settled payment payload ... }}}}'
 ```
 

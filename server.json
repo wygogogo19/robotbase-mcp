@@ -1,8 +1,8 @@
 {
  "name": "robotbase-mcp",
  "title": "RobotBase MCP Server - search, read, verify and pay from one read-only endpoint",
- "version": "0.32.3",
- "description": "One read-only MCP endpoint for agents to search the web, read any page, verify on-chain payments and pay per call - no API keys, no accounts, no custody. Five chains are live, each read from mainnet nodes we run ourselves: Bitcoin (fees, mempool state with a fee-rate histogram and RBF/CPFP feasibility, tx/block/address verification, optional raw-tx relay); Ethereum (Reth execution + Lighthouse consensus, settlement checks with ERC-20 log decoding, fee market, blocks, event logs, account and contract reads); Monero (node telemetry, dynamic fees, mempool, blocks, transaction lookup, ring-size output distribution, and cryptographic tx-proof payment verification); Zcash (all six shielded pools, shielded commitment-tree anchors, transaction checks, network and funding-stream stats); and Tron (node status, blocks and history, transactions with TRC-20 decoding, account permissions, contract reads, chain economics, super representatives and governance proposals). Risk intelligence is light aggregation over public datasets: TRON address risk and TRC-20 USDT settlement verification. RobotBase publishes no RPC endpoint of any kind. Verification tools are free; risk tools include a daily free allowance, then 0.01 USDC per call settled over x402 by the caller's own wallet - x402 runs on Base or Solana as a payment rail only, and no Base or Solana chain data is served. Seventeen web tools are exposed on the hosted endpoint: web_search returns ranked web results (self-hosted SearXNG primary with Serper/Tavily/Brave/cn.bing RSS fallbacks, cached up to 10 minutes) and web_fetch returns readable markdown/text of one public URL with optional OCR (robots.txt-respecting, SSRF-guarded, no login or paywall bypass, provider fallback for pages blocked from this node, capped at 12000 characters); web_screenshot, web_map, web_fetch_batch, web_feed, web_metadata, web_crawl, web_extract, web_act, web_extract_schema, web_diff, web_crawl_async and web_crawl_job add screenshots, URL discovery, batch reads, feeds, metadata, same-host crawling, structured extraction, limited browser interaction, schema extraction, page diffs and async crawl jobs; web_monitor_set, web_monitor_list and web_monitor_delete add scheduled page-change monitoring with optional HMAC-SHA256 webhooks. The 14 metered web tools share a free daily allowance per IP (100 calls/day) and are metered from 1 to 3 x402 credits per call; `web_crawl_job`, `web_monitor_list` and `web_monitor_delete` are free. The hosted endpoint adds sixteen CyberLibrary book tools, for 65 Web3 tools (Dev and Content are separate editions); this repository is the 45-tool reference implementation. No API key, no account and no subscription are offered.",
+ "version": "0.32.0",
+ "description": "One read-only MCP endpoint for agents to search the web, read any page, verify on-chain payments and pay per call - no API keys, no accounts, no custody. Four chains are live, each read from mainnet nodes we run ourselves: Bitcoin (fees, mempool, tx/block/address verification, raw-tx relay); Litecoin (blocks, transactions, fees, mempool); Monero (node telemetry, dynamic fees, mempool, blocks, tx lookup, ring-size output distribution, cryptographic payment proofs); and Zcash (all six shielded pools, anchors, tx checks, network/funding stats). Hosted Web3 has 52 tools (29 chain verification/raw-broadcast + 4 status + 2 market/trend + 17 web); this repository is a 27-tool BTC/XMR/ZEC reference implementation. The ETH and TRON data services were retired on 2026-11-20. RobotBase publishes no RPC endpoint of any kind. Verification tools are free; CyberLibrary and web tools have a daily free allowance, then x402 credits. x402 settles in USDC on Base or Solana as a payment rail only; no Base or Solana chain data is served. No API key, no account and no subscription are offered.",
  "homepage": "https://robotbase.cc/mcp",
  "transport": {
   "type": "streamable-http",
@@ -30,14 +30,11 @@
  },
  "tags": [
   "bitcoin",
-  "ethereum",
   "monero",
   "zcash",
-  "tron",
   "blockchain-data",
   "onchain",
   "verification",
-  "risk-intelligence",
   "aml",
   "rug-pull",
   "honeypot",
@@ -72,7 +69,7 @@
  "tools": [
   {
    "name": "web_search",
-   "description": "Search the live web and get ranked results with title, URL, snippet and published date. When to use: an agent needs current facts, news or links that are not on chain - 'what is the BTC fee market saying today', 'recent Zcash governance proposals', 'find the docs page for X'. Use it before web_fetch, then fetch the one URL that looks authoritative. Do not use: for on-chain facts (use the BTC/ETH/XMR/ZEC/TRON tools), or when you already have the target URL (that is web_fetch). Returns: {query, count, results:[{title,url,snippet,published}], provider (serper|tavily|brave|bing_rss), cached, took_ms, _metering}. Results may be cached for up to 10 minutes; a cached result still counts as one call against the free allowance. Metered: both web tools share 100 free calls/day per IP (separate from the risk-tool allowance), then 1 credit per call over x402 - there is no API key; the 402 answer carries accepts[]. Max count is 10."
+   "description": "Search the live web and get ranked results with title, URL, snippet and published date. When to use: an agent needs current facts, news or links that are not on chain - 'what is the BTC fee market saying today', 'recent Zcash governance proposals', 'find the docs page for X'. Use it before web_fetch, then fetch the one URL that looks authoritative. Do not use: for on-chain facts (use the BTC/LTC/XMR/ZEC tools), or when you already have the target URL (that is web_fetch). Returns: {query, count, results:[{title,url,snippet,published}], provider (serper|tavily|brave|bing_rss), cached, took_ms, _metering}. Results may be cached for up to 10 minutes; a cached result still counts as one call against the free allowance. Metered: both web tools share 100 free calls/day per IP (in a separate bucket), then 1 credit per call over x402 - there is no API key; the 402 answer carries accepts[]. Max count is 10."
   },
   {
    "name": "web_fetch",
@@ -121,78 +118,6 @@
   {
    "name": "broadcast_raw_transaction",
    "description": "Relay an already-signed raw transaction to the network through our own full node (non-custodial: we never see a private key). When to use: an agent signed a transaction locally and wants a high-availability broadcast path into the Bitcoin network. Do not use: to build or sign a transaction (we never hold keys), or to look up a payment (that is btc_get_transaction). Returns: {accepted, txid, chain, relayed} on success, or {accepted:false, reason} - a rejected transaction is never relayed. Availability: disabled by default on this deployment; the operator enables it with RB_ENABLE_BROADCAST=1."
-  },
-  {
-   "name": "eth_get_block",
-   "description": "One Ethereum block by number, tag (latest/finalized/safe) or hash: timestamp, transaction count, gas used against the limit, base fee, block builder and size. When to use: block-level context - how full is Ethereum right now, when a block was produced, what the base fee was, or which builder produced it. Do not use: for a transaction (eth_get_transaction) or for fees across blocks (eth_get_fee_rates). Returns: found, number, hash, parent_hash, timestamp, age_s, tx_count, gas_used, gas_limit, gas_used_pct, base_fee_gwei, miner, size_bytes. Boundary: block bodies are retained from 15,500,000 (2022-09-14) only; older heights return a pruned-history error, not an empty block."
-  },
-  {
-   "name": "eth_read_contract",
-   "description": "Read-only (eth_call) against any Ethereum contract, executed by our own Reth node. ERC-20 helpers balanceOf / allowance / decimals / symbol / name / totalSupply are built in; any other function can be called by passing its 4-byte `selector` plus ABI-encoded `parameter`. Nothing is signed or written. When to use: an agent needs an on-chain value without trusting a third-party API - a USDT/USDC balance, token decimals, an allowance, or any view function. Do not use: to send a transaction (this never writes), or for a historical balance. Returns: ok, contract, function, selector, output_type, value, value_human for known-decimals tokens."
-  },
-  {
-   "name": "eth_get_logs",
-   "description": "Ethereum event logs over a block range, optionally filtered by contract address and event signature, with ERC-20 Transfer logs decoded (token, from, to, amount). When to use: find transfers or contract events in a window - 'who moved this token in the last N blocks', or watch a contract's activity without an indexer. Do not use: for a single transaction (eth_get_transaction) or to scan huge ranges (max 1000 blocks per call, results truncated with a flag). Returns: filter, matched, returned, truncated, logs[] with block_number, tx_hash, address, topics, data and a decoded block for ERC-20 Transfers. Boundary: logs are read from receipts, which exist only for a rolling window (~6 days today, 1.4-8.3 days as the 50k-block static-file shard advances); older ranges are refused."
-  },
-  {
-   "name": "eth_get_transaction",
-   "description": "Ethereum transaction check by hash: success or reverted, gas used, fee paid, confirmations, whether the block is finalized, and any ERC-20 transfers decoded from the receipt logs (token, from, to, amount). When to use: did this ETH or ERC-20 payment actually settle, is it irreversible, who paid whom and how much. Do not use: for fee estimation (eth_get_fee_rates) or for Tron (tron_get_transaction). Returns: found, status, block_number, from, to, value_eth, gas_used, fee_eth, confirmations, finalized, erc20_transfers[]. A miss is reported as absent from *our* node only - never as proof of non-existence. Boundary: the transaction-hash index starts at block 26,170,371 (2026-10-12, only widens) while receipts cover a rolling ~6 days, so a miss on an older transaction means outside our window, not non-existent."
-  },
-  {
-   "name": "eth_get_account",
-   "description": "Ethereum account state from our own node: ETH balance, nonce, and whether the address is a contract. When to use: balance and account type before sizing a transfer, or telling an EOA from a contract. Do not use: for ERC-20 token balances (eth_read_contract with balanceOf) or address risk scoring. Returns: address, balance_eth, nonce, is_contract, code_size_bytes."
-  },
-  {
-   "name": "eth_get_fee_rates",
-   "description": "Ethereum fee market from our own Reth node: current and next base fee, priority-fee percentiles over the last blocks, and the estimated ETH cost of a plain transfer and of an ERC-20 transfer. When to use: pricing an Ethereum transaction, or deciding what tip gets included quickly. Do not use: for Bitcoin (btc_get_fee_rates), Monero (xmr_get_fee_rates) or Tron (tron_get_chain_economics). Returns: base_fee_gwei, next_base_fee_gwei, base_fee_last_blocks_gwei, priority_percentiles_gwei, estimated_cost{simple_eth_transfer_21000_gas_eth, erc20_transfer_65000_gas_eth}."
-  },
-  {
-   "name": "tron_check_address_risk",
-   "description": "TRON address risk intelligence: judicial and black-market labels, account profile and a 0-100 safety score. When to use: before accepting USDT from a counterparty - OTC settlement, merchant payout, or any agent that must not receive tainted funds; also to sanity-check an address you are about to pay. Do not use: to confirm that a specific transfer arrived (that is tron_verify_usdt_transfer). Returns: risk_level (low|medium|high|unknown), safety_score, hit_flags (sanctioned / money_laundering / mixer / cybercrime / phishing / blacklist_doubt ...), malicious_contracts_created, account {activated, age_days, balance_trx, is_contract, trc20_holdings}, not_covered[] and a disclaimer. Metered: 5 free calls per day per IP, then 0.01 USDC per call over x402. There is no API key: the 402 answer carries the machine-readable terms in structuredContent.accepts[]."
-  },
-  {
-   "name": "tron_verify_usdt_transfer",
-   "description": "TRC-20 USDT settlement check by transaction id: did it land, is it irreversible, how much, from and to whom. When to use: an agent or a merchant must confirm a USDT payment before releasing value - this is the settlement check that closes an automated trade loop. Do not use: to assess the counterparty (that is tron_check_address_risk). Data source: our own java-tron full node when the transaction is inside its ~6 day retention window (sub-second, no third party); it falls back to TronGrid automatically for older transactions, and says which one answered in `source`. A local miss is never reported as 'not found' by itself. Returns: found, status (SUCCESS|FAILED), finalized (present on the solidity/irreversible chain), confirmations, blocks_until_finality, block_number, block_time_utc, amount_usdt, from, to, fee_trx, checks {}, verified and a plain-language verdict. Pass expected_to / expected_amount_usdt to have the recipient and amount matched for you. Metered: 5 free calls per day per IP, then 0.01 USDC per call over x402. There is no API key: the 402 answer carries the machine-readable terms in structuredContent.accepts[]."
-  },
-  {
-   "name": "tron_get_current_block",
-   "description": "The current (tip) TRON block: number, id, parent, timestamp, transaction count and a breakdown by contract type, plus the producing witness. When to use: how busy TRON is right now, what is in the block being produced, who produced it. Do not use: to fetch an older block - a lite full node serves the tip only, historical blocks are closed. Returns: number, block_id, parent_hash, timestamp_ms, age_s, tx_count, tx_by_type, producer_address."
-  },
-  {
-   "name": "tron_get_transaction",
-   "description": "One Tron transaction by txid: success or reverted, energy used, the call it made, and - this is the important part - any TRC-20 transfers decoded from the receipt logs (token, from, to, amount). When to use: did this USDT payment really land, for how much, from whom, and is it finalized. Do not use: for address risk scoring (tron_check_address_risk) or for blocks (tron_get_block). Boundary: our node is a lite full node with a recent window (~6 days); an empty result means 'outside our window', NOT 'the payment did not arrive' - fall back to an indexer before saying a payment is missing. Returns: found, block_number, status, contract_type, owner/to/contract_address, amount_trx, trc20_transfers[], energy_used, confirmations, finalized, retention_window."
-  },
-  {
-   "name": "tron_get_account",
-   "description": "TRON account state read straight off our own node: TRX balance, whether the account is activated, energy and bandwidth (used / limit), whether it is a witness, and account age. When to use: TRX balance and resource state before sizing a transfer, or checking whether an address exists on chain. Do not use: for USDT/TRC-20 token balances (use tron_read_contract with balanceOf) or for address risk scoring (that is tron_check_address_risk). Returns: found, address, trx_balance, name, created_ms, last_operation_ms, is_witness, has_code, energy, bandwidth."
-  },
-  {
-   "name": "tron_read_contract",
-   "description": "Read-only (constant) call against any TRON contract, executed by our own node. TRC-20 helpers balanceOf / allowance / decimals / symbol / name / totalSupply are built in; any other function can be called with a raw selector plus ABI-encoded parameter. No state is changed and no key is involved. When to use: an agent needs an on-chain value without trusting a third-party API - USDT balance of an address, token decimals, an allowance, or any view function. Do not use: to send a transaction (this never writes), or to look up a historical balance. Returns: ok, contract, function, output_type, value (decoded), value_human for 6-decimal tokens, raw, energy_used."
-  },
-  {
-   "name": "tron_get_block",
-   "description": "One Tron block by height or block id, read from our own node: producer, timestamp, transaction count split by contract type, and the tx ids in it. When to use: inspect a specific block, or confirm which block a transaction landed in. Do not use: for the tip only (tron_get_current_block) or for a transaction itself (tron_get_transaction). Boundary: our Tron node is a lite full node that keeps only a recent window (~6 days). An empty result means 'outside our window', NOT 'the block does not exist'. Returns: found, number, block_id, parent_hash, timestamp_ms, tx_count, tx_by_type, producer_address, tx_ids, retention_window."
-  },
-  {
-   "name": "tron_get_node_status",
-   "description": "TRON node state from our own java-tron full node: tip height, finalized (solidity) height and how far solidity lags, peers, client version, transactions in the tip block. When to use: is the TRON node we operate synced and healthy, and how far behind is the finalized state. Do not use: for historical blocks or transactions - this is a lite full node and those APIs are closed. Returns: height, solidity_height, solidity_lag_blocks, age_s, tx_in_tip_block, peer_count, client_version."
-  },
-  {
-   "name": "tron_get_contract",
-   "description": "TRON contract metadata: name, creator, whether its ABI is published on chain, the function list, code hash and whether it looks like a TRC-20. When to use: before calling a contract, or to tell an unverified contract from a published one. Do not use: for risk/backdoor analysis (that is tron_check_address_risk). Returns: found, address, name, creator, has_abi, abi_entry_count, is_trc20, functions, code_hash."
-  },
-  {
-   "name": "tron_get_chain_economics",
-   "description": "TRON chain economics straight off our node: energy price (sun per energy unit), transaction fee, account creation fee, witness pay per block, total energy and bandwidth limits, maintenance interval and the next maintenance time, unfreeze delay. When to use: working out what a transaction will actually cost in TRX, or how TRON's resource market is currently priced. Do not use: for Bitcoin fees (btc_get_fee_rates) or Monero fees (xmr_get_fee_rates). Returns: energy_fee_sun_per_unit, transaction_fee_sun, create_account_fee_trx, witness_pay_per_block_trx, maintenance_interval_s, next_maintenance_ms, unfreeze_delay_days, latest_energy_price."
-  },
-  {
-   "name": "tron_list_witnesses",
-   "description": "TRON super representatives and candidates: who is producing blocks, how many they produced, how many they missed, votes and websites - read from our own node. When to use: governance or staking questions about TRON, or checking the health of block production. Do not use: for account balances (tron_get_account). Returns: registered_witnesses, active_block_producers, top_by_blocks_produced[] with address, url, blocks_produced, blocks_missed, votes, in_active_set."
-  },
-  {
-   "name": "tron_list_proposals",
-   "description": "Tron governance proposals: id, proposer, state, approvals, expiry and the parameters they would change. When to use: governance or staking questions, or checking whether a chain-parameter change is pending. Do not use: for the current parameter values (tron_get_chain_economics) or the witness list (tron_list_witnesses). Returns: total_proposals, by_state{}, top_by_approvals[] with proposal_id, proposer, approvals, state, parameters{}."
   },
   {
    "name": "xmr_get_recent_blocks",
