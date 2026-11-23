@@ -343,30 +343,16 @@ def t_list_chains():
                     "ok": bool(n.get("ok")), "synced": bool(n.get("synced")),
                     "height": _as_num(n.get("height")),
                     "state": n.get("state") or c.get("state")})
-    try:
-        ts = t_tron_node_status()
-        tron_row = {"chain": "tron", "tier": "live", "ok": bool(ts.get("ok")),
-                    "synced": bool(ts.get("ok") and (ts.get("age_s") is not None and ts.get("age_s") < 30)),
-                    "height": ts.get("height"), "state": "external RPC"}
-        found = False
-        for x in out:
-            if x.get("chain") == "tron":
-                x.update(tron_row); found = True
-        if not found:
-            out.append(tron_row)
-    except Exception:
-        for x in out:
-            if x.get("chain") == "tron":
-                x.update({"ok": False, "synced": False, "state": "external RPC unavailable"})
+    # fast path: home API only. Never block list_chains on a live external RPC call;
+    # missing chains fall back to a static row and are refreshed by the home cache.
+    known = {x.get("chain") for x in out}
     for _c in EVM_EXT + ("solana",):
-        if _c not in [x.get("chain") for x in out]:
-            try:
-                st = _external_chain_status(_c)
-                out.append({"chain": _c, "tier": "live", "ok": True, "synced": True,
-                            "height": st.get("height"), "state": "external RPC"})
-            except Exception:
-                out.append({"chain": _c, "tier": "live", "ok": False, "synced": False,
-                            "height": None, "state": "external RPC"})
+        if _c not in known:
+            out.append({"chain": _c, "tier": "live", "ok": None, "synced": None,
+                        "height": None, "state": "status via /api/nodes"})
+    if "tron" not in known:
+        out.append({"chain": "tron", "tier": "live", "ok": None, "synced": None,
+                    "height": None, "state": "status via /api/nodes"})
     if not out:                                  # 网关不可达时退回静态名册
         out = [{"chain": c, "tier": "live" if c in CHAINS else "provisioning"}
                for c in ROSTER_CHAINS]
