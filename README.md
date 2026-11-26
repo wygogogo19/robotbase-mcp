@@ -1,6 +1,6 @@
 # RobotBase MCP Server
 
-> **Status 2026-11-23 — v0.33.0.** Hosted Web3 serves **72 read-only tools across 10 live chains**.
+> **Status 2026-11-26 — v0.35.1.** Hosted Web3 serves **71 read-only tools across 10 live chains**.
 > `server_editions.py` is the full hosted multi-edition implementation.
 > `server.py` remains the dependency-free reference subset for local self-hosting.
 
@@ -10,10 +10,10 @@
 
 | Edition | Endpoint | Tools | Audience |
 |---|---|---:|---|
-| **Web3** | `https://web3.robotbase.cc/mcp` | **72** | chain verification, risk, prediction markets, crypto trends |
+| **Web3** | `https://web3.robotbase.cc/mcp` | **71** | chain verification, risk, prediction markets, crypto trends |
 | **Dev** | `https://dev.robotbase.cc/mcp` | **18** | GitHub / HF / npm / PyPI / HN trends + web |
 | **Content** | `https://content.robotbase.cc/mcp` | **35** | social hot lists, attention trends, CyberLibrary + web |
-| Compatibility alias | `https://robotbase.cc/mcp` | **72** | alias of the Web3 edition |
+| Compatibility alias | `https://robotbase.cc/mcp` | **71** | alias of the Web3 edition |
 
 All editions include the same **17-tool web toolbox**.
 
@@ -26,7 +26,7 @@ All editions include the same **17-tool web toolbox**.
 
 No raw RPC endpoint is published. Every read path is the MCP surface.
 
-## Web3 tool surface (72)
+## Web3 tool surface (71)
 
 - **17 web tools** — search, fetch, screenshot, map, batch, feed, metadata, crawl, extract, act, schema extraction, diff, async crawl and scheduled page monitors
 - **4 status/overview tools** — `list_chains`, `chain_status`, `robotbase_services`, `robotbase_capabilities`

@@ -47,7 +47,7 @@ _EDITION_META = {
                 "RobotBase Content MCP — web research, social hot lists, attention trends and books"),
 }
 PORT = int(os.environ.get("RB_PORT") or _EDITION_META[EDITION][1])
-SERVER_INFO = {"name": _EDITION_META[EDITION][0], "version": "0.35.0",
+SERVER_INFO = {"name": _EDITION_META[EDITION][0], "version": "0.35.1",
                "title": _EDITION_META[EDITION][2]}
 BTC_ENV = "/etc/btc-dashboard.env"
 ZEC_BASE = "http://127.0.0.1160:8080"
@@ -357,8 +357,8 @@ def t_list_chains():
         out = [{"chain": c, "tier": "live" if c in CHAINS else "provisioning"}
                for c in ROSTER_CHAINS]
     return {"chains": out, "updated_utc": d.get("updated_utc"),
-            "note": "Ten roster chains are live: BTC/LTC/ETH/XMR/ZEC read from our own nodes; "
-                    "TRON/Base/Polygon/BSC/Solana are served read-only through external RPC. "
+            "note": "Ten roster chains are live: BTC/LTC/XMR/ZEC are self-hosted; "
+                    "ETH/TRON/Base/Polygon/BSC/Solana are read-only through managed external RPC. "
                     "Generic tools: tron_* (TRON), evm_rpc (Base/Polygon/BSC), solana_rpc (Solana)."}
 
 
@@ -7637,6 +7637,8 @@ _TREND_BY_EDITION = {
 
 def _edition_keep(name):
     """Edition catalog filter: web tools are the common lead magnet in all three."""
+    if name == "broadcast_raw_transaction":
+        return EDITION == "web3" and os.environ.get("RB_ENABLE_BROADCAST", "0") == "1"
     if name in WEB_ALL_TOOLS:
         return True
     if name.startswith("cyberlibrary_"):
@@ -8116,7 +8118,7 @@ def _edition_instructions():
               "carries its own _metering block.")
     if EDITION == "web3":
         return ("RobotBase Web3 is the on-chain verification, risk and market-intelligence surface "
-                "for Web3 agents: 72 read-only tools across ten live chains. BTC/LTC/XMR/ZEC are self-hosted; "
+                "for Web3 agents: 71 read-only tools across ten live chains. BTC/LTC/XMR/ZEC are self-hosted; "
                 "ETH/TRON/Base/Solana/BSC/Polygon are read through managed external RPC. "
                 "TRON has 12 dedicated tron_* tools; Base/Polygon/BSC use evm_rpc; Solana uses solana_rpc. "
                 "All 17 web tools, prediction_market_odds and crypto_trending are included." + common)
@@ -8321,7 +8323,7 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
 <h2>Rate limits and privacy</h2>
 <div class="card"><div class="grid">
 <div><div class="muted">Verification tools</div><div><b>Free</b> - no key, no signup</div></div>
-<div><div class="muted">Metered tools (library + web)</div><div><b>5 free/day per IP</b> for library; <b>100 web calls/day per IP shared by all eleven web tools</b> for web, then credits by x402 (retrieval 1-2, get_chunks 2, verify_quote 3, search_passages 5, semantic_search 8, search 6, rag_context 10, full-text 5, web_search 1, web_fetch 1)</div></div>
+<div><div class="muted">Metered tools (library + web)</div><div><b>10 free calls/day/IP shared by every tool</b>; no separate library/web bucket, then credits by x402 (retrieval 1-2, get_chunks 2, verify_quote 3, search_passages 5, semantic_search 8, search 6, rag_context 10, full-text 5, web_search 1, web_fetch 1)</div></div>
 <div><div class="muted">Payment</div><div>USDC on Base or Solana, from your own wallet - <b>no API key, no subscription</b>. Payment rail only: RobotBase serves no Base/Solana chain data.</div></div>
 <div><div class="muted">Anonymous</div><div><b>120 req/min/IP</b></div></div>
 <div><div class="muted">Privacy</div><div>Audit keeps only the first 16 chars of the IP SHA256 — <b>query arguments are never logged</b></div></div>
@@ -8364,7 +8366,7 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
   <li><code>web_feed</code> / <code>web_metadata</code> / <code>web_extract</code> - RSS/Atom items, Open Graph/JSON-LD metadata, tables + JSON-LD as structured data</li>
   <li><code>web_crawl</code> / <code>web_act</code> - same-host crawl (depth 1-2, ≤20 pages), and real-browser click/type/scroll with optional XHR capture</li>
   </ul>
-  <p class="muted" style="margin-bottom:0">Independent free allowance: <b>100 web calls per
+  <p class="muted" style="margin-bottom:0">Shared free pool: <b>10 calls/day/IP across all tools
   day per IP</b> (the same shared pool as every other tool), then <b>1 credit per web_search</b> and
   <b>1 credit per web_fetch</b>. A cached search still counts as one call against the free allowance;
   a paid cache hit does not spend a credit. All fetching is SSRF-guarded: private, loopback,
@@ -8374,7 +8376,7 @@ border-radius:10px;padding:9px 14px;font-size:13px;opacity:0;transition:.25s;poi
 <h2 id="pricing">Pricing</h2>
 <div class="card"><div class="grid">
 <div><div class="muted">Verification tools (44)</div><div><b>$0</b> — free forever, no key, no signup</div></div>
-<div><div class="muted">Metered: risk (2) + CyberLibrary (16) + Web (14)</div><div><b>10 free calls/day per IP</b> for library, <b>100 web calls/day per IP shared by all web tools</b> for web, then credits: retrieval 1-2, rag_context 10, semantic_search 8, cyberlibrary_search 6, full-text 5, web_search 1, web_fetch 1, web_screenshot 2, web_map 1, web_fetch_batch 1/URL, web_feed 1, web_metadata 1, web_crawl 3, web_crawl_async 3, web_extract 1, web_extract_schema 1, web_diff 1, web_act 3, web_monitor_set 1 (web_monitor_list/web_monitor_delete free)</div></div>
+<div><div class="muted">Metered: risk (2) + CyberLibrary (16) + Web (14)</div><div><b>10 free calls/day/IP shared by every tool</b>; no separate web/library bucket, then credits: retrieval 1-2, rag_context 10, semantic_search 8, cyberlibrary_search 6, full-text 5, web_search 1, web_fetch 1, web_screenshot 2, web_map 1, web_fetch_batch 1/URL, web_feed 1, web_metadata 1, web_crawl 3, web_crawl_async 3, web_extract 1, web_extract_schema 1, web_diff 1, web_act 3, web_monitor_set 1 (web_monitor_list/web_monitor_delete free)</div></div>
 <div><div class="muted">How you pay</div><div><b>x402</b> — USDC on Base, paid by the caller's own wallet</div></div>
 <div><div class="muted">Credit packs</div><div><b>10 credits / 0.10 USDC</b> · <b>100 credits / 1.00 USDC</b> — live terms in <code>accepts[]</code></div></div>
 </div>
@@ -8493,7 +8495,7 @@ def server_card():
                  "web-search", "web-fetch", "search", "fetch", "web-crawling", "screenshot", "sitemap", "web-map", "batch-fetch", "rss", "feed", "metadata", "ocr", "crawl", "structured-data", "browser-automation"],
         "pricing": {"verification_tools": "free",
                     "metered_tools": ("CyberLibrary library (16) + web (17): %d free calls/day "
-                                      "per IP for library, 100 web calls/day per IP shared by all web tools for "
+                                      "per IP, shared by every tool and edition; no separate web bucket for "
                                       "web, then credits - retrieval 1-2, full-text 5, "
                                       "web_search 1, web_fetch 1, web_screenshot 2, web_map 1, "
                                       "web_fetch_batch 1 per URL, web_feed 1, web_metadata 1, "
@@ -10940,10 +10942,10 @@ def server_card():
     base = _EDITION_BASE[EDITION]
     n = len(TOOLS)
     pricing = {
-        "free_web_calls_per_day": WEB_FREE,
-        "free_web_scope": "per IP, per edition",
+        "free_web_calls_per_day": FREE_CALLS_PER_DAY,
+        "free_web_scope": "per IP, shared by every tool and edition",
         "metered": "1-3 credits per call after the free allowance; x402 USDC on Base or Solana",
-        "library_free_calls_per_day": RISK_FREE_PER_DAY if EDITION == "content" else None,
+        "risk_library_free_calls_per_day": FREE_CALLS_PER_DAY,
         "api_key": "not offered", "subscription": "not offered",
     }
     tags = ["mcp-server", "read-only", "web-search", "web-fetch", "x402", "ai-agents"]

@@ -5,16 +5,14 @@
 name: robotbase-mcp
 displayName: RobotBase MCP Server
 description: >-
-  One MCP endpoint for agents: search the live web, read public pages as clean Markdown, verify
-  on-chain payments on Bitcoin/Litecoin/Monero/Zcash (self-hosted nodes), and pay per call
-  over x402 — no API keys, no accounts, no custody. 72 hosted tools: 29 free verification tools, 16 CyberLibrary public-domain book tools and 17 web tools (web_search, web_fetch,
-  web_screenshot, web_map, web_fetch_batch, web_feed, web_metadata, web_crawl, web_extract,
-  web_act, web_extract_schema, web_diff, web_crawl_async, web_crawl_job, web_monitor_set,
-  web_monitor_list, web_monitor_delete). This repo is the
-  dependency-free reference implementation (27 tools; CyberLibrary and 15 additional web tools
-  are hosted-only). Base and
-  Solana are x402 payment rails only — no chain data is served for them.
-version: 0.33.0
+  One MCP endpoint for agents: search the live web, read public pages as clean Markdown, and
+  verify on-chain data across 10 live chains (BTC/LTC/XMR/ZEC self-hosted; ETH/TRON/Base/
+  Polygon/BSC/Solana via managed external RPC). 71 hosted read-only tools: chain verification,
+  16 CyberLibrary public-domain book tools and the 17-tool web layer. First 10 calls/day/IP are
+  free across every tool and edition; after that x402 USDC on Base or Solana, or an optional
+  XMR prepaid key. No write/broadcast tool is exposed. This repo is the dependency-free
+  reference implementation (subset); the hosted endpoint is authoritative.
+version: 0.35.1
 license: MIT
 homepage: https://robotbase.cc/mcp
 repository: https://github.com/wygogogo19/robotbase-mcp
